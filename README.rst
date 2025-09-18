@@ -6,6 +6,30 @@ This repository provides access to the main user tooling of ReazonSpeech project
 
 * https://research.reazon.jp/projects/ReazonSpeech/
 
+用法
+====
+.. code:: console
+
+   python asr.py 文件路径
+
+参数
+====
+.. code:: console
+
+   --no-chunk 禁用分块
+
+   --min_silence_len 最小静音时长（毫秒）
+   --silence_thresh 静音音量阈值（dBFS）
+   --keep_silence 分割块前后保留的静音时长（毫秒）
+
+   -text 仅输出完整的识别文本并保存到 .txt 文件
+
+   -segment 输出带时间戳的文本片段 (Segment)并保存到 .segments.txt 文件
+   -segment2srt 将文本片段 (Segment) 转换为 SRT 字幕文件并保存
+
+   -subword 输出所有的子词 (Subword) 及其时间戳并保存到保存到 .subwords.txt 文件=
+   -subword2srt 将子词 (Subword) 转换为 SRT 字幕文件并保存
+
 Install
 =======
 
