@@ -12,6 +12,8 @@ This repository provides access to the main user tooling of ReazonSpeech project
 
    python asr.py 文件路径
 
+推荐使用nemo版模型，注意先安装好对应cuda版本的torch
+
 参数
 ====
 .. code:: console
