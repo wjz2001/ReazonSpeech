@@ -1,5 +1,6 @@
-chcp 65001
 @echo off
+rem 切换代码页以正确显示中文字符
+chcp 65001 > nul
 setlocal
 title ReazonSpeech 语音识别助手
 

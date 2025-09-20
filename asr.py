@@ -3,27 +3,16 @@ import os
 import tempfile
 import shutil
 import torch
+import torchaudio
 from pydub import AudioSegment
+# 导入 OmegaConf 用于创建解码配置
+from omegaconf import OmegaConf
 
-from reazonspeech.nemo.asr import load_model, audio_from_path
+from reazonspeech.nemo.asr import load_model
 from reazonspeech.nemo.asr.decode import decode_hypothesis
-from reazonspeech.nemo.asr.interface import Segment, Subword, TranscribeConfig
+from reazonspeech.nemo.asr.interface import Segment, Subword
+from silero_vad import load_silero_vad, get_speech_timestamps
 
-# Silero VAD 的辅助函数
-def get_speech_timestamps(wav_path, model, threshold=0.5, sampling_rate=16000):
-    """使用 Silero VAD 模型获取语音活动的时间戳"""
-    import torchaudio
-    wav, sr = torchaudio.load(wav_path)
-    if sr != sampling_rate:
-        resampler = torchaudio.transforms.Resample(sr, sampling_rate)
-        wav = resampler(wav)
-    if wav.dim() > 1: wav = wav.mean(dim=0)
-    try:
-        speech_timestamps = model.get_speech_timestamps(wav, threshold=threshold)
-        return speech_timestamps
-    except Exception as e:
-        print(f"[VAD 错误] {e}"); return [{'start': 0, 'end': len(wav)}]
-    
 def format_srt_time(seconds):
     """将秒数格式化为 SRT 时间戳格式 (HH:MM:SS,ms)"""
     assert seconds >= 0, "non-negative timestamp expected"
@@ -66,8 +55,8 @@ def main():
     )
 
     # --- VAD (Silero VAD) 核心参数 ---
-    parser.add_argument("--vad_threshold", type=float, default=0.4, help="[VAD] 模型的置信度阈值 (0-1)，值越高判断越严格。")
-    parser.add_argument("--min_speech_duration_ms", type=int, default=100, help="[VAD 过滤器] 语音块被处理的最小持续时间（毫秒），用于过滤噪音。")
+    parser.add_argument("--vad_threshold", type=float, default=0.2, help="[VAD] 模型的置信度阈值 (0-1)，值越高判断越严格。")
+    parser.add_argument("--min_speech_duration_ms", type=int, default=0, help="[VAD 过滤器] 语音块被处理的最小持续时间（毫秒），用于过滤噪音。")
     parser.add_argument("--keep_silence", type=int, default=300, help="在语音块前后扩展的时长（毫秒），以防切断单词。")
 
     # 创建一个互斥的参数组，因为一次只能选择一种输出格式
@@ -129,14 +118,18 @@ def main():
         model = load_model(device='cuda')
         print("模型加载完成。")
 
-        decoding_config = model.cfg.decoding
+        # 创建一个解码配置对象
         if args.beam_size > 1:
             print(f"已启用 Beam Search 解码，beam size = {args.beam_size}。")
-            decoding_config.decoding_strategy = "beam"
-            decoding_config.beam.beam_size = args.beam_size
+            decoding_cfg = OmegaConf.create(
+                {
+                    "decoding_strategy": "beam",
+                    "beam": {"beam_size": args.beam_size},
+                }
+            )
         else:
-            decoding_config.decoding_strategy = "greedy"
-        model.change_decoding_strategy(decoding_config)
+            # 对于贪心解码，我们可以不传递任何特殊配置
+            decoding_cfg = None
 
         # --- 逐块识别并校正时间戳 ---
         all_segments = []
@@ -145,7 +138,7 @@ def main():
         if args.no_chunk:
             # --- 不分块的逻辑 ---
             print("检测到 --no-chunk 参数，将一次性处理整个文件……")
-            hyp, _ = model.transcribe([temp_wav_path], return_hypotheses=True, verbose=True)
+            hyp, _ = model.transcribe([temp_wav_path], return_hypotheses=True, verbose=True, override_config=decoding_cfg)
             ret = decode_hypothesis(model, hyp[0])
             all_segments = ret.segments
             all_subwords = ret.subwords
@@ -153,14 +146,21 @@ def main():
         else:
             # --- 智能分块的逻辑 ---
             print("正在使用 Silero VAD 模型侦测音频中的语音活动以进行智能分块……")
-            vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad')
-            speech_timestamps = get_speech_timestamps(temp_wav_path, vad_model, threshold=args.vad_threshold)
+            vad_model = load_silero_vad(onnx=True)
+            # 加载音频为 tensor
+            wav_tensor, _ = torchaudio.load(temp_wav_path)
             
-            nonsilent_ranges_ms = []
-            for ts in speech_timestamps:
-                start_ms = ts['start'] / (16000 / 1000)
-                end_ms = ts['end'] / (16000 / 1000)
-                nonsilent_ranges_ms.append([start_ms, end_ms])
+            # 调用官方函数
+            speech_timestamps_seconds = get_speech_timestamps(
+                wav_tensor, 
+                vad_model, 
+                threshold=args.vad_threshold,
+                return_seconds=True
+            )
+            print("Silero VAD 模型加载完成。")
+            
+            # 将秒转换为毫秒
+            nonsilent_ranges_ms = [[ts['start'] * 1000, ts['end'] * 1000] for ts in speech_timestamps_seconds]
             
             if not nonsilent_ranges_ms:
                 print("警告：未侦测到语音活动。将尝试处理整个文件。"); nonsilent_ranges_ms = [[0, len(AudioSegment.from_wav(temp_wav_path))]]
@@ -182,7 +182,7 @@ def main():
                     print(f"正在处理块 {i+1}/{len(filtered_ranges)} (时间: {format_srt_time(time_offset_s)})...")
                     chunk.export(chunk_path, format="wav")
                     
-                    hyp, _ = model.transcribe([chunk_path], return_hypotheses=True, verbose=False)
+                    hyp, _ = model.transcribe([chunk_path], return_hypotheses=True, verbose=False, override_config=decoding_cfg)
                     
                     if hyp and hyp[0]:
                         ret = decode_hypothesis(model, hyp[0])
