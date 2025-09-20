@@ -10,6 +10,8 @@ This repository provides access to the main user tooling of ReazonSpeech project
 ====
 .. code:: console
 
+   pip install silero-vad 安装silero
+
    python asr.py 文件路径
 
 推荐使用nemo版模型，注意先安装好对应cuda版本的torch
@@ -20,9 +22,10 @@ This repository provides access to the main user tooling of ReazonSpeech project
 
    --no-chunk 禁用分块
 
-   --min_silence_len 最小静音时长（毫秒）
-   --silence_thresh 静音音量阈值（dBFS）
-   --keep_silence 分割块前后保留的静音时长（毫秒）
+   --beam_size Beam search 的大小。大于1会显著提升准确率但降低速度。推荐值为5或10
+   --vad_threshold VAD模型的置信度阈值 (0-1)，值越高判断越严格
+   --min_speech_duration_ms VAD 过滤器语音块被处理的最小持续时间（毫秒），用于过滤噪音
+   --keep_silence 在语音块前后扩展的时长（毫秒），以防切断单词
 
    -text 仅输出完整的识别文本并保存到 .txt 文件
 
