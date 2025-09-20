@@ -27,6 +27,15 @@ def format_srt_time(seconds):
 
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
+def format_ass_time(seconds):
+    """将秒数格式化为 ASS 时间戳格式 (H:MM:SS.cs)"""
+    assert seconds >= 0, "non-negative timestamp expected"
+    h = int(seconds / 3600)
+    m = int(seconds / 60) % 60
+    s = int(seconds % 60)
+    cs = int((seconds % 1) * 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
 def main():
     # --- 设置命令行参数解析 ---
     parser = argparse.ArgumentParser(
@@ -56,6 +65,8 @@ def main():
 
     # --- VAD (Silero VAD) 核心参数 ---
     parser.add_argument("--vad_threshold", type=float, default=0.2, help="[VAD] 模型的置信度阈值 (0-1)，值越高判断越严格。")
+    parser.add_argument("--vad_neg_threshold", type=float, default=0.1, help="[VAD] 语音结束判断的阈值。默认是 threshold - 0.15。")
+    parser.add_argument("--vad_min_silence_ms", type=int, default=250, help="[VAD] 结束语音块前需要等待的最小静音时长（毫秒）。")
     parser.add_argument("--min_speech_duration_ms", type=int, default=0, help="[VAD 过滤器] 语音块被处理的最小持续时间（毫秒），用于过滤噪音。")
     parser.add_argument("--keep_silence", type=int, default=300, help="在语音块前后扩展的时长（毫秒），以防切断单词。")
 
@@ -85,6 +96,11 @@ def main():
         "-subword2srt", 
         action="store_true", 
         help="将子词 (Subword) 转换为 SRT 字幕文件并保存"
+    )
+    output_group.add_argument(
+        "-kass",
+        action="store_true",
+        help="生成逐字计时的卡拉OK式 ASS 字幕文件 (.k.ass)"
     )
 
     args = parser.parse_args()
@@ -155,6 +171,10 @@ def main():
                 wav_tensor, 
                 vad_model, 
                 threshold=args.vad_threshold,
+                neg_threshold=args.vad_neg_threshold,
+                min_silence_duration_ms=args.vad_min_silence_ms,
+                min_speech_duration_ms=args.min_speech_duration_ms, # 注意：这个参数函数自带，我们不再需要手动过滤
+                speech_pad_ms=args.keep_silence,
                 return_seconds=True
             )
             print("Silero VAD 模型加载完成。")
@@ -194,19 +214,29 @@ def main():
         print("-" * 20)
         print("识别完成，正在生成输出文件……")
 
-        # 如果没有任何参数，则默认在控制台打印全文
+        # 检查用户是否指定了任何一种文件输出格式
+        file_output_requested = any([
+            args.text, args.segment, args.segment2srt, 
+            args.subword, args.subword2srt, args.kass
+        ])
+
+        # 只有在用户完全没有指定任何输出参数时，才在控制台打印
+        if not file_output_requested:
+            full_text = " ".join([seg.text for seg in all_segments])
+            print("\n识别结果 (完整文本):")
+            print(full_text)
+            print("-" * 20)
+            print("提示：未指定输出参数，结果仅打印到控制台。")
+            print("请使用 -text, -segment2srt, -kass 等参数将结果保存到文件。")
+
         no_output_flag = not any([args.text, args.segment, args.segment2srt, args.subword, args.subword2srt])
 
-        if args.text or no_output_flag:
+        if args.text:
+            output_path = os.path.join(output_dir, f"{base_name}.txt")
             full_text = " ".join([seg.text for seg in all_segments])
-            if args.text:
-                output_path = os.path.join(output_dir, f"{base_name}.txt")
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(full_text)
-                print(f"完整文本已保存到: {output_path}")
-            if no_output_flag:
-                print("\n识别结果 (完整文本):")
-                print(full_text)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(full_text)
+            print(f"完整文本已保存到: {output_path}")
 
         if args.segment:
             output_path = os.path.join(output_dir, f"{base_name}.segments.txt")
@@ -245,6 +275,67 @@ def main():
                     f.write(f"{format_srt_time(last_sub.seconds)} --> {format_srt_time(last_sub.seconds + 0.2)}\n")
                     f.write(f"{last_sub.token.replace(' ', '')}\n\n")
             print(f"子词 SRT 文件已保存到: {output_path}")
+
+        if args.kass:
+            output_path = os.path.join(output_dir, f"{base_name}.k.ass")
+            
+            # ASS 字幕文件头
+            ass_header = """\
+[Script Info]
+ScriptType: v4.00+
+Collisions: Normal
+Timer: 100.0000
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,24,&H00FFFFFF,&HFF000000,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+            dialogue_lines = []
+            subword_idx = 0
+            
+            for seg in all_segments:
+                segment_subwords = []
+                # 找到属于当前 segment 的所有 subwords
+                while subword_idx < len(all_subwords) and all_subwords[subword_idx].seconds < seg.end_seconds:
+                    if all_subwords[subword_idx].seconds >= seg.start_seconds:
+                        segment_subwords.append(all_subwords[subword_idx])
+                    subword_idx += 1
+                
+                if not segment_subwords:
+                    continue
+
+                karaoke_text = ""
+                # 计算每个 subword 的时长
+                for i, sub in enumerate(segment_subwords):
+                    duration_s = 0
+                    if i < len(segment_subwords) - 1:
+                        duration_s = segment_subwords[i+1].seconds - sub.seconds
+                    else:
+                        # 最后一个 subword 的时长，估算为到 segment 结尾
+                        duration_s = max(0.1, seg.end_seconds - sub.seconds)
+
+                    # 转换为厘秒 (cs)
+                    duration_cs = max(1, round(duration_s * 100))
+                    
+                    # 清理 token 中的特殊空格字符
+                    clean_token = sub.token.replace(' ', ' ')
+                    
+                    karaoke_text += f"{{\\k{duration_cs}}}{clean_token}"
+                
+                # 格式化 Dialogue 行
+                start_time = format_ass_time(seg.start_seconds)
+                end_time = format_ass_time(seg.end_seconds)
+                dialogue_lines.append(f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{karaoke_text}")
+
+            # 写入文件
+            with open(output_path, 'w', encoding='utf-8-sig') as f:
+                f.write(ass_header)
+                f.write("\n".join(dialogue_lines))
+            
+            print(f"卡拉OK式 ASS 字幕已保存到: {output_path}")
 
     finally:
         # --- 清理工作：删除临时的 WAV 文件 ---

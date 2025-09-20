@@ -58,8 +58,14 @@ if %ERRORLEVEL% == 2 (
 
 echo.
 echo 请输入新数值，或直接按回车以使用默认值。
-set /p "vadThresh=输入 vad_threshold (默认: 0.4): "
-if not defined vadThresh set vadThresh=0.4
+set /p "vadThresh=输入 vad_threshold (默认: 0.2): "
+if not defined vadThresh set vadThresh=0.2
+
+set /p "negThresh=输入 vad_neg_threshold (语音结束阈值, 默认: 0.1): "
+if not defined negThresh set negThresh=0.1
+
+set /p "minSilence=输入 vad_min_silence_ms (最小静音时长, 默认: 250): "
+if not defined minSilence set minSilence=250
 
 set /p "minSpeech=输入 min_speech_duration_ms (默认: 100): "
 if not defined minSpeech set minSpeech=100
@@ -98,12 +104,14 @@ echo   2. 带时间戳的片段 (.segments.txt)
 echo   3. 将片段转为 SRT 字幕 (.srt)
 echo   4. 带时间戳的子词 (.subwords.txt)
 echo   5. 将子词转为 SRT 字幕 (.subwords.srt)
+echo   6. 卡拉OK式ASS字幕 (.k.ass)
 echo.
 
 :ChoiceOutput
 set "outputOption="
-choice /c 12345 /m "请输入您的选择 [1-5]："
+choice /c 123456 /m "请输入您的选择 [1-6]："
 
+if %ERRORLEVEL% == 6 set "outputOption=-kass"
 if %ERRORLEVEL% == 5 set "outputOption=-subword2srt"
 if %ERRORLEVEL% == 4 set "outputOption=-subword"
 if %ERRORLEVEL% == 3 set "outputOption=-segment2srt"
