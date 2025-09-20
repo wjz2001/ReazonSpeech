@@ -41,6 +41,8 @@ VAD参数
 ====
 .. code:: console
 
+   不填写任何参数：直接把完整的识别文本打印至控制台
+
    -text：仅输出完整的识别文本并保存到 .txt 文件
 
    -segment：输出带时间戳的文本片段 (Segment)并保存到 .segments.txt 文件
