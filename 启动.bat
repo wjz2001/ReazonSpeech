@@ -41,36 +41,53 @@ choice /c YN /m "是否使用智能分块？ (Y=是, 推荐长文件使用; N=�
 
 if %ERRORLEVEL% == 2 (
     set "chunkOption=--no-chunk"
-    goto AskOutput
+    goto AskBeamSize
 )
 
-REM --- 4. (如果分块) 询问是否修改分块参数 ---
-:AskChunkParams
+REM --- 4. (如果分块) 询问是否修改VAD参数 ---
+:AskVadParams
 echo.
 set "chunkParams="
-choice /c YN /m "是否需要修改默认的分块参数？"
+choice /c YN /m "是否需要修改默认的VAD参数？"
 
 if %ERRORLEVEL% == 2 (
-    echo 正在使用默认分块参数。
-    goto AskOutput
+    echo 正在使用默认VAD参数。
+    goto AskBeamSize
 )
 
 echo.
 echo 请输入新数值，或直接按回车以使用默认值。
-set /p "minSilence=输入 min_silence_len (默认: 700): "
-if not defined minSilence set minSilence=700
+set /p "vadThresh=输入 vad_threshold (默认: 0.4): "
+if not defined vadThresh set vadThresh=0.4
 
-set /p "thresh=输入 silence_thresh (默认: -40): "
-if not defined thresh set thresh=-40
+set /p "minSpeech=输入 min_speech_duration_ms (默认: 100): "
+if not defined minSpeech set minSpeech=100
 
 set /p "keep=输入 keep_silence (默认: 300): "
 if not defined keep set keep=300
 
-set "chunkParams=--min_silence_len %minSilence% --silence_thresh %thresh% --keep_silence %keep%"
+set "chunkParams=--vad_threshold %vadThresh% --min_speech_duration_ms %minSpeech% --keep_silence %keep%"
 echo 已设置自定义参数。
 echo.
 
-REM --- 5. 询问输出方式 ---
+REM --- 5. 询问是否使用Beam Search ---
+:AskBeamSize
+echo ----------------------------------------------------------------------
+set "beamParam="
+set "beamSize="
+choice /c YN /m "是否启用Beam Search以提升准确率(速度会变慢)？"
+
+if %ERRORLEVEL% == 2 (
+    echo 未启用Beam Search。
+    goto AskOutput
+)
+echo.
+set /p "beamSize=请输入Beam Size的大小 (推荐值为5或10): "
+if not defined beamSize set beamSize=5
+set "beamParam=--beam_size %beamSize%"
+echo.
+
+REM --- 6. 询问输出方式 ---
 :AskOutput
 echo ----------------------------------------------------------------------
 echo 请选择一个输出格式：
@@ -92,15 +109,14 @@ if %ERRORLEVEL% == 3 set "outputOption=-segment2srt"
 if %ERRORLEVEL% == 2 set "outputOption=-segment"
 if %ERRORLEVEL% == 1 set "outputOption=-text"
 
-REM --- 6. 执行最终的 Python 命令 ---
+REM --- 7. 执行最终的 Python 命令 ---
 echo.
 echo ======================================================================
 echo 正在开始识别... 请稍候。
-echo 根据文件长度，这可能需要较长时间。
 echo ======================================================================
 echo.
 
-python asr.py "%inputFile%" %chunkOption% %chunkParams% %outputOption%
+python asr.py "%inputFile%" %chunkOption% %chunkParams% %beamParam% %outputOption%
 
 echo.
 echo ======================================================================

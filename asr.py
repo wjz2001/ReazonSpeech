@@ -2,12 +2,28 @@ import argparse
 import os
 import tempfile
 import shutil
+import torch
 from pydub import AudioSegment
-from pydub.silence import detect_nonsilent # 使用更精确的静音侦测
-from reazonspeech.nemo.asr import load_model, transcribe, audio_from_path, TranscribeConfig
-# 导入数据类，用于校正时间戳
-from reazonspeech.nemo.asr.interface import Segment, Subword
 
+from reazonspeech.nemo.asr import load_model, audio_from_path
+from reazonspeech.nemo.asr.decode import decode_hypothesis
+from reazonspeech.nemo.asr.interface import Segment, Subword, TranscribeConfig
+
+# Silero VAD 的辅助函数
+def get_speech_timestamps(wav_path, model, threshold=0.5, sampling_rate=16000):
+    """使用 Silero VAD 模型获取语音活动的时间戳"""
+    import torchaudio
+    wav, sr = torchaudio.load(wav_path)
+    if sr != sampling_rate:
+        resampler = torchaudio.transforms.Resample(sr, sampling_rate)
+        wav = resampler(wav)
+    if wav.dim() > 1: wav = wav.mean(dim=0)
+    try:
+        speech_timestamps = model.get_speech_timestamps(wav, threshold=threshold)
+        return speech_timestamps
+    except Exception as e:
+        print(f"[VAD 错误] {e}"); return [{'start': 0, 'end': len(wav)}]
+    
 def format_srt_time(seconds):
     """将秒数格式化为 SRT 时间戳格式 (HH:MM:SS,ms)"""
     assert seconds >= 0, "non-negative timestamp expected"
@@ -41,6 +57,19 @@ def main():
         help="禁用智能分块功能，一次性处理整个音频文件"
     )
 
+    # --- 解码参数 ---
+    parser.add_argument(
+        "--beam_size",
+        type=int,
+        default=1,
+        help="Beam search 的大小。大于1会显著提升准确率但降低速度。推荐值为5或10。"
+    )
+
+    # --- VAD (Silero VAD) 核心参数 ---
+    parser.add_argument("--vad_threshold", type=float, default=0.4, help="[VAD] 模型的置信度阈值 (0-1)，值越高判断越严格。")
+    parser.add_argument("--min_speech_duration_ms", type=int, default=100, help="[VAD 过滤器] 语音块被处理的最小持续时间（毫秒），用于过滤噪音。")
+    parser.add_argument("--keep_silence", type=int, default=300, help="在语音块前后扩展的时长（毫秒），以防切断单词。")
+
     # 创建一个互斥的参数组，因为一次只能选择一种输出格式
     output_group = parser.add_mutually_exclusive_group()
     output_group.add_argument(
@@ -68,11 +97,6 @@ def main():
         action="store_true", 
         help="将子词 (Subword) 转换为 SRT 字幕文件并保存"
     )
-
-    # --- 智能分块参数 ---
-    parser.add_argument("--min_silence_len", type=int, default=700, help="最小静音时长（毫秒）。")
-    parser.add_argument("--silence_thresh", type=int, default=-50, help="静音音量阈值（dBFS）。")
-    parser.add_argument("--keep_silence", type=int, default=300, help="分割块前后保留的静音时长（毫秒）。")
 
     args = parser.parse_args()
 
@@ -105,66 +129,70 @@ def main():
         model = load_model(device='cuda')
         print("模型加载完成。")
 
+        decoding_config = model.cfg.decoding
+        if args.beam_size > 1:
+            print(f"已启用 Beam Search 解码，beam size = {args.beam_size}。")
+            decoding_config.decoding_strategy = "beam"
+            decoding_config.beam.beam_size = args.beam_size
+        else:
+            decoding_config.decoding_strategy = "greedy"
+        model.change_decoding_strategy(decoding_config)
+
         # --- 逐块识别并校正时间戳 ---
         all_segments = []
         all_subwords = []
 
         if args.no_chunk:
             # --- 不分块的逻辑 ---
-            print("检测到 --no-chunk 参数，将一次性处理整个文件...")
-            audio_data = audio_from_path(temp_wav_path)
-            ret = transcribe(model, audio_data, config=TranscribeConfig(verbose=True)) # 长时间任务显示进度条
+            print("检测到 --no-chunk 参数，将一次性处理整个文件……")
+            hyp, _ = model.transcribe([temp_wav_path], return_hypotheses=True, verbose=True)
+            ret = decode_hypothesis(model, hyp[0])
             all_segments = ret.segments
             all_subwords = ret.subwords
 
         else:
             # --- 智能分块的逻辑 ---
-            print("正在侦测音频中的语音活动以进行智能分块...")
-            wav_audio = AudioSegment.from_wav(temp_wav_path)
+            print("正在使用 Silero VAD 模型侦测音频中的语音活动以进行智能分块……")
+            vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad')
+            speech_timestamps = get_speech_timestamps(temp_wav_path, vad_model, threshold=args.vad_threshold)
             
-            nonsilent_ranges = detect_nonsilent(
-                wav_audio,
-                min_silence_len=args.min_silence_len,
-                silence_thresh=args.silence_thresh,
-            )
-            if not nonsilent_ranges:
-                print("警告：未侦测到语音活动。将尝试处理整个文件。")
-                nonsilent_ranges = [[0, len(wav_audio)]]
-                
-            print(f"音频被智能分割成 {len(nonsilent_ranges)} 个块。")
+            nonsilent_ranges_ms = []
+            for ts in speech_timestamps:
+                start_ms = ts['start'] / (16000 / 1000)
+                end_ms = ts['end'] / (16000 / 1000)
+                nonsilent_ranges_ms.append([start_ms, end_ms])
+            
+            if not nonsilent_ranges_ms:
+                print("警告：未侦测到语音活动。将尝试处理整个文件。"); nonsilent_ranges_ms = [[0, len(AudioSegment.from_wav(temp_wav_path))]]
+            
+            original_chunk_count = len(nonsilent_ranges_ms)
+            filtered_ranges = [r for r in nonsilent_ranges_ms if (r[1] - r[0]) >= args.min_speech_duration_ms]
+            print(f"VAD 侦测到 {original_chunk_count} 个语音块，经过滤（最短 {args.min_speech_duration_ms}ms），保留 {len(filtered_ranges)} 个块进行处理。")
 
-            for i, time_range in enumerate(nonsilent_ranges):
-                start_ms, end_ms = time_range
-                start_ms = max(0, start_ms - args.keep_silence)
-                end_ms = min(len(wav_audio), end_ms + args.keep_silence)
-                chunk = wav_audio[start_ms:end_ms]
-                time_offset_s = start_ms / 1000.0
+            if len(filtered_ranges) > 0:
+                wav_audio = AudioSegment.from_wav(temp_wav_path)
+                for i, time_range in enumerate(filtered_ranges):
+                    start_ms, end_ms = time_range
+                    start_ms = max(0, start_ms - args.keep_silence)
+                    end_ms = min(len(wav_audio), end_ms + args.keep_silence)
+                    chunk = wav_audio[start_ms:end_ms]
+                    time_offset_s = start_ms / 1000.0
 
-                chunk_path = os.path.join(temp_chunk_dir, f"chunk_{i}.wav")
-                print(f"正在处理块 {i+1}/{len(nonsilent_ranges)} (时间: {format_srt_time(time_offset_s)})...")
-                chunk.export(chunk_path, format="wav")
-                
-                audio_chunk_data = audio_from_path(chunk_path)
-                ret = transcribe(model, audio_chunk_data, config=TranscribeConfig(verbose=False))
-                
-                if ret.segments:
-                    for seg in ret.segments:
-                        all_segments.append(Segment(
-                            start_seconds=seg.start_seconds + time_offset_s,
-                            end_seconds=seg.end_seconds + time_offset_s,
-                            text=seg.text
-                        ))
-                if ret.subwords:
-                    for sub in ret.subwords:
-                        all_subwords.append(Subword(
-                            seconds=sub.seconds + time_offset_s,
-                            token_id=sub.token_id,
-                            token=sub.token
-                        ))
-
+                    chunk_path = os.path.join(temp_chunk_dir, f"chunk_{i}.wav")
+                    print(f"正在处理块 {i+1}/{len(filtered_ranges)} (时间: {format_srt_time(time_offset_s)})...")
+                    chunk.export(chunk_path, format="wav")
+                    
+                    hyp, _ = model.transcribe([chunk_path], return_hypotheses=True, verbose=False)
+                    
+                    if hyp and hyp[0]:
+                        ret = decode_hypothesis(model, hyp[0])
+                        if ret.segments:
+                            for seg in ret.segments: all_segments.append(Segment(start_seconds=seg.start_seconds + time_offset_s, end_seconds=seg.end_seconds + time_offset_s, text=seg.text))
+                        if ret.subwords:
+                            for sub in ret.subwords: all_subwords.append(Subword(seconds=sub.seconds + time_offset_s, token_id=sub.token_id, token=sub.token))
         # --- 根据参数生成输出文件 ---
         print("-" * 20)
-        print("识别完成，正在生成输出文件...")
+        print("识别完成，正在生成输出文件……")
 
         # 如果没有任何参数，则默认在控制台打印全文
         no_output_flag = not any([args.text, args.segment, args.segment2srt, args.subword, args.subword2srt])
