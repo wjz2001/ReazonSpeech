@@ -16,24 +16,32 @@ This repository provides access to the main user tooling of ReazonSpeech project
 
 推荐使用nemo版模型，注意先安装好对应cuda版本的torch
 
-参数
+VAD参数
 ====
 .. code:: console
 
-   --no-chunk 禁用分块
+   --no-chunk：禁用分块
 
-   --beam_size Beam search 的大小。大于1会显著提升准确率但降低速度。推荐值为5或10
-   --vad_threshold VAD模型的置信度阈值 (0-1)，值越高判断越严格
-   --min_speech_duration_ms VAD 过滤器语音块被处理的最小持续时间（毫秒），用于过滤噪音
-   --keep_silence 在语音块前后扩展的时长（毫秒），以防切断单词
+   --beam_size：Beam search 的大小。大于1会显著提升准确率但降低速度。推荐值为5或10
+   --vad_threshold：VAD模型的置信度阈值 (0-1)，值越高判断越严格
+   --vad_neg_threshold：VAD语音结束判断的阈值。默认是 threshold - 0.15
+   --vad_min_silence_ms：VAD结束语音块前需要等待的最小静音时长（毫秒）
+   --min_speech_duration_ms：VAD 过滤器语音块被处理的最小持续时间（毫秒），用于过滤噪音
+   --keep_silence：在语音块前后扩展的时长（毫秒），以防切断单词
 
-   -text 仅输出完整的识别文本并保存到 .txt 文件
+输出参数
+====
+.. code:: console
 
-   -segment 输出带时间戳的文本片段 (Segment)并保存到 .segments.txt 文件
-   -segment2srt 将文本片段 (Segment) 转换为 SRT 字幕文件并保存
+   -text：仅输出完整的识别文本并保存到 .txt 文件
 
-   -subword 输出所有的子词 (Subword) 及其时间戳并保存到保存到 .subwords.txt 文件=
-   -subword2srt 将子词 (Subword) 转换为 SRT 字幕文件并保存
+   -segment：输出带时间戳的文本片段 (Segment)并保存到 .segments.txt 文件
+   -segment2srt：将文本片段 (Segment) 转换为 SRT 字幕文件并保存
+
+   -subword：输出所有的子词 (Subword) 及其时间戳并保存到保存到 .subwords.txt 文件=
+   -subword2srt：将子词 (Subword) 转换为 SRT 字幕文件并保存
+
+   -kass：生成逐字计时的卡拉OK式 ASS 字幕文件 (.k.ass)
 
 Install
 =======
