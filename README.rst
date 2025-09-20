@@ -6,11 +6,19 @@ This repository provides access to the main user tooling of ReazonSpeech project
 
 * https://research.reazon.jp/projects/ReazonSpeech/
 
+Install
+=======
+
+.. code:: console
+
+   $ git clone https://github.com/reazon-research/ReazonSpeech
+   $ pip install ReazonSpeech/pkg/nemo-asr  # or k2-asr, espnet-asr or espnet-oneseg
+
 用法
 ====
 .. code:: console
 
-   pip install silero-vad 安装silero
+   安装silero：pip install silero-vad 
 
    python asr.py 文件路径
 
@@ -42,14 +50,6 @@ VAD参数
    -subword2srt：将子词 (Subword) 转换为 SRT 字幕文件并保存
 
    -kass：生成逐字计时的卡拉OK式 ASS 字幕文件 (.k.ass)
-
-Install
-=======
-
-.. code:: console
-
-   $ git clone https://github.com/reazon-research/ReazonSpeech
-   $ pip install ReazonSpeech/pkg/nemo-asr  # or k2-asr, espnet-asr or espnet-oneseg
 
 Packages
 ========
