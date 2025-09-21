@@ -16,9 +16,18 @@ def load_model(device=None):
       nemo.collections.asr.models.EncDecRNNTBPEModel
     """
 
-    # 1. 定义模型应该存放的本地路径和文件名
-    #    您可以根据需要修改这个目录路径
-    model_dir = 'D:\\ReazonSpeech\\models'
+    #  动态获取当前脚本文件所在的目录
+    #    __file__ 是一个内置变量，代表当前脚本的文件名
+    #    os.path.dirname(os.path.abspath(__file__)) 可以获得脚本所在的绝对目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 定义模型应该存放的本地路径和文件名
+    #    使用 '..' 来代表上一级目录，从当前目录 (asr) 出发，
+    #    上溯六层到达 D:\ReazonSpeech，然后再进入 models 目录
+    model_dir = os.path.join(script_dir, '..', '..', '..', '..',     '..', '..', 'models')
+    
+    #    使用 os.path.normpath 来规范化路径，使其看起来更整洁 (例如     D:\ReazonSpeech\models)
+    model_dir = os.path.normpath(model_dir)
     model_name = 'reazonspeech-nemo-v2.nemo'
     local_model_path = os.path.join(model_dir, model_name)
 
