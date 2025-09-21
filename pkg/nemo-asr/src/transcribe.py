@@ -15,6 +15,13 @@ def load_model(device=None):
     Returns:
       nemo.collections.asr.models.EncDecRNNTBPEModel
     """
+
+    # 1. 定义模型应该存放的本地路径和文件名
+    #    您可以根据需要修改这个目录路径
+    model_dir = 'D:\\ReazonSpeech\\models'
+    model_name = 'reazonspeech-nemo-v2.nemo'
+    local_model_path = os.path.join(model_dir, model_name)
+
     if device is None:
         if torch.cuda.is_available():
             device = "cuda"
@@ -24,7 +31,22 @@ def load_model(device=None):
     from nemo.utils import logging
     logging.setLevel(logging.ERROR)
     from nemo.collections.asr.models import EncDecRNNTBPEModel
-    return EncDecRNNTBPEModel.from_pretrained('reazon-research/reazonspeech-nemo-v2',
+
+    # 4. 核心逻辑：检查本地模型是否存在
+    if os.path.exists(local_model_path):
+        # 如果文件存在，就从本地加载
+        print(f"[提示] 在 '{local_model_path}' 找到本地模型。")
+        print(f"[提示] 正在从本地加载模型...")
+        return EncDecRNNTBPEModel.restore_from(restore_path=local_model_path,
+                                              map_location=device)
+    else:
+        # 如果文件不存在，执行原始的下载逻辑
+        print(f"[提示] 在 '{local_model_path}' 未找到本地模型。")
+        print(f"[提示] 准备从 Hugging Face 下载模型...")
+        # 确保模型目录存在，以便下载的文件可以被 NeMo 缓存到默认位置
+        # (注意: from_pretrained 有自己的缓存机制，通常在用户主目录下的 .cache)
+        # 这里的打印信息主要是为了告知用户将要发生网络下载
+        return EncDecRNNTBPEModel.from_pretrained('reazon-research/reazonspeech-nemo-v2',
                                               map_location=device)
 
 def transcribe(model, audio, config=None):
