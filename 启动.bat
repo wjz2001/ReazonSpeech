@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 rem 切换代码页以正确显示中文字符
 chcp 65001 > nul
 setlocal

@@ -341,7 +341,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             for seg in all_segments:
                 segment_subwords = []
                 # 找到属于当前 segment 的所有 subwords
-                while subword_idx < len(all_subwords) and all_subwords[subword_idx].seconds < seg.end_seconds:
+                while subword_idx < len(all_subwords) and all_subwords[subword_idx].seconds <= seg.end_seconds:
                     if all_subwords[subword_idx].seconds >= seg.start_seconds:
                         segment_subwords.append(all_subwords[subword_idx])
                     subword_idx += 1
