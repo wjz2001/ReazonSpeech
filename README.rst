@@ -11,18 +11,23 @@ Install
 
 .. code:: console
 
-   $ git clone https://github.com/reazon-research/ReazonSpeech
-   $ pip install ReazonSpeech/pkg/nemo-asr  # or k2-asr, espnet-asr or espnet-oneseg
+   git clone https://github.com/reazon-research/ReazonSpeech
+   pip install ReazonSpeech/pkg/nemo-asr  # or k2-asr, espnet-asr or espnet-oneseg
+   pip install pyannote.audio
+
+   在根目录下新建文件夹 model 文件夹
+
+   在https://huggingface.co/onnx-community/pyannote-segmentation-3.0/tree/main/onnx下载模型 model_quantized.onnx
+   在https://huggingface.co/reazon-research/reazonspeech-nemo-v2/tree/main下载模型 reazonspeech-nemo-v2.nemo
+   把以上两个模型放入 model 文件夹
+
+   注意安装好对应cuda版本的torch
 
 用法
 ====
 .. code:: console
 
-   安装silero：pip install silero-vad 
-
    python asr.py 文件路径
-
-推荐使用nemo版模型，注意先安装好对应cuda版本的torch
 
 VAD参数
 ====
@@ -31,11 +36,9 @@ VAD参数
    --no-chunk：禁用分块
 
    --beam_size：Beam search 的大小。大于1会显著提升准确率但降低速度。推荐值为5或10
-   --vad_threshold：VAD模型的置信度阈值 (0-1)，值越高判断越严格
-   --vad_neg_threshold：VAD语音结束判断的阈值。默认是 threshold - 0.15
-   --vad_min_silence_ms：VAD结束语音块前需要等待的最小静音时长（毫秒）
-   --min_speech_duration_ms：VAD 过滤器语音块被处理的最小持续时间（毫秒），用于过滤噪音
-   --keep_silence：在语音块前后扩展的时长（毫秒），以防切断单词
+   --vad_threshold：VAD判断为语音的置信度阈值 (0-1)
+   --min_speech_duration_s：移除短于此时长(秒)的语音块
+   --keep_silence：在语音块前后扩展的时长（毫秒）
 
 输出参数
 ====
