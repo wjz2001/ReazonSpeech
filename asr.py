@@ -4,6 +4,7 @@ import tempfile
 import shutil
 import torch
 import torchaudio
+from pathlib import Path
 from pydub import AudioSegment
 # 导入 OmegaConf 用于创建解码配置
 from omegaconf import OmegaConf
@@ -11,8 +12,49 @@ from omegaconf import OmegaConf
 from reazonspeech.nemo.asr import load_model
 from reazonspeech.nemo.asr.decode import decode_hypothesis
 from reazonspeech.nemo.asr.interface import Segment, Subword
-from silero_vad import load_silero_vad, get_speech_timestamps
 
+# ONNX VAD 依赖
+try:
+    import onnxruntime
+    import numpy as np
+except ImportError:
+    onnxruntime = None
+
+# --- ONNX VAD 辅助函数 ---
+def get_speech_timestamps_onnx(wav_tensor, onnx_session, threshold=0.5, sampling_rate=16000):
+    """使用 ONNX 模型和后处理来获取语音时间戳"""
+    # ONNX 模型需要特定的输入形状
+    if wav_tensor.dim() == 2:
+        wav_tensor = wav_tensor.unsqueeze(0)
+    
+    # 运行 ONNX 模型
+    ort_inputs = {'input_values': wav_tensor.numpy()}
+    ort_outs = onnx_session.run(None, ort_inputs)
+    logits = torch.from_numpy(ort_outs[0])[0] # 获取 logits: [num_frames, num_classes]
+    
+    # Pyannote-segmentation-3.0 的输出中，索引2是 "speech"
+    speech_probs = torch.sigmoid(logits[:, 2])
+    speech_frames = speech_probs > threshold
+    
+    frame_duration_s = (wav_tensor.shape[2] / sampling_rate) / logits.shape[0]
+    speech_timestamps = []
+    is_speech = False
+    start_time = 0
+    
+    for i, frame in enumerate(speech_frames):
+        if frame and not is_speech:
+            is_speech = True
+            start_time = i * frame_duration_s
+        elif not frame and is_speech:
+            is_speech = False
+            end_time = i * frame_duration_s # 结束点是当前帧的开始
+            speech_timestamps.append({'start': start_time, 'end': end_time})
+    if is_speech:
+        end_time = len(speech_frames) * frame_duration_s
+        speech_timestamps.append({'start': start_time, 'end': end_time})
+            
+    return speech_timestamps
+    
 def format_srt_time(seconds):
     """将秒数格式化为 SRT 时间戳格式 (HH:MM:SS,ms)"""
     assert seconds >= 0, "non-negative timestamp expected"
@@ -64,11 +106,9 @@ def main():
     )
 
     # --- VAD (Silero VAD) 核心参数 ---
-    parser.add_argument("--vad_threshold", type=float, default=0.2, help="[VAD] 模型的置信度阈值 (0-1)，值越高判断越严格。")
-    parser.add_argument("--vad_neg_threshold", type=float, default=0.1, help="[VAD] 语音结束判断的阈值。默认是 threshold - 0.15。")
-    parser.add_argument("--vad_min_silence_ms", type=int, default=250, help="[VAD] 结束语音块前需要等待的最小静音时长（毫秒）。")
-    parser.add_argument("--min_speech_duration_ms", type=int, default=0, help="[VAD 过滤器] 语音块被处理的最小持续时间（毫秒），用于过滤噪音。")
-    parser.add_argument("--keep_silence", type=int, default=300, help="在语音块前后扩展的时长（毫秒），以防切断单词。")
+    parser.add_argument("--vad_threshold", type=float, default=0.2, help="[VAD] 判断为语音的置信度阈值 (0-1)。")
+    parser.add_argument("--min_speech_duration_s", type=float, default=0.1, help="[过滤器] 移除短于此时长(秒)的语音块。")
+    parser.add_argument("--keep_silence", type=int, default=30, help="在语音块前后扩展的时长（毫秒）。")
 
     # 创建一个互斥的参数组，因为一次只能选择一种输出格式
     output_group = parser.add_mutually_exclusive_group()
@@ -160,34 +200,38 @@ def main():
             all_subwords = ret.subwords
 
         else:
-            # --- 智能分块的逻辑 ---
-            print("正在使用 Silero VAD 模型侦测音频中的语音活动以进行智能分块……")
-            vad_model = load_silero_vad(onnx=True)
-            # 加载音频为 tensor
-            wav_tensor, _ = torchaudio.load(temp_wav_path)
+            if not onnxruntime:
+                print("[错误] onnxruntime 未安装。请运行 'pip install onnxruntime'。")
+                return
             
-            # 调用官方函数
-            speech_timestamps_seconds = get_speech_timestamps(
-                wav_tensor, 
-                vad_model, 
-                threshold=args.vad_threshold,
-                neg_threshold=args.vad_neg_threshold,
-                min_silence_duration_ms=args.vad_min_silence_ms,
-                min_speech_duration_ms=args.min_speech_duration_ms, # 注意：这个参数函数自带，我们不再需要手动过滤
-                speech_pad_ms=args.keep_silence,
-                return_seconds=True
+            script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+            local_onnx_model_path = script_dir / 'models' / 'model_quantized.onnx'
+            
+            if not local_onnx_model_path.exists():
+                print(f"[错误] ONNX VAD 模型未在 '{local_onnx_model_path}' 找到。")
+                print("请下载 model_quantized.onnx 并放入 models 文件夹。")
+                return
+
+            print("正在从本地路径加载 ONNX VAD 模型 (将在 CPU 上运行)...")
+            onnx_session = onnxruntime.InferenceSession(str(local_onnx_model_path), providers=['CPUExecutionProvider'])
+            print("ONNX VAD 模型加载完成。")
+
+            print("正在使用 ONNX VAD 进行语音活动侦测...")
+            wav_tensor, sr = torchaudio.load(temp_wav_path)
+            speech_timestamps_seconds = get_speech_timestamps_onnx(
+                wav_tensor, onnx_session, args.vad_threshold
             )
-            print("Silero VAD 模型加载完成。")
-            
-            # 将秒转换为毫秒
+                
             nonsilent_ranges_ms = [[ts['start'] * 1000, ts['end'] * 1000] for ts in speech_timestamps_seconds]
-            
+
             if not nonsilent_ranges_ms:
-                print("警告：未侦测到语音活动。将尝试处理整个文件。"); nonsilent_ranges_ms = [[0, len(AudioSegment.from_wav(temp_wav_path))]]
-            
-            original_chunk_count = len(nonsilent_ranges_ms)
-            filtered_ranges = [r for r in nonsilent_ranges_ms if (r[1] - r[0]) >= args.min_speech_duration_ms]
-            print(f"VAD 侦测到 {original_chunk_count} 个语音块，经过滤（最短 {args.min_speech_duration_ms}ms），保留 {len(filtered_ranges)} 个块进行处理。")
+                print("警告：未侦测到语音活动。"); 
+                filtered_ranges = []
+            else:
+                original_chunk_count = len(nonsilent_ranges_ms)
+                min_speech_duration_ms = args.min_speech_duration_s * 1000
+                filtered_ranges = [r for r in nonsilent_ranges_ms if (r[1] - r[0]) >= min_speech_duration_ms]
+                print(f"VAD 侦测到 {original_chunk_count} 个语音块，经过滤（最短 {min_speech_duration_ms}ms），保留 {len(filtered_ranges)} 个块进行处理。")
 
             if len(filtered_ranges) > 0:
                 wav_audio = AudioSegment.from_wav(temp_wav_path)
@@ -228,8 +272,6 @@ def main():
             print("-" * 20)
             print("提示：未指定输出参数，结果仅打印到控制台。")
             print("请使用 -text, -segment2srt, -kass 等参数将结果保存到文件。")
-
-        no_output_flag = not any([args.text, args.segment, args.segment2srt, args.subword, args.subword2srt])
 
         if args.text:
             output_path = os.path.join(output_dir, f"{base_name}.txt")

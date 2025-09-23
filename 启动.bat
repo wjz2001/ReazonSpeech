@@ -58,22 +58,16 @@ if %ERRORLEVEL% == 2 (
 
 echo.
 echo 请输入新数值，或直接按回车以使用默认值。
-set /p "vadThresh=输入 vad_threshold (默认: 0.2): "
+set /p "vadThresh=输入 vad_threshold (语音置信度, 默认: 0.2): "
 if not defined vadThresh set vadThresh=0.2
 
-set /p "negThresh=输入 vad_neg_threshold (语音结束阈值, 默认: 0.1): "
-if not defined negThresh set negThresh=0.1
+set /p "minSpeech=输入 min_speech_duration_s (最短语音(秒), 默认: 0.1): "
+if not defined minSpeech set minSpeech=0.1
 
-set /p "minSilence=输入 vad_min_silence_ms (最小静音时长, 默认: 250): "
-if not defined minSilence set minSilence=250
+set /p "keep=输入 keep_silence (语音前后填充(毫秒), 默认: 30): "
+if not defined keep set keep=30
 
-set /p "minSpeech=输入 min_speech_duration_ms (默认: 100): "
-if not defined minSpeech set minSpeech=100
-
-set /p "keep=输入 keep_silence (默认: 300): "
-if not defined keep set keep=300
-
-set "chunkParams=--vad_threshold %vadThresh% --min_speech_duration_ms %minSpeech% --keep_silence %keep%"
+set "chunkParams=--vad_threshold %vadThresh% --min_speech_duration_s %minSpeech% --keep_silence %keep%"
 echo 已设置自定义参数。
 echo.
 
