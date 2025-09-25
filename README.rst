@@ -15,10 +15,10 @@ Install
    pip install ReazonSpeech/pkg/nemo-asr  # or k2-asr, espnet-asr or espnet-oneseg
    pip install pyannote.audio
 
-#. 在根目录下新建文件夹 model 文件夹
+#. 在根目录下新建 models 文件夹
 #. `下载模型 model_quantized.onnx <https://huggingface.co/onnx-community/pyannote-segmentation-3.0/tree/main/onnx/>`_
 #. `下载模型 reazonspeech-nemo-v2.nemo <https://huggingface.co/reazon-research/reazonspeech-nemo-v2/tree/main/>`_
-#. 把以上两个模型放入 model 文件夹
+#. 把以上两个模型放入 models 文件夹
 
 .. note::
    注意安装好对应cuda版本的torch
