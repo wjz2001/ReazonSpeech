@@ -1,22 +1,23 @@
-﻿@echo off
+@echo off
 rem 切换代码页以正确显示中文字符
 chcp 65001 > nul
 setlocal
 title ReazonSpeech 语音识别助手
 
 REM --- 1. 检查并启动虚拟环境 ---
-echo 正在检查虚拟环境...
+echo 正在检查虚拟环境……
 if not exist ".\venv\Scripts\activate.bat" (
     echo.
-    echo [错误] 未在 '.\venv\Scripts\activate.bat' 找到虚拟环境。
-    echo 请确保您正在项目的根目录下运行此脚本。
+    echo [错误] 未在 '.\venv\Scripts\activate.bat' 找到虚拟环境
+    echo 请确保您正在项目的根目录下运行此脚本
     echo.
     pause
     exit /b 1
 )
 
-echo 正在激活虚拟环境...
+echo 正在激活虚拟环境……
 call ".\venv\Scripts\activate.bat"
+echo 虚拟环境激活成功！
 echo.
 
 REM --- 2. 获取音视频文件路径 ---
@@ -27,7 +28,7 @@ set /p "inputFile=请输入您的音频/视频文件的完整路径，然后按�
 
 if not exist "%inputFile%" (
     echo.
-    echo [错误] 文件未找到。请检查路径后重试。
+    echo [错误] 文件未找到，请检查路径后重试
     echo.
     goto GetFile
 )
@@ -52,12 +53,12 @@ set "chunkParams="
 choice /c YN /m "是否需要修改默认的VAD参数？"
 
 if %ERRORLEVEL% == 2 (
-    echo 正在使用默认VAD参数。
+    echo 正在使用默认VAD参数
     goto AskBeamSize
 )
 
 echo.
-echo 请输入新数值，或直接按回车以使用默认值。
+echo 请输入新数值，或直接按回车以使用默认值
 set /p "vadThresh=输入 vad_threshold (语音置信度, 默认: 0.2): "
 if not defined vadThresh set vadThresh=0.2
 
@@ -68,7 +69,7 @@ set /p "keep=输入 keep_silence (语音前后填充(毫秒), 默认: 30): "
 if not defined keep set keep=30
 
 set "chunkParams=--vad_threshold %vadThresh% --min_speech_duration_s %minSpeech% --keep_silence %keep%"
-echo 已设置自定义参数。
+echo 已设置自定义参数
 echo.
 
 REM --- 5. 询问是否使用Beam Search ---
@@ -79,7 +80,7 @@ set "beamSize="
 choice /c YN /m "是否启用Beam Search以提升准确率(速度会变慢)？"
 
 if %ERRORLEVEL% == 2 (
-    echo 未启用Beam Search。
+    echo 未启用Beam Search
     goto AskOutput
 )
 echo.
@@ -115,7 +116,7 @@ if %ERRORLEVEL% == 1 set "outputOption=-text"
 REM --- 7. 执行最终的 Python 命令 ---
 echo.
 echo ======================================================================
-echo 正在开始识别... 请稍候。
+echo 正在开始识别，请稍候……
 echo ======================================================================
 echo.
 
@@ -123,10 +124,9 @@ python asr.py "%inputFile%" %chunkOption% %chunkParams% %beamParam% %outputOptio
 
 echo.
 echo ======================================================================
-echo 识别流程已结束。
-echo 您的输出文件应该已保存在与输入文件相同的目录中。
+echo 识别流程已结束，您的输出文件应该已保存在与输入文件相同的目录中
 echo ======================================================================
 echo.
-echo 按任意键退出...
+echo 按任意键退出……
 pause > nul
 endlocal

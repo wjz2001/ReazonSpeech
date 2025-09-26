@@ -162,7 +162,7 @@ def main():
     # --- 执行核心的语音识别流程 ---
     try:
         # --- FFmpeg 预处理：将输入文件转换为标准 WAV ---
-        print(f"正在转换输入文件 '{input_path}' 为临时 WAV 文件...")
+        print(f"正在转换输入文件 '{input_path}' 为临时 WAV 文件……")
         audio = AudioSegment.from_file(input_path)
         # 转换为单声道，16kHz采样率，这是ASR模型的标准格式
         audio = audio.set_channels(1).set_frame_rate(16000)
@@ -170,8 +170,8 @@ def main():
         print("转换完成。")
 
         # --- 加载模型 (只需一次) ---
-        print("正在加载模型...")
-        model = load_model(device='cuda')
+        print("正在加载模型……")
+        model = load_model()
         print("模型加载完成。")
 
         # 创建一个解码配置对象
@@ -208,15 +208,15 @@ def main():
             local_onnx_model_path = script_dir / 'models' / 'model_quantized.onnx'
             
             if not local_onnx_model_path.exists():
-                print(f"[错误] ONNX VAD 模型未在 '{local_onnx_model_path}' 找到。")
+                print(f"[错误] Pyannote-segmentation-3.0 模型未在 '{local_onnx_model_path}' 找到。")
                 print("请下载 model_quantized.onnx 并放入 models 文件夹。")
                 return
 
-            print("正在从本地路径加载 ONNX VAD 模型 (将在 CPU 上运行)...")
+            print("正在从本地路径加载 Pyannote-segmentation-3.0 模型 (将在 CPU 上运行)……")
             onnx_session = onnxruntime.InferenceSession(str(local_onnx_model_path), providers=['CPUExecutionProvider'])
-            print("ONNX VAD 模型加载完成。")
+            print("Pyannote-segmentation-3.0 模型加载完成。")
 
-            print("正在使用 ONNX VAD 进行语音活动侦测...")
+            print("正在使用 Pyannote-segmentation-3.0 进行语音活动侦测……")
             wav_tensor, sr = torchaudio.load(temp_wav_path)
             speech_timestamps_seconds = get_speech_timestamps_onnx(
                 wav_tensor, onnx_session, args.vad_threshold
@@ -243,7 +243,7 @@ def main():
                     time_offset_s = start_ms / 1000.0
 
                     chunk_path = os.path.join(temp_chunk_dir, f"chunk_{i}.wav")
-                    print(f"正在处理块 {i+1}/{len(filtered_ranges)} (时间: {format_srt_time(time_offset_s)})...")
+                    print(f"正在处理块 {i+1}/{len(filtered_ranges)} (时间: {format_srt_time(time_offset_s)})……")
                     chunk.export(chunk_path, format="wav")
                     
                     hyp, _ = model.transcribe([chunk_path], return_hypotheses=True, verbose=False, override_config=decoding_cfg)
