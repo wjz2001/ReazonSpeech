@@ -11,8 +11,11 @@ Install
 
 .. code:: console
 
-   git clone https://github.com/reazon-research/ReazonSpeech
-   pip install ReazonSpeech/pkg/nemo-asr  # or k2-asr, espnet-asr or espnet-oneseg
+   git clone https://github.com/wjz2001/ReazonSpeech
+   cd ReazonSpeech
+   python -m venv venv
+   .\venv\Scripts\activate
+   python install_for_nemoasr.py  # 仅非windows系统：pip install ReazonSpeech/pkg/nemo-asr or k2-asr, espnet-asr or espnet-oneseg
    pip install pyannote.audio
 
 #. 在根目录下新建 models 文件夹
@@ -21,7 +24,7 @@ Install
 #. 把以上两个模型放入 models 文件夹
 
 .. note::
-   注意安装好对应cuda版本的torch
+   注意torch版本是否适合已安装的cuda版本，一般情况下不会有问题
 
 用法
 ====
