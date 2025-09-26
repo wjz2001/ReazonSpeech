@@ -34,8 +34,12 @@ def load_model(device=None):
     if device is None:
         if torch.cuda.is_available():
             device = "cuda"
+            print("信息: 检测到可用的 GPU，将自动选择 CUDA 加载模型。")
         else:
             device = "cpu"
+            print("信息: 未检测到可用的 GPU，将自动选择 CPU 加载模型。")
+    else:
+        print(f"信息: 用户已指定使用 {device} 设备加载模型。")        
 
     from nemo.utils import logging
     logging.setLevel(logging.ERROR)
