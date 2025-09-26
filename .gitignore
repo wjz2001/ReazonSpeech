@@ -2,8 +2,10 @@ __pycache__
 *.pyc
 *.m2ts
 *.wav
+*.srt
 *.flac
 *.egg-info
 *.zip
 venv/
 /pkg/k2-asr/build/
+models/
