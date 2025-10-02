@@ -6,6 +6,34 @@ from .decode import decode_hypothesis, PAD_SECONDS
 from .audio import audio_to_file, pad_audio, norm_audio
 from .fs import create_tempfile
 
+def find_project_root(marker_file="asr.py"):
+    """
+    从当前脚本位置开始向上查找，直到找到包含指定标记文件的项目根目录。
+
+    Args:
+        marker_file (str): 用于标识项目根目录的文件名。
+
+    Returns:
+        str: 项目根目录的绝对路径。
+        
+    Raises:
+        FileNotFoundError: 如果向上查找到文件系统顶层仍未找到标记文件。
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.exists(os.path.join(current_dir, marker_file)):
+            return current_dir  # 找到了根目录
+        
+        parent_dir = os.path.dirname(current_dir)
+        
+        # 如果已经到达文件系统的顶层 (e.g., 'C:\\')，则停止
+        if parent_dir == current_dir:
+            raise FileNotFoundError(
+                f"无法找到项目根目录。请确保在项目根目录下有一个 '{marker_file}' 文件。"
+            )
+            
+        current_dir = parent_dir
+
 def load_model(device=None):
     """Load ReazonSpeech model
 
@@ -16,18 +44,17 @@ def load_model(device=None):
       nemo.collections.asr.models.EncDecRNNTBPEModel
     """
 
-    #  动态获取当前脚本文件所在的目录
-    #    __file__ 是一个内置变量，代表当前脚本的文件名
-    #    os.path.dirname(os.path.abspath(__file__)) 可以获得脚本所在的绝对目录
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # 定义模型应该存放的本地路径和文件名
-    #    使用 '..' 来代表上一级目录，从当前目录 (asr) 出发，
-    #    上溯六层到达 D:\ReazonSpeech，然后再进入 models 目录
-    model_dir = os.path.join(script_dir, '..', '..', '..', '..',     '..', '..', 'models')
-    
-    #    使用 os.path.normpath 来规范化路径，使其看起来更整洁 (例如     D:\ReazonSpeech\models)
-    model_dir = os.path.normpath(model_dir)
+    local_model_path = None  # 默认本地路径为无效
+    try:
+        # 使用根目录下的 'asr.py' 文件作为锚点来定位项目根目录
+        project_root = find_project_root(marker_file="asr.py")
+    except FileNotFoundError as e:
+        # 如果找不到根目录，不退出，只打印一个提示信息
+        print(f"[提示] 未能定位到项目根目录（{e}）。")
+        print("[提示] 将直接尝试从 Hugging Face 下载模型。")
+
+    # 基于找到的根目录，安全地构建 models 文件夹的路径
+    model_dir = os.path.join(project_root, 'models')
     model_name = 'reazonspeech-nemo-v2.nemo'
     local_model_path = os.path.join(model_dir, model_name)
 

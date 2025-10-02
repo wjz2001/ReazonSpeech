@@ -2,10 +2,13 @@ __pycache__
 *.pyc
 *.m2ts
 *.wav
+!/test.wav
 *.srt
 *.flac
 *.egg-info
 *.zip
-venv/
+/venv/
+/.ssh/
 /pkg/k2-asr/build/
-models/
+/pkg/nemo-asr/build/
+/gitpush.bat

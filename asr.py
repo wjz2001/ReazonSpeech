@@ -97,14 +97,6 @@ def main():
         help="禁用智能分块功能，一次性处理整个音频文件"
     )
 
-    # --- 解码参数 ---
-    parser.add_argument(
-        "--beam_size",
-        type=int,
-        default=1,
-        help="Beam search 的大小。大于1会显著提升准确率但降低速度。推荐值为5或10。"
-    )
-
     # --- VAD (Silero VAD) 核心参数 ---
     parser.add_argument("--vad_threshold", type=float, default=0.2, help="[VAD] 判断为语音的置信度阈值 (0-1)。")
     parser.add_argument("--min_speech_duration_s", type=float, default=0.1, help="[过滤器] 移除短于此时长(秒)的语音块。")
@@ -174,19 +166,6 @@ def main():
         model = load_model()
         print("模型加载完成。")
 
-        # 创建一个解码配置对象
-        if args.beam_size > 1:
-            print(f"已启用 Beam Search 解码，beam size = {args.beam_size}。")
-            decoding_cfg = OmegaConf.create(
-                {
-                    "decoding_strategy": "beam",
-                    "beam": {"beam_size": args.beam_size},
-                }
-            )
-        else:
-            # 对于贪心解码，我们可以不传递任何特殊配置
-            decoding_cfg = None
-
         # --- 逐块识别并校正时间戳 ---
         all_segments = []
         all_subwords = []
@@ -194,7 +173,7 @@ def main():
         if args.no_chunk:
             # --- 不分块的逻辑 ---
             print("检测到 --no-chunk 参数，将一次性处理整个文件……")
-            hyp, _ = model.transcribe([temp_wav_path], return_hypotheses=True, verbose=True, override_config=decoding_cfg)
+            hyp, _ = model.transcribe([temp_wav_path], return_hypotheses=True, verbose=True, override_config=None)
             ret = decode_hypothesis(model, hyp[0])
             all_segments = ret.segments
             all_subwords = ret.subwords
@@ -246,7 +225,7 @@ def main():
                     print(f"正在处理块 {i+1}/{len(filtered_ranges)} (时间: {format_srt_time(time_offset_s)})……")
                     chunk.export(chunk_path, format="wav")
                     
-                    hyp, _ = model.transcribe([chunk_path], return_hypotheses=True, verbose=False, override_config=decoding_cfg)
+                    hyp, _ = model.transcribe([chunk_path], return_hypotheses=True, verbose=False, override_config=None)
                     
                     if hyp and hyp[0]:
                         ret = decode_hypothesis(model, hyp[0])

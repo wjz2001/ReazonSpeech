@@ -14,9 +14,8 @@ Install
    git clone https://github.com/wjz2001/ReazonSpeech
    cd ReazonSpeech
    python -m venv venv
-   .\venv\Scripts\activate
-   python install_for_nemoasr.py  # 仅非windows系统：pip install ReazonSpeech/pkg/nemo-asr or k2-asr, espnet-asr or espnet-oneseg
-   pip install pyannote.audio
+   .\venv\Scripts\activate # Linux或MacOS：source venv/bin/activate
+   python install_for_nemoasr.py
 
 #. 在根目录下新建 models 文件夹
 #. `下载模型 model_quantized.onnx <https://huggingface.co/onnx-community/pyannote-segmentation-3.0/tree/main/onnx/>`_
@@ -38,7 +37,6 @@ VAD参数
 
    --no-chunk：禁用分块
 
-   --beam_size：Beam search 的大小。大于1会显著提升准确率但降低速度。推荐值为5或10
    --vad_threshold：VAD判断为语音的置信度阈值 (0-1)
    --min_speech_duration_s：移除短于此时长(秒)的语音块
    --keep_silence：在语音块前后扩展的时长（毫秒）
