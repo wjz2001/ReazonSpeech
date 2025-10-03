@@ -210,7 +210,7 @@ def main():
                 original_chunk_count = len(nonsilent_ranges_ms)
                 min_speech_duration_ms = args.min_speech_duration_s * 1000
                 filtered_ranges = [r for r in nonsilent_ranges_ms if (r[1] - r[0]) >= min_speech_duration_ms]
-                print(f"VAD 侦测到 {original_chunk_count} 个语音块，经过滤（不超过 {min_speech_duration_ms}ms），保留并处理 {len(filtered_ranges)} 个块。")
+                print(f"VAD 侦测到 {original_chunk_count} 个语音块，过滤不超过 {min_speech_duration_ms}ms的部分，保留并处理 {len(filtered_ranges)} 个语音块。")
 
             if len(filtered_ranges) > 0:
                 wav_audio = AudioSegment.from_wav(temp_wav_path)
@@ -222,7 +222,7 @@ def main():
                     time_offset_s = start_ms / 1000.0
 
                     chunk_path = os.path.join(temp_chunk_dir, f"chunk_{i}.wav")
-                    print(f"正在处理块 {i+1}/{len(filtered_ranges)} (起止时间: {format_srt_time(time_offset_s)})……")
+                    print(f"正在处理块 {i+1}/{len(filtered_ranges)} (块起始时间: {format_srt_time(time_offset_s)})……")
                     chunk.export(chunk_path, format="wav")
                     
                     hyp, _ = model.transcribe([chunk_path], return_hypotheses=True, verbose=False, override_config=None)
