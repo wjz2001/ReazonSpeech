@@ -3,6 +3,7 @@ import sys
 import os
 import re
 import shutil
+import nemo
 
 # --- Helper 函数 ---
 def run_command(command_list):
@@ -12,13 +13,10 @@ def run_command(command_list):
     try:
         executable = command_list[0]
         # 确保调用的是当前虚拟环境的可执行文件
-        if executable in ('pip', 'python'):
-            # 优先使用 Scripts (Windows)，其次是 bin (Linux/macOS)
-            for subdir in ('Scripts', 'bin'):
-                path = os.path.join(sys.prefix, subdir, executable)
-                if os.path.exists(path):
-                    command_list[0] = path
-                    break
+        if command_list[0] == 'python':
+            command_list[0] = sys.executable
+        elif command_list[0] == 'pip':
+            command_list = [sys.executable, '-m', 'pip'] + command_list[1:]
         
         subprocess.run(command_list, check=True) # shell=False 是默认值
         print("... 命令执行成功!")
@@ -55,9 +53,12 @@ def patch_exp_manager():
     """在已安装的 nemo_toolkit 中查找并修补 exp_manager.py 文件 (仅限 Windows)"""
     print("\n> 尝试修补 nemo_toolkit...")
     try:
-        # sys.prefix 在虚拟环境中指向 venv 目录
-        site_packages_path = os.path.join(sys.prefix, 'Lib', 'site-packages')
-        file_path = os.path.join(site_packages_path, 'nemo', 'utils', 'exp_manager.py')
+        # 找到 nemo 包的 __init__.py 文件
+        nemo_init_path = nemo.__file__
+        # 从 __init__.py 向上找到 nemo 包的根目录
+        nemo_root_path = os.path.dirname(nemo_init_path)
+        # 构造目标文件的绝对路径
+        file_path = os.path.join(nemo_root_path, 'utils', 'exp_manager.py')
 
         if not os.path.exists(file_path):
             print(f"!!! 错误: 未能找到文件 {file_path}")
@@ -69,8 +70,8 @@ def patch_exp_manager():
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        original_line = 'rank_termination_signal: signal.Signals = signal.SIGKILL'
-        patched_line = "rank_termination_signal: signal.Signals = getattr(signal, 'SIGKILL', signal.SIGTERM)"
+        original_line = "rank_termination_signal: signal.Signals = signal.SIGKILL"
+        patched_line = "rank_termination_signal: signal.Signals = signal.SIGKILL if os.name != 'nt' else signal.SIGTERM"
 
         if patched_line in content:
             print("--- 文件已被修补过，跳过此步骤。")
