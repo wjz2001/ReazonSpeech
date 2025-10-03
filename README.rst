@@ -52,7 +52,7 @@ VAD参数
    -text：仅输出完整的识别文本并保存为 .txt 文件
 
    -segment：输出带时间戳的文本片段 (Segment)并保存为 .segments.txt 文件
-   -segment2srt：输出带时间戳的文本片段 (Segment)并转换为 .segments.srt 字幕文件
+   -segment2srt：输出带时间戳的文本片段 (Segment)并转换为 .srt 字幕文件
 
    -subword：输出所有的子词 (Subword) 及其时间戳并保存为 .subwords.txt 文件
    -subword2srt：输出所有的子词 (Subword) 及其时间戳并转换为 .subwords.srt 字幕文件
