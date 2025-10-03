@@ -4,6 +4,8 @@ __pycache__
 *.wav
 !/test.wav
 *.srt
+*.txt
+*.ass
 *.flac
 *.egg-info
 *.zip
