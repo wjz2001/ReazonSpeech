@@ -6,7 +6,7 @@ This repository provides access to the main user tooling of ReazonSpeech project
 
 * https://research.reazon.jp/projects/ReazonSpeech/
 
-Install
+部署 Nemo-asr 版本
 =======
 
 .. code:: console
