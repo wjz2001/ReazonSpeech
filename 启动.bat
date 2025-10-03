@@ -39,7 +39,7 @@ REM --- 3. 询问是否分块 ---
 :AskChunk
 echo ----------------------------------------------------------------------
 set "chunkOption="
-choice /c YN /m "是否使用智能分块？ (Y=是, 推荐长文件使用; N=否, 适用于短文件)"
+choice /c YN /m "是否使用智能分块？ (Y=是, 推荐使用; N=否, 除非为了测试否则不推荐使用)"
 
 if %ERRORLEVEL% == 2 (
     set "chunkOption=--no-chunk"
@@ -82,7 +82,7 @@ echo   2. 带时间戳的片段 (.segments.txt)
 echo   3. 将片段转为 SRT 字幕 (.srt)
 echo   4. 带时间戳的子词 (.subwords.txt)
 echo   5. 将子词转为 SRT 字幕 (.subwords.srt)
-echo   6. 卡拉OK式ASS字幕 (.k.ass)
+echo   6. 卡拉OK式ASS字幕 (.ass)
 echo.
 
 :ChoiceOutput
