@@ -1,4 +1,8 @@
-# ReazonSpeech
+<div align="center">
+    <img src="/icon.ico"/>
+    <h1>ReazonSpeech</h1>
+</div>
+<br/>
 
 This repository provides access to the main user tooling of ReazonSpeech
 project.
@@ -24,7 +28,7 @@ python install_for_nemoasr.py
 
 ### 注意
 
-1. 本模型可仅在 CPU 上运行，如果有 GPU 且支持 cuda 的话会更快。
+1. 本模型可仅在 CPU 上运行，如果有 GPU 且支持 cuda 的话会更快
    - 如果要在有 cuda 的 GPU 上运行，建议在运行前检查是否安装了对应 cuda 版本的 torch，一般情况下安装脚本会自动处理好
 2. 确保设备上有能全局使用的ffmpeg，否则无法转换音频/视频为可语音识别的文件
 
@@ -37,7 +41,7 @@ python asr.py 文件路径
 ### VAD参数
 
 | 参数 | 作用 | 默认值 |
-|-----------|-------------|---------|
+|-----------|:-------------:|:---------:|
 | `--no-chunk` | 禁止使用VAD | `无` |
 | `--vad_threshold` | VAD判断为语音的置信度阈值（0-1） | `0.2` |
 | `--min_speech_duration_ms` | 移除短于此时长（毫秒）的语音块 | `100` |
@@ -46,7 +50,7 @@ python asr.py 文件路径
 ### 输出参数
 
 | 参数 | 作用 |
-|-----------|-------------|
+|-----------|:-------------:|
 | `无` | 直接把完整的识别文本打印至控制台 |
 | `-text` | 仅输出完整的识别文本并保存为 .txt 文件 |
 | `-segment` | 输出带时间戳的文本片段 (Segment)并保存为 .segments
