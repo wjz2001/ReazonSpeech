@@ -263,7 +263,7 @@ def main():
             with open(output_path, 'w', encoding='utf-8') as f:
                 for seg in all_segments:
                     f.write(f"[{format_srt_time(seg.start_seconds)} --> {format_srt_time(seg.end_seconds)}] {seg.text}\n")
-            print(f"带时间戳的文本片段：{output_path}")
+            print(f"带时间戳的文本片段已保存为：{output_path}")
 
         if args.segment2srt:
             output_path = os.path.join(output_dir, f"{base_name}.srt")

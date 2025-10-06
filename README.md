@@ -24,7 +24,7 @@ python install_for_nemoasr.py
 
 ### 注意
 
-1. 本模型可仅在 CPU 上运行，如果有 GPU 且支持 cuda 的话会更快。 
+1. 本模型可仅在 CPU 上运行，如果有 GPU 且支持 cuda 的话会更快。
    - 如果要在有 cuda 的 GPU 上运行，建议在运行前检查是否安装了对应 cuda 版本的 torch，一般情况下安装脚本会自动处理好
 2. 确保设备上有能全局使用的ffmpeg，否则无法转换音频/视频为可语音识别的文件
 
