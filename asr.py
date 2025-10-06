@@ -81,13 +81,13 @@ def format_ass_time(seconds):
 def main():
     # --- 设置命令行参数解析 ---
     parser = argparse.ArgumentParser(
-        description="使用 ReazonSpeech 模型识别语音，并按指定格式输出结果。基于静音的智能分块方式识别长音频，以保证准确率并解决显存问题。"
+        description="使用 ReazonSpeech 模型识别语音，并按指定格式输出结果。基于静音的智能分块方式识别长音频，以保证准确率并解决显存问题"
     )
     
-    # 添加一个必须的位置参数：音频文件路径
+    # 添加一个必须的位置参数：音频/视频文件路径
     parser.add_argument(
         "input_file", 
-        help="需要识别语音的音频文件路径"
+        help="需要识别语音的音频/视频文件路径"
     )
 
     # --- --no-chunk 参数 ---
@@ -98,41 +98,40 @@ def main():
     )
 
     # --- VAD (Silero VAD) 核心参数 ---
-    parser.add_argument("--vad_threshold", type=float, default=0.2, help="[VAD] 判断为语音的置信度阈值 (0-1)。")
-    parser.add_argument("--min_speech_duration_s", type=float, default=0.1, help="[过滤器] 移除短于此时长(秒)的语音块。")
-    parser.add_argument("--keep_silence", type=int, default=30, help="在语音块前后扩展时长（毫秒）。")
+    parser.add_argument("--vad_threshold", type=float, default=0.2, help="【VAD】判断为语音的置信度阈值（0-1）")
+    parser.add_argument("--min_speech_duration_ms", type=float, default=100, help="【过滤器】移除短于此时长（毫秒）的语音块")
+    parser.add_argument("--keep_silence", type=int, default=30, help="在语音块前后扩展时长（毫秒）")
 
-    # 创建一个互斥的参数组，因为一次只能选择一种输出格式
-    output_group = parser.add_mutually_exclusive_group()
-    output_group.add_argument(
+    # 输出格式参数
+    parser.add_argument(
         "-text", 
         action="store_true", 
         help="仅输出完整的识别文本并保存为 .txt 文件"
     )
-    output_group.add_argument(
+    parser.add_argument(
         "-segment", 
         action="store_true", 
-        help="输出带时间戳的文本片段 (Segment)并保存为 .segments.txt 文件"
+        help="输出带时间戳的文本片段（Segment）并保存为 .segments.txt 文件"
     )
-    output_group.add_argument(
+    parser.add_argument(
         "-segment2srt", 
         action="store_true", 
-        help="输出带时间戳的文本片段 (Segment)并转换为 .srt 字幕文件"
+        help="输出带时间戳的文本片段（Segment）并转换为 .srt 字幕文件"
     )
-    output_group.add_argument(
+    parser.add_argument(
         "-subword", 
         action="store_true", 
-        help="输出所有的子词 (Subword) 及其时间戳并保存为 .subwords.txt 文件"
+        help="输出带时间戳的所有子词（Subword）并保存为 .subwords.txt 文件"
     )
-    output_group.add_argument(
+    parser.add_argument(
         "-subword2srt", 
         action="store_true", 
-        help="输出所有的子词 (Subword) 及其时间戳并转换为 .subwords.srt 字幕文件"
+        help="输出带时间戳的所有子词（Subword）并转换为 .subwords.srt 字幕文件"
     )
-    output_group.add_argument(
+    parser.add_argument(
         "-kass",
         action="store_true",
-        help="生成逐字计时的卡拉OK式 ASS 字幕文件 (.ass)"
+        help="生成逐字计时的卡拉OK式 .ass 字幕文件"
     )
 
     args = parser.parse_args()
@@ -159,12 +158,12 @@ def main():
         # 转换为单声道，16kHz采样率，这是ASR模型的标准格式
         audio = audio.set_channels(1).set_frame_rate(16000)
         audio.export(temp_wav_path, format="wav")
-        print("转换完成。")
+        print("转换完成")
 
         # --- 加载模型 (只需一次) ---
         print("正在加载模型……")
         model = load_model()
-        print("模型加载完成。")
+        print("模型加载完成")
 
         # --- 逐块识别并校正时间戳 ---
         all_segments = []
@@ -180,20 +179,20 @@ def main():
 
         else:
             if not onnxruntime:
-                print("[错误] onnxruntime 未安装。请运行 'pip install onnxruntime'。")
+                print("【错误】onnxruntime 未安装，请运行 'pip install onnxruntime'")
                 return
             
             script_dir = Path(os.path.dirname(os.path.abspath(__file__)))
             local_onnx_model_path = script_dir / 'models' / 'model_quantized.onnx'
             
             if not local_onnx_model_path.exists():
-                print(f"[错误] Pyannote-segmentation-3.0 模型未在 '{local_onnx_model_path}' 找到。")
-                print("请下载 model_quantized.onnx 并放入 models 文件夹。")
+                print(f"【错误】Pyannote-segmentation-3.0 模型未在 '{local_onnx_model_path}' 中找到")
+                print("请下载 model_quantized.onnx 并放入 models 文件夹")
                 return
 
-            print("正在从本地路径加载 Pyannote-segmentation-3.0 模型 (将在 CPU 上运行)……")
+            print("正在从本地路径加载 Pyannote-segmentation-3.0 模型（将在 CPU 上运行）……")
             onnx_session = onnxruntime.InferenceSession(str(local_onnx_model_path), providers=['CPUExecutionProvider'])
-            print("Pyannote-segmentation-3.0 模型加载完成。")
+            print("Pyannote-segmentation-3.0 模型加载完成")
 
             print("正在使用 Pyannote-segmentation-3.0 侦测语音活动……")
             wav_tensor, sr = torchaudio.load(temp_wav_path)
@@ -204,13 +203,13 @@ def main():
             nonsilent_ranges_ms = [[ts['start'] * 1000, ts['end'] * 1000] for ts in speech_timestamps_seconds]
 
             if not nonsilent_ranges_ms:
-                print("警告：未侦测到语音活动。"); 
+                print("【警告】未侦测到语音活动"); 
                 filtered_ranges = []
             else:
                 original_chunk_count = len(nonsilent_ranges_ms)
-                min_speech_duration_ms = args.min_speech_duration_s * 1000
+                min_speech_duration_ms = args.min_speech_duration_ms
                 filtered_ranges = [r for r in nonsilent_ranges_ms if (r[1] - r[0]) >= min_speech_duration_ms]
-                print(f"VAD 侦测到 {original_chunk_count} 个语音块，过滤不超过 {min_speech_duration_ms}ms 的部分，保留并处理 {len(filtered_ranges)} 个语音块。")
+                print(f"VAD 侦测到 {original_chunk_count} 个语音块，已过滤不超过 {min_speech_duration_ms}ms 的部分，保留并处理 {len(filtered_ranges)} 个语音块")
 
             if len(filtered_ranges) > 0:
                 wav_audio = AudioSegment.from_wav(temp_wav_path)
@@ -222,7 +221,7 @@ def main():
                     time_offset_s = start_ms / 1000.0
 
                     chunk_path = os.path.join(temp_chunk_dir, f"chunk_{i}.wav")
-                    print(f"正在处理语音块 {i+1}/{len(filtered_ranges)} (该块起始时间: {format_srt_time(time_offset_s)})……")
+                    print(f"正在处理语音块 {i+1}/{len(filtered_ranges)} （该块起始时间：{format_srt_time(time_offset_s)}）……")
                     chunk.export(chunk_path, format="wav")
                     
                     hyp, _ = model.transcribe([chunk_path], return_hypotheses=True, verbose=False, override_config=None)
@@ -246,25 +245,25 @@ def main():
         # 只有在用户完全没有指定任何输出参数时，才在控制台打印
         if not file_output_requested:
             full_text = " ".join([seg.text for seg in all_segments])
-            print("\n识别结果 (完整文本):")
+            print("\n识别结果（完整文本）：")
             print(full_text)
             print("-" * 20)
-            print("提示：未指定输出参数，结果仅打印到控制台。")
-            print("请使用 -text, -segment2srt, -kass 等参数将结果保存为文件。")
+            print("提示：未指定输出参数，结果将打印至控制台")
+            print("请使用 -text，-segment2srt，-kass 等参数将结果保存为文件")
 
         if args.text:
             output_path = os.path.join(output_dir, f"{base_name}.txt")
             full_text = " ".join([seg.text for seg in all_segments])
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(full_text)
-            print(f"完整文本已保存为: {output_path}")
+            print(f"完整的识别文本已保存为：{output_path}")
 
         if args.segment:
             output_path = os.path.join(output_dir, f"{base_name}.segments.txt")
             with open(output_path, 'w', encoding='utf-8') as f:
                 for seg in all_segments:
                     f.write(f"[{format_srt_time(seg.start_seconds)} --> {format_srt_time(seg.end_seconds)}] {seg.text}\n")
-            print(f"文本片段已保存为: {output_path}")
+            print(f"带时间戳的文本片段：{output_path}")
 
         if args.segment2srt:
             output_path = os.path.join(output_dir, f"{base_name}.srt")
@@ -273,14 +272,14 @@ def main():
                     f.write(f"{i}\n")
                     f.write(f"{format_srt_time(seg.start_seconds)} --> {format_srt_time(seg.end_seconds)}\n")
                     f.write(f"{seg.text}\n\n")
-            print(f"SRT 字幕文件已保存为: {output_path}")
+            print(f"文本片段 SRT 字幕文件已保存为：{output_path}")
 
         if args.subword:
             output_path = os.path.join(output_dir, f"{base_name}.subwords.txt")
             with open(output_path, 'w', encoding='utf-8') as f:
                 for sub in all_subwords:
                     f.write(f"[{format_srt_time(sub.seconds)}] {sub.token.replace(' ', '')}\n")
-            print(f"子词信息已保存为: {output_path}")
+            print(f"带时间戳的所有子词信息已保存为：{output_path}")
         
         if args.subword2srt:
             output_path = os.path.join(output_dir, f"{base_name}.subwords.srt")
@@ -295,7 +294,7 @@ def main():
                     f.write(f"{len(all_subwords)}\n")
                     f.write(f"{format_srt_time(last_sub.seconds)} --> {format_srt_time(last_sub.seconds + 0.2)}\n")
                     f.write(f"{last_sub.token.replace(' ', '')}\n\n")
-            print(f"子词 SRT 文件已保存为: {output_path}")
+            print(f"所有子词信息 SRT 文件已保存为：{output_path}")
 
         if args.kass:
             output_path = os.path.join(output_dir, f"{base_name}.ass")
@@ -356,18 +355,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f.write(ass_header)
                 f.write("\n".join(dialogue_lines))
             
-            print(f"卡拉OK式 ASS 字幕已保存为: {output_path}")
+            print(f"卡拉OK式 ASS 字幕已保存为：{output_path}")
 
     finally:
         # --- 清理工作：删除临时的 WAV 文件 ---
         if os.path.exists(temp_wav_path):
             os.remove(temp_wav_path)
-            print(f"\n临时文件 '{temp_wav_path}' 已删除。")
+            print(f"\n临时文件 '{temp_wav_path}' 已删除")
 
         # 使用 shutil.rmtree 来删除临时块目录及其所有内容
         if os.path.exists(temp_chunk_dir):
             shutil.rmtree(temp_chunk_dir)
-            print(f"临时块目录 '{os.path.basename(temp_chunk_dir)}' 已删除。")
+            print(f"临时块目录 '{os.path.basename(temp_chunk_dir)}' 已删除")
 
 if __name__ == "__main__":
     main()
