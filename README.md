@@ -9,7 +9,7 @@ project.
 
 - <https://research.reazon.jp/projects/ReazonSpeech/>
 
-## 部署
+## nemo版部署
 
 ```bash
 git clone https://github.com/wjz2001/ReazonSpeech

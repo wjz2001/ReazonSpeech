@@ -29,7 +29,7 @@ def find_project_root(marker_file="asr.py"):
         # 如果已经到达文件系统的顶层 (e.g., 'C:\\')，则停止
         if parent_dir == current_dir:
             raise FileNotFoundError(
-                f"无法找到项目根目录。请确保在项目根目录下有一个 '{marker_file}' 文件。"
+                f"无法找到项目根目录，请确保在项目根目录下有一个 '{marker_file}' 文件"
             )
             
         current_dir = parent_dir
@@ -50,8 +50,8 @@ def load_model(device=None):
         project_root = find_project_root(marker_file="asr.py")
     except FileNotFoundError as e:
         # 如果找不到根目录，不退出，只打印一个提示信息
-        print(f"[提示] 未能定位到项目根目录（{e}）。")
-        print("[提示] 将直接尝试从 Hugging Face 下载模型。")
+        print(f"【提示】未能定位到项目根目录（{e}）")
+        print("【提示】将直接尝试从 Hugging Face 下载模型")
 
     # 基于找到的根目录，安全地构建 models 文件夹的路径
     model_dir = os.path.join(project_root, 'models')
@@ -61,12 +61,12 @@ def load_model(device=None):
     if device is None:
         if torch.cuda.is_available():
             device = "cuda"
-            print("信息: 检测到可用的 GPU，将自动选择 CUDA 加载模型。")
+            print("【信息】检测到可用的 GPU，将自动选择 CUDA 加载模型")
         else:
             device = "cpu"
-            print("信息: 未检测到可用的 GPU，将自动选择 CPU 加载模型。")
+            print("【信息】未检测到可用的 GPU，将自动选择 CPU 加载模型")
     else:
-        print(f"信息: 用户已指定使用 {device} 设备加载模型。")        
+        print(f"【信息】用户已指定使用 {device} 加载模型")        
 
     from nemo.utils import logging
     logging.setLevel(logging.ERROR)
@@ -75,14 +75,14 @@ def load_model(device=None):
     # 4. 核心逻辑：检查本地模型是否存在
     if os.path.exists(local_model_path):
         # 如果文件存在，就从本地加载
-        print(f"[提示] 在 '{local_model_path}' 找到本地模型。")
-        print(f"[提示] 正在从本地加载模型...")
+        print(f"【提示】在 '{local_model_path}' 找到本地模型")
+        print(f"【提示】正在从本地加载模型……")
         return EncDecRNNTBPEModel.restore_from(restore_path=local_model_path,
                                               map_location=device)
     else:
         # 如果文件不存在，执行原始的下载逻辑
-        print(f"[提示] 在 '{local_model_path}' 未找到本地模型。")
-        print(f"[提示] 准备从 Hugging Face 下载模型...")
+        print(f"【提示】在 '{local_model_path}' 未找到本地模型")
+        print(f"【提示】准备从 Hugging Face 下载模型……")
         # 确保模型目录存在，以便下载的文件可以被 NeMo 缓存到默认位置
         # (注意: from_pretrained 有自己的缓存机制，通常在用户主目录下的 .cache)
         # 这里的打印信息主要是为了告知用户将要发生网络下载
