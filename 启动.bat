@@ -91,7 +91,8 @@ echo.
 
 REM --- 5. 询问输出方式 ---
 :AskOutputLoop
-cls
+
+echo ======================================================================
 
 echo 请选择您要生成的一种或多种文件格式：
 
@@ -126,9 +127,10 @@ if not defined userChoice (
 
 rem 情况二：用户输入了内容，使用字符串替换法检查输入中是否包含任何无效字符
 rem  例如，增加第7个选项，就在 VALID_OPTIONS 后面加上 7
-set "VALID_OPTIONS=123456"
 set "checker=!userChoice!"
-rem 依次将所有合法的数字从检查字符串中移除
+rem 依次将所有合法的数字从检查字符串中移除，在用户输入前加上一个不会被移除的字符X以防止变量中途变为空
+
+set "checker=X!userChoice!"
 set "checker=!checker:1=!"
 set "checker=!checker:2=!"
 set "checker=!checker:3=!"
@@ -136,8 +138,9 @@ set "checker=!checker:4=!"
 set "checker=!checker:5=!"
 set "checker=!checker:6=!"
 
-rem 如果移除了所有合法数字后，字符串还不为空，说明含有非法字符
-if not "!checker!"=="" (
+rem 如果移除了所有合法数字后，字符串不等于X，说明含有非法字符
+if not "!checker!"=="X" (
+    cls
     goto AskOutputLoop
 )
 
