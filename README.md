@@ -2,7 +2,6 @@
     <img src="/icon.ico"/>
     <h1>ReazonSpeech</h1>
 </div>
-<br/>
 
 This repository provides access to the main user tooling of ReazonSpeech
 project.
@@ -11,13 +10,30 @@ project.
 
 ## nemo版部署
 
+### 零、配置 python3 环境
+
+如果你的设备未安装python3，请照此[教程](https://pvt9.com/_posts/pythoninstall)安装
+
+### 一、下载程序
+
 ```bash
 git clone https://github.com/wjz2001/ReazonSpeech
 cd ReazonSpeech
-python -m venv venv
-.\venv\Scripts\activate # Linux或MacOS：source venv/bin/activate
-python install_for_nemoasr.py
 ```
+
+### 二、虚拟环境
+
+1.创建虚拟环境
+```bash
+python -m venv venv
+```
+
+2.激活虚拟环境
+  - **Windows (CMD/PowerShell)**: `.\venv\Scripts\activate`
+
+  - **macOS / Linux (Bash/Zsh)**: `source venv/bin/activate`
+
+### 三、安装
 
 1.  在根目录下新建 models 文件夹
 2.  [下载模型
@@ -25,12 +41,25 @@ python install_for_nemoasr.py
 3.  [下载模型
     reazonspeech-nemo-v2.nemo](https://huggingface.co/reazon-research/reazonspeech-nemo-v2/tree/main/)
 4.  把以上两个模型放入 models 文件夹
+5.  在**已激活虚拟环境**的终端中，运行`python install_for_nemoasr.py`
 
 ### 注意
 
 1. 本模型可仅在 CPU 上运行，如果有 GPU 且支持 cuda 的话会更快
    - 如果要在有 cuda 的 GPU 上运行，建议在运行前检查是否安装了对应 cuda 版本的 torch，一般情况下安装脚本会自动处理好
 2. 确保设备上有能全局使用的ffmpeg，否则无法转换音频/视频为可语音识别的文件
+   - **Windows**：
+    1.  从 [FFmpeg gyan下载](https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z)  解压后得到`ffmpeg.exe`；
+    2.  将下载的 **`ffmpeg.exe 和 ffprobe.exe` 文件直接放置在本项目根目录** (与 `asr.py` 文件在同一级)，程序会自动检测并使用它
+
+   - **macOS（使用 Homebrew）**：
+    ```bash
+    brew install ffmpeg
+    ```
+   - **Linux（Debian/Ubuntu）**：
+    ```bash
+    sudo apt update && sudo apt install ffmpeg
+    ```
 
 ## 用法
 
