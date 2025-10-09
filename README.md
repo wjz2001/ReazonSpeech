@@ -79,13 +79,14 @@ python asr.py 文件路径
 ### 输出参数
 
 | 参数 | 作用 |
-|-----------|:-------------:|
+|-----------|-------------|
 | `无` | 直接把完整的识别文本打印至控制台 |
 | `-text` | 仅输出完整的识别文本并保存为 .txt 文件 |
-| `-segment` | 输出带时间戳的文本片段 (Segment)并保存为 .segments
+| `-segment` | 输出带时间戳的文本片段（Segment）并保存为 .segments.txt 文件 |
 | `-segment2srt` | 输出带时间戳的文本片段 (Segment)并转换为 .srt 字幕文件 |
 | `-subword` | 输出带时间戳的所有子词 (Subword) 并保存为 .subwords.txt 文件 |
-| `-subword2srt` | 输出带时间戳的所有子词 (Subword) 并转换为 .subwords.srt 字幕
+| `-subword2srt` | 输出带时间戳的所有子词 (Subword) 并转换为 .subwords.srt 字幕文件 |
+| `-subword2json` | 输出带时间戳的所有子词（Subword）并转换为 .subwords.json 文件 |
 | `-kass` | 生成逐字计时的卡拉OK式 .ass 字幕文件 |
 
 ## Packages

@@ -108,7 +108,9 @@ echo   4. 带时间戳的所有子词（.subwords.txt）
 
 echo   5. 带时间戳的所有子词并转换为字幕（.subwords.srt）
 
-echo   6. 卡拉OK式ASS字幕（.ass）
+echo   6. 带时间戳的所有子词并转换为 JSON 文件（.subwords.json）
+
+echo   7. 卡拉OK式ASS字幕（.ass）
 
 echo.
 
@@ -137,6 +139,7 @@ set "checker=!checker:3=!"
 set "checker=!checker:4=!"
 set "checker=!checker:5=!"
 set "checker=!checker:6=!"
+set "checker=!checker:7=!"
 
 rem 如果移除了所有合法数字后，字符串不等于X，说明含有非法字符
 if not "!checker!"=="X" (
@@ -152,7 +155,8 @@ if NOT "!userChoice:2=!"=="!userChoice!" set "outputOptions=!outputOptions! -seg
 if NOT "!userChoice:3=!"=="!userChoice!" set "outputOptions=!outputOptions! -segment2srt"
 if NOT "!userChoice:4=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword"
 if NOT "!userChoice:5=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword2srt"
-if NOT "!userChoice:6=!"=="!userChoice!" set "outputOptions=!outputOptions! -kass"
+if NOT "!userChoice:6=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword2json"
+if NOT "!userChoice:7=!"=="!userChoice!" set "outputOptions=!outputOptions! -kass"
 
 REM --- 6. 执行最终的 Python 命令 ---
 :Execute

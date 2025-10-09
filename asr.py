@@ -4,11 +4,9 @@ import tempfile
 import shutil
 import torch
 import torchaudio
+import json
 from pathlib import Path
 from pydub import AudioSegment
-# 导入 OmegaConf 用于创建解码配置
-from omegaconf import OmegaConf
-
 from reazonspeech.nemo.asr import load_model
 from reazonspeech.nemo.asr.decode import decode_hypothesis
 from reazonspeech.nemo.asr.interface import Segment, Subword
@@ -129,6 +127,11 @@ def main():
         help="输出带时间戳的所有子词（Subword）并转换为 .subwords.srt 字幕文件"
     )
     parser.add_argument(
+        "-subword2json",
+        action="store_true",
+        help="输出带时间戳的所有子词（Subword）并转换为 .subwords.json 文件"
+    )
+    parser.add_argument(
         "-kass",
         action="store_true",
         help="生成逐字计时的卡拉OK式 .ass 字幕文件"
@@ -142,7 +145,7 @@ def main():
     base_name = os.path.splitext(os.path.basename(input_path))[0]
 
     # 创建一个临时的 WAV 文件
-    # delete=False 确保我们可以在 with 块外使用它，最后手动删除
+    # delete=False 确保在 with 块外使用它，最后手动删除
     temp_wav_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     temp_wav_path = temp_wav_file.name
     temp_wav_file.close() # 关闭文件句柄，以便 ffmpeg 可以写入
@@ -168,6 +171,7 @@ def main():
         # --- 逐块识别并校正时间戳 ---
         all_segments = []
         all_subwords = []
+        vad_chunk_end_times_s = [] # 用于存储VAD块的结束时间
 
         if args.no_chunk:
             # --- 不分块的逻辑 ---
@@ -215,13 +219,16 @@ def main():
                 wav_audio = AudioSegment.from_wav(temp_wav_path)
                 for i, time_range in enumerate(filtered_ranges):
                     start_ms, end_ms = time_range
+                    # 记录这个VAD块在原始音频中的精确结束时间
+                    chunk_end_time_s = end_ms / 1000.0
+                    vad_chunk_end_times_s.append(chunk_end_time_s)
                     start_ms = max(0, start_ms - args.keep_silence)
                     end_ms = min(len(wav_audio), end_ms + args.keep_silence)
                     chunk = wav_audio[start_ms:end_ms]
                     time_offset_s = start_ms / 1000.0
 
                     chunk_path = os.path.join(temp_chunk_dir, f"chunk_{i}.wav")
-                    print(f"正在处理语音块 {i+1}/{len(filtered_ranges)} （该块起始时间：{format_srt_time(time_offset_s)}）……")
+                    print(f"正在处理语音块 {i+1}/{len(filtered_ranges)} （该块起止时间：{format_srt_time(start_ms/1000.0)} --> {format_srt_time(end_ms/1000.0)}）……")
                     chunk.export(chunk_path, format="wav")
                     
                     hyp, _ = model.transcribe([chunk_path], return_hypotheses=True, verbose=False, override_config=None)
@@ -232,14 +239,119 @@ def main():
                             for seg in ret.segments: all_segments.append(Segment(start_seconds=seg.start_seconds + time_offset_s, end_seconds=seg.end_seconds + time_offset_s, text=seg.text))
                         if ret.subwords:
                             for sub in ret.subwords: all_subwords.append(Subword(seconds=sub.seconds + time_offset_s, token_id=sub.token_id, token=sub.token))
+
+        # 如果整个过程下来没有任何识别结果，提前告知用户并退出，避免生成空文件
+        if not all_segments:
+            print("=" * 70)
+            print("【信息】未识别到任何有效的语音内容，程序结束")
+            return
+        
+        if all_segments and all_subwords:
+            print("=" * 70)
+
+# --- 预先计算所有子词的、尊重 VAD 边界的结束时间 ---
+        subword_end_seconds = []
+        if all_subwords and not args.no_chunk and vad_chunk_end_times_s:
+            print("=" * 70)
+            print("正在根据 VAD 边界校正子词时间戳……")
+            vad_cursor = 0
+            for i, sub in enumerate(all_subwords):
+                # 确定当前子词的 VAD 边界
+                while vad_cursor < len(vad_chunk_end_times_s) and sub.seconds > vad_chunk_end_times_s[vad_cursor]:
+                    vad_cursor += 1
+                
+                vad_boundary_end_s = float('inf')
+                if vad_cursor < len(vad_chunk_end_times_s):
+                    vad_boundary_end_s = vad_chunk_end_times_s[vad_cursor]
+
+                # 计算潜在的结束时间
+                potential_end_time = 0
+                if i < len(all_subwords) - 1:
+                    potential_end_time = all_subwords[i+1].seconds
+                else: # 如果是最后一个子词
+                    potential_end_time = sub.seconds + 0.5 # 估算一个时长
+
+                # 取 VAD 边界 和 下一个子词开始时间 的最小值
+                corrected_end_time = min(potential_end_time, vad_boundary_end_s)
+                
+                # 安全检查，确保结束时间 > 开始时间
+                if corrected_end_time <= sub.seconds:
+                    corrected_end_time = sub.seconds + 0.1
+                
+                subword_end_seconds.append(corrected_end_time)
+            print("子词时间戳校正完成")
+
+            # --- 用子词的时间戳来从零开始构建片段的时间戳，并创建映射关系 ---
+            segment_to_subword_map = [] # 新的数据结构，存储元组 (segment, subwords_list, subwords_indices_list)
+            subword_cursor = 0 # 全局子词列表的游标
+            print("正在根据子词时间戳优化文本片段的时间戳……")
+
+            for seg in all_segments:
+                # 为当前片段的文本，找到其对应的子词序列
+                target_text = seg.text.replace(" ", "")
+                segment_subwords = []
+                segment_indices = [] # 新增：用于存储子词的全局索引
+                temp_text = ""
+                
+                match_start_cursor = subword_cursor
+                
+                while subword_cursor < len(all_subwords):
+                    sub = all_subwords[subword_cursor]
+                    
+                    # 记录子词对象和它的全局索引
+                    segment_subwords.append(sub)
+                    segment_indices.append(subword_cursor)
+
+                    temp_text += sub.token.replace(' ', '')
+                    subword_cursor += 1
+                    
+                    if temp_text == target_text:
+                        break
+                else:
+                    print(f"【警告】未能为片段 '{seg.text}' 找到完全匹配的子词序列，此片段将被跳过")
+                    subword_cursor = match_start_cursor + 1
+                    continue
+                
+                # 如果找到了匹配的子词序列，用它们精确地重建时间戳并存储映射
+                if segment_subwords:
+                    new_start_time = segment_subwords[0].seconds
+                    
+                    last_subword_index = segment_indices[-1] # 使用它自己的最后一个子词的索引
+                    
+                    new_end_time = 0
+                    if subword_end_seconds:
+                        new_end_time = subword_end_seconds[last_subword_index]
+                    else:
+                        if subword_cursor < len(all_subwords):
+                           new_end_time = all_subwords[subword_cursor].seconds
+                        else:
+                           new_end_time = segment_subwords[-1].seconds + 0.5
+
+                    if new_end_time <= new_start_time:
+                        new_end_time = new_start_time + 0.2
+                    
+                    # 创建新的、时间戳更精确的 Segment 对象
+                    new_segment = Segment(start_seconds=new_start_time, end_seconds=new_end_time, text=seg.text)
+                    
+                    # 将新的 Segment、其对应的子词列表、以及索引列表作为一个整体存入 map
+                    segment_to_subword_map.append((new_segment, segment_subwords, segment_indices))
+
+            # --- 从映射中更新 all_segments ---
+            if segment_to_subword_map:
+                all_segments = [item[0] for item in segment_to_subword_map]
+                print("文本片段时间戳优化完成")
+            else:
+                print("【错误】未能重建任何文本片段，识别失败")
+                return
+
         # --- 根据参数生成输出文件 ---
-        print("-" * 20)
+        print("=" * 70)
         print("识别完成，正在生成输出文件……")
 
         # 检查用户是否指定了任何一种文件输出格式
         file_output_requested = any([
             args.text, args.segment, args.segment2srt, 
-            args.subword, args.subword2srt, args.kass
+            args.subword, args.subword2srt, args.subword2json, args.kass
         ])
 
         # 只有在用户完全没有指定任何输出参数时，才在控制台打印
@@ -247,7 +359,7 @@ def main():
             full_text = " ".join([seg.text for seg in all_segments])
             print("\n识别结果（完整文本）：")
             print(full_text)
-            print("-" * 20)
+            print("=" * 70)
             print("提示：未指定输出参数，结果将打印至控制台")
             print("请使用 -text，-segment2srt，-kass 等参数将结果保存为文件")
 
@@ -284,17 +396,40 @@ def main():
         if args.subword2srt:
             output_path = os.path.join(output_dir, f"{base_name}.subwords.srt")
             with open(output_path, 'w', encoding='utf-8') as f:
-                if len(all_subwords) > 1:
-                    for i, sub in enumerate(all_subwords[:-1], 1):
+                # 如果有 VAD 校正后的时间，优先使用
+                if subword_end_seconds:
+                    for i, sub in enumerate(all_subwords, 1):
+                        end_time_s = subword_end_seconds[i-1]
                         f.write(f"{i}\n")
-                        f.write(f"{format_srt_time(sub.seconds)} --> {format_srt_time(all_subwords[i].seconds)}\n")
+                        f.write(f"{format_srt_time(sub.seconds)} --> {format_srt_time(end_time_s)}\n")
                         f.write(f"{sub.token.replace(' ', '')}\n\n")
-                if all_subwords:
-                    last_sub = all_subwords[-1]
-                    f.write(f"{len(all_subwords)}\n")
-                    f.write(f"{format_srt_time(last_sub.seconds)} --> {format_srt_time(last_sub.seconds + 0.2)}\n")
-                    f.write(f"{last_sub.token.replace(' ', '')}\n\n")
-            print(f"所有子词信息 SRT 文件已保存为：{output_path}")
+                else: # 否则，沿用旧的 --no-chunk 逻辑
+                    if len(all_subwords) > 1:
+                        for i, sub in enumerate(all_subwords[:-1], 1):
+                            f.write(f"{i}\n")
+                            f.write(f"{format_srt_time(sub.seconds)} --> {format_srt_time(all_subwords[i].seconds)}\n")
+                            f.write(f"{sub.token.replace(' ', '')}\n\n")
+                    if all_subwords:
+                        last_sub = all_subwords[-1]
+                        end_time_s = last_sub.seconds + 0.5
+                        f.write(f"{len(all_subwords)}\n")
+                        f.write(f"{format_srt_time(last_sub.seconds)} --> {format_srt_time(end_time_s)}\n")
+                        f.write(f"{last_sub.token.replace(' ', '')}\n\n")
+            print(f"所有子词信息的 SRT 文件已保存为：{output_path}")
+
+        if args.subword2json:
+            output_path = os.path.join(output_dir, f"{base_name}.subwords.json")
+            subwords_for_json = []
+            for sub in all_subwords:
+                subwords_for_json.append({
+                    "token": sub.token.replace(' ', ' '),
+                    "timestamp": sub.seconds
+                })
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(subwords_for_json, f, ensure_ascii=False, indent=4)
+            
+            print(f"所有子词信息的 JSON 文件已保存为：{output_path}")
 
         if args.kass:
             output_path = os.path.join(output_dir, f"{base_name}.ass")
@@ -314,33 +449,31 @@ Style: Default,Arial,24,&H00FFFFFF,&HFF000000,&H00000000,&H00000000,0,0,0,0,100,
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
             dialogue_lines = []
-            subword_idx = 0
             
-            for seg in all_segments:
-                segment_subwords = []
-                # 找到属于当前 segment 的所有 subwords
-                while subword_idx < len(all_subwords) and all_subwords[subword_idx].seconds <= seg.end_seconds:
-                    if all_subwords[subword_idx].seconds >= seg.start_seconds:
-                        segment_subwords.append(all_subwords[subword_idx])
-                    subword_idx += 1
+            # 【直接遍历预先计算好的映射关系，而不是 all_segments
+            for seg, segment_subwords, segment_indices in segment_to_subword_map:
                 
                 if not segment_subwords:
                     continue
 
                 karaoke_text = ""
-                # 计算每个 subword 的时长
+                # 遍历当前片段的子词，计算卡拉OK时长
                 for i, sub in enumerate(segment_subwords):
                     duration_s = 0
-                    if i < len(segment_subwords) - 1:
-                        duration_s = segment_subwords[i+1].seconds - sub.seconds
-                    else:
-                        # 最后一个 subword 的时长，估算为到 segment 结尾
-                        duration_s = max(0.1, seg.end_seconds - sub.seconds)
+                    # 优先使用预先计算好的、VAD感知的结束时间
+                    if subword_end_seconds:
+                        global_index = segment_indices[i] # 直接使用映射中保存的全局索引
+                        duration_s = subword_end_seconds[global_index] - sub.seconds
+                    else: # --no-chunk
+                        if i < len(segment_subwords) - 1:
+                            duration_s = segment_subwords[i+1].seconds - sub.seconds
+                        else: # 最后一个词
+                            duration_s = max(0.1, seg.end_seconds - sub.seconds)
 
                     # 转换为厘秒 (cs)
                     duration_cs = max(1, round(duration_s * 100))
                     
-                    # 清理 token 中的特殊空格字符
+                    # 清理 token 中的特殊空格字符 (这里也建议修正一下空格字符)
                     clean_token = sub.token.replace(' ', ' ')
                     
                     karaoke_text += f"{{\\k{duration_cs}}}{clean_token}"
