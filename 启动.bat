@@ -34,7 +34,11 @@ REM --- 2. 获取音视频文件路径 ---
 echo ======================================================================
 
 set "inputFile="
+
 set /p "inputFile=请拖入您的音频/视频文件或输入它的完整路径，然后按回车键："
+
+rem 移除可能存在于路径开头和结尾的引号
+set "inputFile=!inputFile:"=!"
 
 if not exist "%inputFile%" (
     echo.
@@ -166,13 +170,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令: python asr.py "%inputFile%" %chunkOption% !outputOptions! %chunkParams%
+echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption% !outputOptions! %chunkParams%
 
 echo ======================================================================
 
 echo.
 
-python asr.py "%inputFile%" %chunkOption% %chunkParams% !outputOptions!
+python asr.py "!inputFile!" %chunkOption% %chunkParams% !outputOptions!
 
 echo.
 
