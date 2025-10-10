@@ -247,102 +247,101 @@ def main():
             return
         
         if all_segments and all_subwords:
-            print("=" * 70)
 
-# --- 预先计算所有子词的、尊重 VAD 边界的结束时间 ---
-        subword_end_seconds = []
-        if all_subwords and not args.no_chunk and vad_chunk_end_times_s:
-            print("=" * 70)
-            print("正在根据 VAD 边界校正子词时间戳……")
-            vad_cursor = 0
-            for i, sub in enumerate(all_subwords):
-                # 确定当前子词的 VAD 边界
-                while vad_cursor < len(vad_chunk_end_times_s) and sub.seconds > vad_chunk_end_times_s[vad_cursor]:
-                    vad_cursor += 1
-                
-                vad_boundary_end_s = float('inf')
-                if vad_cursor < len(vad_chunk_end_times_s):
-                    vad_boundary_end_s = vad_chunk_end_times_s[vad_cursor]
-
-                # 计算潜在的结束时间
-                potential_end_time = 0
-                if i < len(all_subwords) - 1:
-                    potential_end_time = all_subwords[i+1].seconds
-                else: # 如果是最后一个子词
-                    potential_end_time = sub.seconds + 0.5 # 估算一个时长
-
-                # 取 VAD 边界 和 下一个子词开始时间 的最小值
-                corrected_end_time = min(potential_end_time, vad_boundary_end_s)
-                
-                # 安全检查，确保结束时间 > 开始时间
-                if corrected_end_time <= sub.seconds:
-                    corrected_end_time = sub.seconds + 0.1
-                
-                subword_end_seconds.append(corrected_end_time)
-            print("子词时间戳校正完成")
-
-            # --- 用子词的时间戳来从零开始构建片段的时间戳，并创建映射关系 ---
-            segment_to_subword_map = [] # 新的数据结构，存储元组 (segment, subwords_list, subwords_indices_list)
-            subword_cursor = 0 # 全局子词列表的游标
-            print("正在根据子词时间戳优化文本片段的时间戳……")
-
-            for seg in all_segments:
-                # 为当前片段的文本，找到其对应的子词序列
-                target_text = seg.text.replace(" ", "")
-                segment_subwords = []
-                segment_indices = [] # 新增：用于存储子词的全局索引
-                temp_text = ""
-                
-                match_start_cursor = subword_cursor
-                
-                while subword_cursor < len(all_subwords):
-                    sub = all_subwords[subword_cursor]
+            # --- 预先计算所有子词的、尊重 VAD 边界的结束时间 ---
+            subword_end_seconds = []
+            if all_subwords and not args.no_chunk and vad_chunk_end_times_s:
+                print("=" * 70)
+                print("正在根据 VAD 边界校正子词时间戳……")
+                vad_cursor = 0
+                for i, sub in enumerate(all_subwords):
+                    # 确定当前子词的 VAD 边界
+                    while vad_cursor < len(vad_chunk_end_times_s) and sub.seconds > vad_chunk_end_times_s[vad_cursor]:
+                        vad_cursor += 1
                     
-                    # 记录子词对象和它的全局索引
-                    segment_subwords.append(sub)
-                    segment_indices.append(subword_cursor)
-
-                    temp_text += sub.token.replace(' ', '')
-                    subword_cursor += 1
+                    vad_boundary_end_s = float('inf')
+                    if vad_cursor < len(vad_chunk_end_times_s):
+                        vad_boundary_end_s = vad_chunk_end_times_s[vad_cursor]
+    
+                    # 计算潜在的结束时间
+                    potential_end_time = 0
+                    if i < len(all_subwords) - 1:
+                        potential_end_time = all_subwords[i+1].seconds
+                    else: # 如果是最后一个子词
+                        potential_end_time = sub.seconds + 0.5 # 估算一个时长
+    
+                    # 取 VAD 边界 和 下一个子词开始时间 的最小值
+                    corrected_end_time = min(potential_end_time, vad_boundary_end_s)
                     
-                    if temp_text == target_text:
-                        break
-                else:
-                    print(f"【警告】未能为片段 '{seg.text}' 找到完全匹配的子词序列，此片段将被跳过")
-                    subword_cursor = match_start_cursor + 1
-                    continue
-                
-                # 如果找到了匹配的子词序列，用它们精确地重建时间戳并存储映射
-                if segment_subwords:
-                    new_start_time = segment_subwords[0].seconds
+                    # 安全检查，确保结束时间 > 开始时间
+                    if corrected_end_time <= sub.seconds:
+                        corrected_end_time = sub.seconds + 0.1
                     
-                    last_subword_index = segment_indices[-1] # 使用它自己的最后一个子词的索引
+                    subword_end_seconds.append(corrected_end_time)
+                print("子词时间戳校正完成")
+    
+                # --- 用子词的时间戳来从零开始构建片段的时间戳，并创建映射关系 ---
+                segment_to_subword_map = [] # 新的数据结构，存储元组 (segment, subwords_list, subwords_indices_list)
+                subword_cursor = 0 # 全局子词列表的游标
+                print("正在根据子词时间戳优化文本片段的时间戳……")
+    
+                for seg in all_segments:
+                    # 为当前片段的文本，找到其对应的子词序列
+                    target_text = seg.text.replace(" ", "")
+                    segment_subwords = []
+                    segment_indices = [] # 新增：用于存储子词的全局索引
+                    temp_text = ""
                     
-                    new_end_time = 0
-                    if subword_end_seconds:
-                        new_end_time = subword_end_seconds[last_subword_index]
+                    match_start_cursor = subword_cursor
+                    
+                    while subword_cursor < len(all_subwords):
+                        sub = all_subwords[subword_cursor]
+                        
+                        # 记录子词对象和它的全局索引
+                        segment_subwords.append(sub)
+                        segment_indices.append(subword_cursor)
+    
+                        temp_text += sub.token.replace(' ', '')
+                        subword_cursor += 1
+                        
+                        if temp_text == target_text:
+                            break
                     else:
-                        if subword_cursor < len(all_subwords):
-                           new_end_time = all_subwords[subword_cursor].seconds
+                        print(f"【警告】未能为片段 '{seg.text}' 找到完全匹配的子词序列，此片段将被跳过")
+                        subword_cursor = match_start_cursor + 1
+                        continue
+                    
+                    # 如果找到了匹配的子词序列，用它们精确地重建时间戳并存储映射
+                    if segment_subwords:
+                        new_start_time = segment_subwords[0].seconds
+                        
+                        last_subword_index = segment_indices[-1] # 使用它自己的最后一个子词的索引
+                        
+                        new_end_time = 0
+                        if subword_end_seconds:
+                            new_end_time = subword_end_seconds[last_subword_index]
                         else:
-                           new_end_time = segment_subwords[-1].seconds + 0.5
-
-                    if new_end_time <= new_start_time:
-                        new_end_time = new_start_time + 0.2
-                    
-                    # 创建新的、时间戳更精确的 Segment 对象
-                    new_segment = Segment(start_seconds=new_start_time, end_seconds=new_end_time, text=seg.text)
-                    
-                    # 将新的 Segment、其对应的子词列表、以及索引列表作为一个整体存入 map
-                    segment_to_subword_map.append((new_segment, segment_subwords, segment_indices))
-
-            # --- 从映射中更新 all_segments ---
-            if segment_to_subword_map:
-                all_segments = [item[0] for item in segment_to_subword_map]
-                print("文本片段时间戳优化完成")
-            else:
-                print("【错误】未能重建任何文本片段，识别失败")
-                return
+                            if subword_cursor < len(all_subwords):
+                               new_end_time = all_subwords[subword_cursor].seconds
+                            else:
+                               new_end_time = segment_subwords[-1].seconds + 0.5
+    
+                        if new_end_time <= new_start_time:
+                            new_end_time = new_start_time + 0.2
+                        
+                        # 创建新的、时间戳更精确的 Segment 对象
+                        new_segment = Segment(start_seconds=new_start_time, end_seconds=new_end_time, text=seg.text)
+                        
+                        # 将新的 Segment、其对应的子词列表、以及索引列表作为一个整体存入 map
+                        segment_to_subword_map.append((new_segment, segment_subwords, segment_indices))
+    
+                # --- 从映射中更新 all_segments ---
+                if segment_to_subword_map:
+                    all_segments = [item[0] for item in segment_to_subword_map]
+                    print("文本片段时间戳优化完成")
+                else:
+                    print("【错误】未能重建任何文本片段，识别失败")
+                    return
 
         # --- 根据参数生成输出文件 ---
         print("=" * 70)
@@ -473,7 +472,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     # 转换为厘秒 (cs)
                     duration_cs = max(1, round(duration_s * 100))
                     
-                    # 清理 token 中的特殊空格字符 (这里也建议修正一下空格字符)
+                    # 清理 token 中的特殊空格字符
                     clean_token = sub.token.replace(' ', ' ')
                     
                     karaoke_text += f"{{\\k{duration_cs}}}{clean_token}"
