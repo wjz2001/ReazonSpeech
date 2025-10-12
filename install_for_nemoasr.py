@@ -3,7 +3,6 @@ import sys
 import os
 import re
 import shutil
-import nemo
 
 # --- Helper 函数 ---
 def run_command(command_list):
@@ -53,6 +52,7 @@ def patch_exp_manager():
     """在已安装的 nemo_toolkit 中查找并修补 exp_manager.py 文件 (仅限 Windows)"""
     print("\n> 尝试修补 nemo_toolkit...")
     try:
+        import nemo
         # 找到 nemo 包的 __init__.py 文件
         nemo_init_path = nemo.__file__
         # 从 __init__.py 向上找到 nemo 包的根目录
