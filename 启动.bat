@@ -108,13 +108,17 @@ echo   2. 带时间戳的文本片段（.segments.txt）
 
 echo   3. 带时间戳的文本片段并转换为字幕（.srt）
 
-echo   4. 带时间戳的所有子词（.subwords.txt）
+echo   4. 输出带时间戳的文本片段并转换为 VTT 字幕文件（.vtt）
 
-echo   5. 带时间戳的所有子词并转换为字幕（.subwords.srt）
+echo   5. 输出带时间戳的文本片段并转换为由制表符分隔的 .tsv 文件（.tsv）
 
-echo   6. 带时间戳的所有子词并转换为 JSON 文件（.subwords.json）
+echo   6. 带时间戳的所有子词（.subwords.txt）
 
-echo   7. 卡拉OK式ASS字幕（.ass）
+echo   7. 带时间戳的所有子词并转换为字幕（.subwords.srt）
+
+echo   8. 带时间戳的所有子词并转换为 JSON 文件（.subwords.json）
+
+echo   9. 生成逐字计时的卡拉OK式 ASS 字幕文件（.ass）
 
 echo.
 
@@ -144,6 +148,8 @@ set "checker=!checker:4=!"
 set "checker=!checker:5=!"
 set "checker=!checker:6=!"
 set "checker=!checker:7=!"
+set "checker=!checker:8=!"
+set "checker=!checker:9=!"
 
 rem 如果移除了所有合法数字后，字符串不等于X，说明含有非法字符
 if not "!checker!"=="X" (
@@ -157,10 +163,12 @@ set "outputOptions="
 if NOT "!userChoice:1=!"=="!userChoice!" set "outputOptions=!outputOptions! -text"
 if NOT "!userChoice:2=!"=="!userChoice!" set "outputOptions=!outputOptions! -segment"
 if NOT "!userChoice:3=!"=="!userChoice!" set "outputOptions=!outputOptions! -segment2srt"
-if NOT "!userChoice:4=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword"
-if NOT "!userChoice:5=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword2srt"
-if NOT "!userChoice:6=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword2json"
-if NOT "!userChoice:7=!"=="!userChoice!" set "outputOptions=!outputOptions! -kass"
+if NOT "!userChoice:4=!"=="!userChoice!" set "outputOptions=!outputOptions! -segment2vtt"
+if NOT "!userChoice:5=!"=="!userChoice!" set "outputOptions=!outputOptions! -segment2tsv"
+if NOT "!userChoice:6=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword"
+if NOT "!userChoice:7=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword2srt"
+if NOT "!userChoice:8=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword2json"
+if NOT "!userChoice:9=!"=="!userChoice!" set "outputOptions=!outputOptions! -kass"
 
 REM --- 6. 执行最终的 Python 命令 ---
 :Execute
