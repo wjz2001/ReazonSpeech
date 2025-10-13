@@ -56,6 +56,25 @@ def get_speech_timestamps_onnx(wav_tensor, onnx_session, threshold=0.5, sampling
             
     return speech_timestamps
 
+def format_duration(seconds):
+    """将秒数格式化为 'X时Y分Z.ZZ秒' 的形式"""
+    if seconds < 0:
+        return "未知时长"
+    
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    
+    parts = []
+    if hours > 0:
+        parts.append(f"{int(hours)} 时")
+    if minutes > 0:
+        parts.append(f"{int(minutes)} 分")
+    
+    # 总是显示秒，并保留两位小数
+    parts.append(f"{secs:.2f} 秒")
+    
+    return "".join(parts)
+
 def create_precise_segments_from_subwords(all_subwords, vad_chunk_end_times_s=[], no_chunk=False):
     if not all_subwords:
         return [], [], []
@@ -247,7 +266,7 @@ def main():
         asr_model_load_start = time.time()  # <--- 计时开始
         model = load_model()
         asr_model_load_end = time.time()    # <--- 计时结束
-        print(f"模型加载完成，耗时：{asr_model_load_end - asr_model_load_start:.2f} 秒")
+        print(f"模型加载完成")
 
         # --- 逐块识别并校正时间戳 ---
         all_segments = []
@@ -272,7 +291,7 @@ def main():
             vad_model_load_start = time.time()  # <--- 计时开始
             onnx_session = onnxruntime.InferenceSession(str(local_onnx_model_path), providers=['CPUExecutionProvider'])
             vad_model_load_end = time.time()    # <--- 计时结束
-            print(f"Pyannote-segmentation-3.0 模型加载完成，耗时：{vad_model_load_end - vad_model_load_start:.2f} 秒")
+            print(f"Pyannote-segmentation-3.0 模型加载完成")
 
             print("正在使用 Pyannote-segmentation-3.0 侦测语音活动……")
             wav_tensor, sr = torchaudio.load(temp_wav_path)
@@ -324,7 +343,6 @@ def main():
             return
         
         print("=" * 70)
-        print(f"语音识别核心流程完成，耗时：{recognition_end_time - recognition_start_time:.2f} 秒")
         print("正在根据子词和VAD边界生成精确文本片段……")
         
         all_segments, segment_to_subword_map, subword_end_seconds = create_precise_segments_from_subwords(
@@ -472,6 +490,11 @@ def main():
             print(f"卡拉OK式 ASS 字幕已保存为：{output_path}")
 
     finally:
+        print("=" * 70)
+        print(f"ReazonSpeech模型加载耗时：{format_duration(asr_model_load_end - asr_model_load_start)}")
+        print(f"Pyannote-segmentation-3.0 模型加载耗时：{format_duration(vad_model_load_end - vad_model_load_start)}")
+        print(f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time - (vad_model_load_end - vad_model_load_start))}")
+
         # --- 清理工作：删除临时的 WAV 文件 ---
         if os.path.exists(temp_wav_path):
             os.remove(temp_wav_path)
