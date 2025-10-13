@@ -492,9 +492,17 @@ def main():
     finally:
         print("=" * 70)
         print(f"ReazonSpeech模型加载耗时：{format_duration(asr_model_load_end - asr_model_load_start)}")
-        print(f"Pyannote-segmentation-3.0 模型加载耗时：{format_duration(vad_model_load_end - vad_model_load_start)}")
-        print(f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time - (vad_model_load_end - vad_model_load_start))}")
+        # 安全地获取 VAD 加载的起止时间，如果不存在则默认为 0
+        vad_model_load_start = locals().get('vad_model_load_start', 0)
+        vad_model_load_end = locals().get('vad_model_load_end', 0)
+        # 只有当VAD加载时间大于0时才打印，否则不显示
+        if vad_model_load_end - vad_model_load_start > 0:
+            print(f"Pyannote-segmentation-3.0 模型加载耗时：{format_duration(vad_model_load_end - vad_model_load_start)}")
+            print(f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time - (vad_model_load_end - vad_model_load_start))}")
+        else:
+            print(f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time)}")
 
+        print("=" * 70)
         # --- 清理工作：删除临时的 WAV 文件 ---
         if os.path.exists(temp_wav_path):
             os.remove(temp_wav_path)
