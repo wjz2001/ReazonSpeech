@@ -1,1 +1,2 @@
-build/
+/build/
+/reazonspeech_nemo_asr.egg-info/
