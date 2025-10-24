@@ -62,7 +62,7 @@ set "chunkOption="
 choice /c YN /m "是否使用智能语音分块？（Y=是，推荐使用；N=否，除非音频极短或为了测试，否则不推荐使用）"
 if %ERRORLEVEL% == 2 (
     set "chunkOption=--no-chunk"
-    goto AskOutputLoop
+    goto AskBeamParams
 )
 
 REM --- 4. (如果使用VAD) 询问是否修改VAD参数 ---
@@ -72,7 +72,7 @@ set "chunkParams="
 choice /c YN /m "是否需要修改默认的VAD参数？"
 
 if %ERRORLEVEL% == 2 (
-    goto AskOutputLoop
+    goto AskBeamParams
 )
 echo.
 
@@ -84,8 +84,8 @@ if not defined vadThresh set vadThresh=0.2
 set /p "minSpeech=输入 min_speech_duration_ms（移除短于此时长（毫秒）的语音块，默认：100）："
 if not defined minSpeech set minSpeech=100
 
-set /p "keep=输入 keep_silence（在语音块前后扩展的时长（毫秒），默认：30）："
-if not defined keep set keep=30
+set /p "keep=输入 keep_silence（在语音块前后扩展的时长（毫秒），默认：300）："
+if not defined keep set keep=300
 
 set "chunkParams=--vad_threshold %vadThresh% --min_speech_duration_ms %minSpeech% --keep_silence %keep%"
 
@@ -93,7 +93,28 @@ echo 已设置自定义参数
 
 echo.
 
-REM --- 5. 询问输出方式 ---
+REM --- 5. 询问高级识别参数 ---
+:AskBeamParams
+
+echo 文件: !inputFile!
+
+echo ======================================================================
+
+echo.
+
+echo 请输入新数值，或直接按回车以使用默认值
+
+set /p "beamSize=输入 beam_size（集束搜索宽度，默认：4，范围：4~64（仅整数），更大的值可能更准确但更慢）："
+
+if not defined beamSize set beamSize=4
+
+set "beamParams=--beam %beamSize%"
+
+echo 已设置高级识别参数
+
+echo.
+
+REM --- 6. 询问输出方式 ---
 :AskOutputLoop
 
 echo ======================================================================
@@ -170,7 +191,7 @@ if NOT "!userChoice:7=!"=="!userChoice!" set "outputOptions=!outputOptions! -sub
 if NOT "!userChoice:8=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword2json"
 if NOT "!userChoice:9=!"=="!userChoice!" set "outputOptions=!outputOptions! -kass"
 
-REM --- 6. 执行最终的 Python 命令 ---
+REM --- 7. 执行最终的 Python 命令 ---
 :Execute
 echo.
 
@@ -178,13 +199,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption% !outputOptions! %chunkParams%
+echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption% !outputOptions! %chunkParams% !beamParams!
 
 echo ======================================================================
 
 echo.
 
-python asr.py "!inputFile!" %chunkOption% %chunkParams% !outputOptions!
+python asr.py "!inputFile!" %chunkOption% %chunkParams% !beamParams! !outputOptions!
 
 echo.
 

@@ -9,9 +9,9 @@ import time
 import numpy as np
 from pathlib import Path
 from pydub import AudioSegment
+from omegaconf import open_dict
 from reazonspeech.nemo.asr import load_model
-from reazonspeech.nemo.asr.decode import find_end_of_segment
-from reazonspeech.nemo.asr.decode import decode_hypothesis
+from reazonspeech.nemo.asr.decode import find_end_of_segment, decode_hypothesis, PAD_SECONDS, SECONDS_PER_STEP
 from reazonspeech.nemo.asr.interface import Segment, Subword
 from reazonspeech.nemo.asr.writer import (
     SRTWriter,
@@ -68,9 +68,6 @@ def get_speech_timestamps_onnx(
 
 def format_duration(seconds):
     """将秒数格式化为 'X时Y分Z.ZZ秒' 的形式"""
-    if seconds < 0:
-        return "未知时长"
-
     hours, remainder = divmod(seconds, 3600)
     minutes, secs = divmod(remainder, 60)
 
@@ -93,8 +90,7 @@ def create_precise_segments_from_subwords(
         return [], [], []
 
     # 计算子词平均持续时长和子词结束时间
-    DEFAULT_LAST_SUBWORD_DURATION = 0.5
-    average_duration = DEFAULT_LAST_SUBWORD_DURATION
+    average_duration = SECONDS_PER_STEP
 
     if len(all_subwords) > 1:
         durations = [
@@ -240,7 +236,29 @@ def main():
         help="禁用智能分块功能，一次性处理整个音频文件",
     )
 
-    # --- VAD (Silero VAD) 核心参数 ---
+    def beam_size_type(value):
+        """自定义 argparse 类型函数，用于验证 beam_size 的范围"""
+        try:
+            ivalue = int(value)
+        except ValueError:
+            # 如果无法转换为整数，则引发错误
+            raise argparse.ArgumentTypeError(f"beam_size 必须为 4 到 64 之间的整数，您提供的 {value} 不正确")
+        
+        if not (4 <= ivalue <= 64):
+            # 如果不在指定的范围内，则引发错误
+            raise argparse.ArgumentTypeError(f"beam_size 必须为 4 到 64 之间的整数，您提供的 {ivalue} 不正确")
+        
+        # 如果验证通过，返回整数值
+        return ivalue
+
+    parser.add_argument(
+            "--beam",
+            type=beam_size_type,
+            default=4,
+            help="设置集束搜索（Beam Search）宽度，范围为 4 到 64 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
+        )
+
+    # --- VAD核心参数 ---
     parser.add_argument(
         "--vad_threshold",
         type=float,
@@ -256,7 +274,7 @@ def main():
     parser.add_argument(
         "--keep_silence",
         type=int,
-        default=30,
+        default=300,
         help="在语音块前后扩展时长（毫秒）",
     )
 
@@ -356,6 +374,20 @@ def main():
         asr_model_load_end = time.time()  # <--- 计时结束
         print(f"模型加载完成")
 
+        # 保存原始的解码配置
+        original_decoding_cfg = model.cfg.decoding
+        
+        # 创建一个新的配置副本并修改 beam_size
+        new_decoding_cfg = original_decoding_cfg.copy()
+        with open_dict(new_decoding_cfg): # 使用 open_dict 使配置可修改
+            if 'beam' not in new_decoding_cfg:
+                 new_decoding_cfg.beam = {} # 如果不存在 beam 节，先创建
+            new_decoding_cfg.beam.beam_size = args.beam
+        
+        # 在所有识别任务开始前，应用这个新的解码策略
+        print(f"正在应用新的解码策略（beam_size={args.beam}）……")
+        model.change_decoding_strategy(new_decoding_cfg)
+
         # --- 逐块识别并校正时间戳 ---
         all_segments = []
         all_subwords = []
@@ -364,14 +396,19 @@ def main():
         # --- 计时开始：核心识别流程 ---
         recognition_start_time = time.time()
 
+        # 使用 pydub 创建静音段用于填充
+        # PAD_SECONDS 是以秒为单位，pydub 需要毫秒
+        silence_padding = AudioSegment.silent(duration=PAD_SECONDS * 1000, frame_rate=16000)
+
         if args.no_chunk:
             # --- 不分块的逻辑 ---
-            print("检测到 --no-chunk 参数，将一次性处理整个文件……")
+            print("未使用VAD，一次性处理整个文件……")
+            final_audio = silence_padding + audio + silence_padding
+            final_audio.export(temp_wav_path, format="wav")
             hyp, _ = model.transcribe(
                 [temp_wav_path],
                 return_hypotheses=True,
                 verbose=True,
-                override_config=None,
             )
             if hyp and hyp[0]:
                 ret = decode_hypothesis(model, hyp[0])
@@ -387,8 +424,8 @@ def main():
             )
             vad_model_load_end = time.time()  # <--- 计时结束
             print(f"Pyannote-segmentation-3.0 模型加载完成")
-
             print("正在使用 Pyannote-segmentation-3.0 侦测语音活动……")
+
             wav_tensor, sr = torchaudio.load(temp_wav_path)
             speech_timestamps_seconds = get_speech_timestamps_onnx(
                 wav_tensor, onnx_session, args.vad_threshold
@@ -414,26 +451,41 @@ def main():
                     f"VAD 侦测到 {original_chunk_count} 个语音块，已过滤不超过 {min_speech_duration_ms}ms 的部分，保留并处理 {len(filtered_ranges)} 个语音块"
                 )
 
+            # 记录上一个处理块的实际结束时间
+            last_processed_end_ms = 0
+
             wav_audio = AudioSegment.from_wav(temp_wav_path)
             for i, time_range in enumerate(filtered_ranges):
                 start_ms, end_ms = time_range
                 # 记录这个VAD块在原始音频中的精确结束时间
                 chunk_end_time_s = end_ms / 1000.0
                 vad_chunk_end_times_s.append(chunk_end_time_s)
+                # 计算带 padding 的起止时间
                 start_ms = max(0, start_ms - args.keep_silence)
                 end_ms = min(len(wav_audio), end_ms + args.keep_silence)
-                chunk = wav_audio[start_ms:end_ms]
+                # 如果当前块的开始时间早于上一个块的结束时间，则将当前块的开始时间强制设置为上一个块的结束时间，避免重叠
+                if start_ms < last_processed_end_ms:
+                    start_ms = last_processed_end_ms
+                # 如果修正后出现 start >= end 的情况（说明这个块完全被前一个块的 padding 覆盖了）
+                if start_ms >= end_ms:
+                    continue         
+                # 更新 last_processed_end_ms，为下一次循环做准备
+                last_processed_end_ms = end_ms
+
+                # 使用 pydub 切分音频块，将静音段添加到块的前后，完成填充
+                chunk = silence_padding + wav_audio[start_ms:end_ms] + silence_padding
+
                 time_offset_s = start_ms / 1000.0
                 chunk_path = os.path.join(temp_chunk_dir, f"chunk_{i}.wav")
                 print(
-                    f"正在处理语音块 {i+1}/{len(filtered_ranges)} （该块起止时间：{SRTWriter._format_time(start_ms/1000.0)} --> {SRTWriter._format_time(end_ms/1000.0)}）……"
+                    f"正在处理语音块 {i+1}/{len(filtered_ranges)} （该块起止时间：{SRTWriter._format_time(start_ms / 1000.0)} --> {SRTWriter._format_time(end_ms / 1000.0)}，持续时间：{(end_ms - start_ms) / 1000.0:.2f} 秒）……"
                 )
                 chunk.export(chunk_path, format="wav")
+                
                 hyp, _ = model.transcribe(
                     [chunk_path],
                     return_hypotheses=True,
                     verbose=False,
-                    override_config=None,
                 )
                 if hyp and hyp[0]:
                     ret = decode_hypothesis(model, hyp[0])
@@ -446,6 +498,10 @@ def main():
                                     token=sub.token,
                                 )
                             )
+
+        # 恢复原始解码策略，以防后续有其他操作
+        print("正在恢复原始解码策略……")
+        model.change_decoding_strategy(original_decoding_cfg)
 
         # --- 计时结束：核心识别流程 ---
         recognition_end_time = time.time()
@@ -646,7 +702,6 @@ def main():
         if os.path.exists(temp_chunk_dir):
             shutil.rmtree(temp_chunk_dir)
             print(f"临时块目录 '{os.path.basename(temp_chunk_dir)}' 已删除")
-
 
 if __name__ == "__main__":
     main()
