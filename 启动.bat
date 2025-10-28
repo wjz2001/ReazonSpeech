@@ -104,11 +104,13 @@ echo.
 
 echo 请输入新数值，或直接按回车以使用默认值
 
+set "beamParams="  REM 首先确保变量为空
+
 set /p "beamSize=输入 beam_size（集束搜索宽度，默认：4，范围：4~64（仅整数），更大的值可能更准确但更慢）："
 
-if not defined beamSize set beamSize=4
-
-set "beamParams=--beam %beamSize%"
+if NOT "!beamSize!"=="" (
+    set "beamParams=--beam !beamSize!"
+)
 
 echo 已设置高级识别参数
 
