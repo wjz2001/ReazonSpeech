@@ -40,6 +40,8 @@ set /p "inputFile=请拖入您的音频/视频文件或输入它的完整路径�
 rem 移除可能存在于路径开头和结尾的引号
 set "inputFile=!inputFile:"=!"
 
+if not defined inputFile goto GetFile
+
 if not exist "%inputFile%" (
     echo.
 
@@ -79,13 +81,19 @@ echo.
 echo 请输入新数值，或直接按回车以使用默认值
 
 set /p "vadThresh=输入 vad_threshold（语音置信度，默认：0.2，范围：0~1）："
-if not defined vadThresh set vadThresh=0.2
+if defined vadThresh set "chunkParams=!chunkParams! --vad_threshold !vadThresh!"
+
+set /p "vadEndThresh=输入 vad_end_threshold（语音是否结束置信度，默认：智能，范围：0~1）："
+if defined vadEndThresh set "chunkParams=!chunkParams! --vad_end_threshold !vadEndThresh!"
 
 set /p "minSpeech=输入 min_speech_duration_ms（移除短于此时长（毫秒）的语音块，默认：100）："
-if not defined minSpeech set minSpeech=100
+if defined minSpeech set "chunkParams=!chunkParams! --min_speech_duration_ms !minSpeech!"
+
+set /p "minSilence=输入 min_silence_duration_ms（最短静音间隔时长（毫秒），默认：200）："
+if defined minSilence set "chunkParams=!chunkParams! --min_silence_duration_ms !minSilence!"
 
 set /p "keep=输入 keep_silence（在语音块前后扩展的时长（毫秒），默认：300）："
-if not defined keep set keep=300
+if defined keep set "chunkParams=!chunkParams! --keep_silence !keep!"
 
 set "chunkParams=--vad_threshold %vadThresh% --min_speech_duration_ms %minSpeech% --keep_silence %keep%"
 
@@ -116,7 +124,16 @@ echo 已设置高级识别参数
 
 echo.
 
-REM --- 6. 询问输出方式 ---
+REM --- 6. 询问是否启用调试模式---
+:AskDebug
+
+echo.
+
+choice /c YN /m "是否启用调试模式？（保留临时文件并自动打开目录）"
+
+if %ERRORLEVEL% == 1 set "debugOption=--debug"
+
+REM --- 7. 询问输出方式 ---
 :AskOutputLoop
 
 echo ======================================================================
@@ -193,7 +210,7 @@ if NOT "!userChoice:7=!"=="!userChoice!" set "outputOptions=!outputOptions! -sub
 if NOT "!userChoice:8=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword2json"
 if NOT "!userChoice:9=!"=="!userChoice!" set "outputOptions=!outputOptions! -kass"
 
-REM --- 7. 执行最终的 Python 命令 ---
+REM --- 8. 执行最终的 Python 命令 ---
 :Execute
 echo.
 
@@ -201,13 +218,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption% !outputOptions! %chunkParams% !beamParams!
+echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!beamParams! !debugOption!!outputOptions!
 
 echo ======================================================================
 
 echo.
 
-python asr.py "!inputFile!" %chunkOption% %chunkParams% !beamParams! !outputOptions!
+python asr.py "!inputFile!" %chunkOption%!chunkParams!!beamParams! !debugOption!!outputOptions!
 
 echo.
 
