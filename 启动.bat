@@ -4,7 +4,7 @@ chcp 65001 > nul
 setlocal enabledelayedexpansion
 title ReazonSpeech 语音识别助手
 
-REM --- 1. 检查并启动虚拟环境 ---
+REM --- 检查并启动虚拟环境 ---
 
 echo 正在检查虚拟环境……
 
@@ -28,7 +28,7 @@ echo 虚拟环境激活成功！
 
 echo.
 
-REM --- 2. 获取音视频文件路径 ---
+REM --- 获取音视频文件路径 ---
 :GetFile
 
 echo ======================================================================
@@ -55,7 +55,7 @@ echo 已找到文件: %inputFile%
 
 echo.
 
-REM --- 3. 询问是否使用VAD ---
+REM --- 询问是否使用VAD ---
 :AskChunk
 
 echo ======================================================================
@@ -67,14 +67,14 @@ if %ERRORLEVEL% == 2 (
     goto AskBeamParams
 )
 
-REM --- 4. (如果使用VAD) 询问是否修改VAD参数 ---
+REM --- (如果使用VAD) 询问是否修改VAD参数 ---
 :AskVadParams
 echo.
 set "chunkParams="
 choice /c YN /m "是否需要修改默认的VAD参数？"
 
 if %ERRORLEVEL% == 2 (
-    goto AskBeamParams
+    goto AskRefineTail
 )
 echo.
 
@@ -95,13 +95,56 @@ if defined minSilence set "chunkParams=!chunkParams! --min_silence_duration_ms !
 set /p "keep=输入 keep_silence（在语音块前后扩展的时长（毫秒），默认：300）："
 if defined keep set "chunkParams=!chunkParams! --keep_silence !keep!"
 
-set "chunkParams=--vad_threshold %vadThresh% --min_speech_duration_ms %minSpeech% --keep_silence %keep%"
-
-echo 已设置自定义参数
+echo 已设置自定义 VAD 参数
 
 echo.
 
-REM --- 5. 询问高级识别参数 ---
+REM --- 4.5. 询问段尾精修参数 (只有启用了VAD才会走到这里) ---
+:AskRefineTail
+echo ======================================================================
+set "tailParams="
+
+echo.
+
+choice /c YN /m "是否启用“段尾精修”功能？"
+
+if %ERRORLEVEL% == 2 (
+    goto AskBeamParams
+)
+
+REM 用户选择了开启精修
+set "tailParams= --refine-tail"
+
+echo.
+choice /c YN /m "是否需要修改默认的段尾精修参数？"
+if %ERRORLEVEL% == 2 (
+    goto AskBeamParams
+)
+
+echo.
+
+echo 请输入新数值，或直接按回车以使用默认值
+
+set /p "t_per=输入 tail_percentile（自适应阈值，默认：20.0，值越大越容易判为静音）："
+if defined t_per set "tailParams=!tailParams! --tail_percentile !t_per!"
+
+set /p "t_off=输入 tail_offset（阈值偏移量，默认：0.05，值越大越容易判为静音）："
+if defined t_off set "tailParams=!tailParams! --tail_offset !t_off!"
+
+set /p "t_look=输入 tail_lookahead_ms（滞回检查时长（毫秒），默认：80）："
+if defined t_look set "tailParams=!tailParams! --tail_lookahead_ms !t_look!"
+
+set /p "t_safe=输入 tail_safety_margin_ms（安全边距（毫秒），默认：30）："
+if defined t_safe set "tailParams=!tailParams! --tail_safety_margin_ms !t_safe!"
+
+set /p "t_keep=输入 tail_min_keep_ms（强制保留时长（毫秒），默认：30）："
+if defined t_keep set "tailParams=!tailParams! --tail_min_keep_ms !t_keep!"
+
+echo 已设置段尾精修参数
+
+echo.
+
+REM --- 询问高级识别参数 ---
 :AskBeamParams
 
 echo 文件: !inputFile!
@@ -124,7 +167,7 @@ echo 已设置高级识别参数
 
 echo.
 
-REM --- 6. 询问是否启用调试模式---
+REM --- 询问是否启用调试模式---
 :AskDebug
 
 echo.
@@ -133,7 +176,7 @@ choice /c YN /m "是否启用调试模式？（保留临时文件并自动打开
 
 if %ERRORLEVEL% == 1 set "debugOption=--debug"
 
-REM --- 7. 询问输出方式 ---
+REM --- 询问输出方式 ---
 :AskOutputLoop
 
 echo ======================================================================
@@ -210,7 +253,7 @@ if NOT "!userChoice:7=!"=="!userChoice!" set "outputOptions=!outputOptions! -sub
 if NOT "!userChoice:8=!"=="!userChoice!" set "outputOptions=!outputOptions! -subword2json"
 if NOT "!userChoice:9=!"=="!userChoice!" set "outputOptions=!outputOptions! -kass"
 
-REM --- 8. 执行最终的 Python 命令 ---
+REM --- 执行最终的 Python 命令 ---
 :Execute
 echo.
 
@@ -218,13 +261,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!beamParams! !debugOption!!outputOptions!
+echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!tailParams!!beamParams! !debugOption!!outputOptions!
 
 echo ======================================================================
 
 echo.
 
-python asr.py "!inputFile!" %chunkOption%!chunkParams!!beamParams! !debugOption!!outputOptions!
+python asr.py "!inputFile!" %chunkOption%!chunkParams!!tailParams!!beamParams! !debugOption!!outputOptions!
 
 echo.
 
