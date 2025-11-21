@@ -1,6 +1,7 @@
 import argparse
 import copy
 import heapq
+import math
 import os
 import tempfile
 import shutil
@@ -33,6 +34,31 @@ try:
 except ImportError:
     onnxruntime = None
 
+def calculate_frame_cost(frame_idx, speech_probs, waveform, samplerate, frame_duration_s, vad_threshold):
+    """计算单帧作为切分点的代价（代价越低越适合切分）。"""
+    # 基础 VAD 概率成本
+    prob = speech_probs[frame_idx]
+    if prob > vad_threshold:
+        return 100.0 # 惩罚高概率点
+        
+    # 能量成本 (避免切在清音/呼吸声上)
+    # 边界检查
+    chunk = waveform[
+        0, 
+        max(int(frame_idx * frame_duration_s * samplerate), 0) : 
+        min(int((frame_idx + 1) * frame_duration_s * samplerate), waveform.shape[1])
+    ]
+    energy_cost = 0.0
+    if chunk.numel() > 0:
+        energy_cost = min(torch.sqrt(torch.mean(chunk**2)).item(), 0.5) * 10.0
+
+    # 局部平滑度 (斜率)
+    slope_cost = 0.0
+    if 0 < frame_idx < len(speech_probs) - 1:
+        slope_cost = abs(speech_probs[frame_idx+1] - speech_probs[frame_idx-1]) * 2.0
+
+    return prob + energy_cost + slope_cost
+
 def create_precise_segments_from_subwords(
     all_subwords, vad_chunk_end_times_s=None, no_chunk=False, debug=False
 ):
@@ -61,6 +87,7 @@ def create_precise_segments_from_subwords(
 
     # 计算子词平均持续时长和子词结束时间
     average_duration = SECONDS_PER_STEP
+    durations = []
 
     if len(all_subwords) > 1:
         durations = [
@@ -71,9 +98,6 @@ def create_precise_segments_from_subwords(
     positive_durations = [d for d in durations if d > 0]
     if positive_durations:
         average_duration = sum(positive_durations) / len(positive_durations)
-    else:
-        durations = []
-        positive_durations = []
 
     # --- 动态计算停顿阈值 ---
     pause_threshold = float('inf') # 默认阈值为无穷大，即默认禁用此功能
@@ -102,7 +126,7 @@ def create_precise_segments_from_subwords(
     while start < len(all_subwords):
         # 获取当前需要遵守的 VAD 边界的时间戳
         # 在 subword_vad_end_times 中查找。
-        # bisect_right 会返回 subword_vad_end_times[start] 在列表中最后一次出现的位置的下一个索引。
+        # bisect_right 会返回在保持列表有序的前提下，插入subword_vad_end_times[start]的最右位置
         # lo=start 是为了优化性能，告诉函数从 start 位置开始往后找，不要从头找。
         next_group_start_idx = bisect_right(subword_vad_end_times, subword_vad_end_times[start], lo=start)
 
@@ -124,7 +148,7 @@ def create_precise_segments_from_subwords(
         
         # 将片段的起始点和最终的结束点加入，形成完整的切分区间
         # start - 1 是为了让循环 for i in range(len(all_split_points) - 1): 能够从 start 索引开始处理第一个子片段
-        all_split_points = [start -1] + pause_split_indices + [end_idx]
+        all_split_points = [start - 1] + pause_split_indices + [end_idx]
 
         if pause_split_indices and debug:
             # --- 构建带有 || 分隔符的完整片段预览 ---
@@ -171,6 +195,50 @@ def create_precise_segments_from_subwords(
 
     return all_segments, segment_to_subword_map, subword_end_seconds
 
+def find_optimal_splits_dp_strict(candidates, num_cuts, start_frame, end_frame, frame_duration_s, max_duration_s):
+    """严格硬约束的动态规划算法。"""
+    n = len(candidates)
+    max_frames = int(max_duration_s / frame_duration_s)
+    min_frames = int(3.0 / frame_duration_s) 
+    
+    dp = [[(float('inf'), []) for _ in range(n)] for _ in range(num_cuts + 1)]
+
+    # 第一刀
+    for j in range(n):
+        cut_frame = candidates[j]['frame']
+        segment_len = cut_frame - start_frame
+        if min_frames <= segment_len <= max_frames:
+            dp[1][j] = (candidates[j]['cost'], [cut_frame])
+
+    # 后续每一刀
+    for i in range(2, num_cuts + 1):
+        for j in range(i - 1, n):
+            curr_frame = candidates[j]['frame']
+            for k in range(i - 2, j):
+                prev_frame = candidates[k]['frame']
+                segment_len = curr_frame - prev_frame
+                
+                if min_frames <= segment_len <= max_frames:
+                    prev_cost, prev_path = dp[i-1][k]
+                    if prev_cost != float('inf'):
+                        new_total_cost = prev_cost + candidates[j]['cost']
+                        if new_total_cost < dp[i][j][0]:
+                            dp[i][j] = (new_total_cost, prev_path + [curr_frame])
+
+    # 最终检查
+    final_min_cost = float('inf')
+    final_best_path = []
+    for j in range(num_cuts - 1, n):
+        last_cut_frame = candidates[j]['frame']
+        last_segment_len = end_frame - last_cut_frame
+        if min_frames <= last_segment_len <= max_frames:
+            cost, path = dp[num_cuts][j]
+            if cost < final_min_cost:
+                final_min_cost = cost
+                final_best_path = path
+
+    return final_best_path
+
 def format_duration(seconds):
     """将秒数格式化为 'X时Y分Z.ZZ秒' 的形式"""
     hours, remainder = divmod(seconds, 3600)
@@ -195,8 +263,7 @@ def get_speech_timestamps_onnx(
     sampling_rate,
     neg_threshold, #语音结束阈值（低阈值）
     min_speech_duration_ms, #最小语音段时长
-    min_silence_duration_ms, #多长静音视为真正间隔
-    max_speech_duration_s=float('inf'), # 智能切分阶段的软最大长度（可为 inf）
+    min_silence_duration_ms #多长静音视为真正间隔
 ):
     """使用 ONNX 模型和后处理来获取语音时间戳"""
     # ONNX 模型需要特定的输入形状
@@ -222,19 +289,10 @@ def get_speech_timestamps_onnx(
 
     frame_duration_s = (waveform.shape[2] / sampling_rate) / logits.shape[0]
 
-    # ==== 将 ms/s 转为帧数 ====
-    min_silence_frames = min_silence_duration_ms / (frame_duration_s * 1000.0)
-    max_speech_frames = (
-        max_speech_duration_s / frame_duration_s
-        if max_speech_duration_s != float('inf')
-        else float('inf')
-    )
-
     speeches = []
-    current_speech = {}
+    current_speech = None
     triggered = False
     temp_silence_start_frame = None
-    possible_ends = []  # (end_time_in_s, silence_len_in_frames)
 
     for i, prob in enumerate(speech_probs):
         # --- 语音开始逻辑（高阈值） ---
@@ -243,7 +301,6 @@ def get_speech_timestamps_onnx(
                 triggered = True
                 current_speech = {'start': i * frame_duration_s}
                 temp_silence_start_frame = None
-                possible_ends = []
             continue
 
         # --- 处于语音段中时，跟踪静音区域 ---
@@ -252,47 +309,22 @@ def get_speech_timestamps_onnx(
             if temp_silence_start_frame is None:
                 temp_silence_start_frame = i
         else:
-            # 回到高于 neg_threshold 的区域，检查之前是否有足够长静音
-            if temp_silence_start_frame is not None:
-                silence_len = i - temp_silence_start_frame
-                if silence_len >= min_silence_frames:
-                    # 记录为潜在的段结束位置（智能切分点）
-                    possible_ends.append((temp_silence_start_frame * frame_duration_s, silence_len))
-                temp_silence_start_frame = None
+            # 回到语音，清掉静音起点
+            temp_silence_start_frame = None
 
-        # --- 智能最大长度切分逻辑（软约束） ---
-        if max_speech_frames != float('inf'):
-            if (i - int(current_speech['start'] / frame_duration_s)) >= max_speech_frames:
-                if possible_ends:
-                    # 优先选择最长静音点作为切分点
-                    end_time, _ = max(possible_ends, key=lambda x: x[1])
-
-                    if (end_time - current_speech['start']) * 1000.0 >= min_speech_duration_ms:
-                        print(f"【VAD】超过最大语音时长，在最近的静音点 {end_time:.2f} 秒处软切分")
-                        current_speech['end'] = end_time
-                        speeches.append(current_speech)
-
-                    # 从切分点开始新的语音段
-                    current_speech = {'start': end_time}
-                    temp_silence_start_frame = None
-                    possible_ends = []
-                    continue
-                    # 没有可用静音点：放弃软切分，继续累积，交给后续“硬切分”
-
-        # --- 正常结束逻辑：静音持续足够长则结束当前段 ---
+        # --- 按静音长度结束当前段 ---
         if temp_silence_start_frame is not None:
             silence_len = i - temp_silence_start_frame
-            if silence_len >= min_silence_frames:
+            # ==== 将 ms/s 转为帧数 ====
+            if silence_len >= max(1,int(min_silence_duration_ms / (frame_duration_s * 1000.0))):
                 end_time = temp_silence_start_frame * frame_duration_s
-                if (end_time - current_speech['start']) * 1000.0 >= min_speech_duration_ms:
-                    current_speech['end'] = end_time
+                if (end_time - current_speech["start"]) * 1000.0 >= min_speech_duration_ms:
+                    current_speech["end"] = end_time
                     speeches.append(current_speech)
-                # 重置状态
+                    # 收尾并准备下一段
                 triggered = False
-                current_speech = {}
+                current_speech = None
                 temp_silence_start_frame = None
-                possible_ends = []
-                continue
 
     # --- 处理结尾残留的语音段 ---
     if triggered and current_speech:
@@ -303,6 +335,90 @@ def get_speech_timestamps_onnx(
 
     # 完整的语音概率数组 speech_probs 和每一帧的持续时间 frame_duration_s
     return speeches, speech_probs, frame_duration_s
+
+def global_smart_segmenter(long_segment, speech_probs, waveform, samplerate, frame_duration_s, max_duration_s, vad_threshold):
+    """
+    入口函数：分析一个长 VAD 段，返回切割好的子段列表。
+    """
+    start_s = long_segment['start']
+    end_s = long_segment['end']
+    duration_s = end_s - start_s
+
+    # 计算必须切几刀
+    num_segments = math.ceil(duration_s / max_duration_s)
+    if num_segments <= 1:
+        return [long_segment]
+
+    num_cuts = num_segments - 1
+
+    start_frame = int(start_s / frame_duration_s)
+    end_frame = int(end_s / frame_duration_s)
+
+    # 生成候选点 (筛选 VAD 概率 < 0.3 的局部低点)
+    candidates = []
+    search_start = start_frame + int(1.0 / frame_duration_s)
+    search_end = end_frame - int(1.0 / frame_duration_s)
+
+    # 边界保护
+    search_start = max(0, search_start)
+    search_end = min(len(speech_probs), search_end)
+
+    # 提取搜索区间的概率
+    if search_end > search_start + 2:
+        segment_probs = speech_probs[search_start:search_end]
+        
+        # 利用 numpy 寻找局部极小值且概率 < 0.3 的点
+        # 逻辑：当前点 <= 前一点 AND 当前点 <= 后一点 AND 当前点 < 0.3
+        # 注意：切片操作 [1:-1] 对应原数组的索引 i, [:-2] 对应 i-1, [2:] 对应 i+1
+        
+        # 这里的 segment_probs 是一个切片视图
+        p_curr = segment_probs[1:-1]
+        p_prev = segment_probs[:-2]
+        p_next = segment_probs[2:]
+
+        # 生成布尔掩码
+        mask = (p_curr < 0.3) & (p_curr <= p_prev) & (p_curr <= p_next)
+        
+        # 获取满足条件的相对索引
+        relative_indices = np.where(mask)[0]
+        
+        # 还原绝对索引：+1 是因为 p_curr 从切片的第1个元素开始，+search_start 是切片偏移
+        candidate_indices = relative_indices + 1 + search_start
+
+        # 遍历筛选出的索引计算成本 (此时循环次数大大减少)
+        for idx in candidate_indices:
+            cost = calculate_frame_cost(idx, speech_probs, waveform, samplerate, frame_duration_s, vad_threshold)
+            candidates.append({'frame': int(idx), 'cost': cost})
+    
+    # 执行 DP
+    best_cuts_frames = []
+    if len(candidates) >= num_cuts:
+        best_cuts_frames = find_optimal_splits_dp_strict(
+            candidates, num_cuts, start_frame, end_frame, frame_duration_s, max_duration_s
+        )
+    
+    # 构建结果
+    final_segments = []
+    if not best_cuts_frames:
+        # Fallback: 强制均匀切分
+        curr = start_s
+        while curr < end_s:
+            next_cut = min(curr + max_duration_s - 1, end_s)
+            if next_cut >= end_s: 
+                final_segments.append({'start': curr, 'end': end_s})
+                break
+            final_segments.append({'start': curr, 'end': next_cut})
+            curr = next_cut 
+    else:
+        current_start_s = start_s
+        overlap_s = 1.0 # 保留1秒重叠，防止切在字中间
+        for cut_frame in best_cuts_frames:
+            split_s = cut_frame * frame_duration_s
+            final_segments.append({'start': current_start_s, 'end': split_s})
+            current_start_s = max(start_s, split_s - overlap_s)
+        final_segments.append({'start': current_start_s, 'end': end_s})
+
+    return final_segments
 
 def merge_overlapping_intervals(intervals):
     """仅合并物理上重叠的区间。"""
@@ -321,15 +437,13 @@ def merge_overlapping_intervals(intervals):
             
     return merged
 
-def merge_overlap_dedup(chunk_subwords_list, chunk_ranges_s, prefer='next'):
+def merge_overlap_dedup(chunk_subwords_list, chunk_ranges_s):
     """
     合并来自不同块的子词列表，并处理重叠区域的重复子词。
 
     Args:
         chunk_subwords_list (list[list[Subword]]): 每个块识别出的子词列表的列表。
         chunk_ranges_s (list[tuple[float, float]]): 每个块在原始音频中的（开始，结束）时间。
-        prefer (str, optional): 在重叠区遇到冲突时保留哪个版本。
-                                'next' 表示保留后面块的结果。Defaults to 'next'.
 
     Returns:
         list[Subword]: 合并并去重后的最终子词列表。
@@ -362,10 +476,10 @@ def merge_overlap_dedup(chunk_subwords_list, chunk_ranges_s, prefer='next'):
         # --- 有重叠区域，执行更复杂的合并去重逻辑 ---
         
         # 将旧结果（merged）和新结果（curr_subs）划分为重叠区和非重叠区
-        prev_non_overlap = [s for s in merged if s.seconds < s_ov]
+        prev_non_overlap = [s for s in merged if not (s_ov <= s.seconds <= e_ov)]
         prev_overlap = [s for s in merged if s_ov <= s.seconds <= e_ov]
         
-        curr_non_overlap = [s for s in curr_subs if s.seconds > e_ov]
+        curr_non_overlap = [s for s in curr_subs if not (s_ov <= s.seconds <= e_ov)]
         curr_overlap = [s for s in curr_subs if s_ov <= s.seconds <= e_ov]
 
         # 处理核心的重叠区域
@@ -385,14 +499,12 @@ def merge_overlap_dedup(chunk_subwords_list, chunk_ranges_s, prefer='next'):
         for s_new in curr_overlap:
             for s_old in prev_overlap_map.get(s_new.token_id, []):
                 if _is_conflict(s_new, s_old):
-                    # 如果找到冲突，根据 prefer 策略决定是否替换
                     # 我们标记旧的 subword 为 None，表示它可能被替换
-                    if prefer == 'next':
-                        # 记录要丢弃的旧 subword 的 id
-                        discarded_old_ids.add(id(s_old))
+                    # 记录要丢弃的旧 subword 的 id
+                    discarded_old_ids.add(id(s_old))
                     break
             
-            # 如果没有冲突，或者有冲突但策略是保留旧的，则新的也需要添加
+            # 将新的 subword 添加到重叠区（冲突的旧 subword 会在后面被过滤掉）
             final_overlap.append(s_new)
 
         # 把旧的、未被标记为删除的 subword 添加回来
@@ -442,7 +554,7 @@ def refine_tail_end_timestamp(
     offset                # 在自适应阈值的基础上增加的固定偏移量，值越大，越容易将高概率区域有语音区域判为静音
 ):
     # 仅在“最后子词之后”的尾窗内搜索
-    start_idx = int(max(0.0, last_token_start_s) / frame_duration_s)
+    start_idx = int(max(0, last_token_start_s) / frame_duration_s)
     # 尾部最多多看 1s
     end_idx = min(len(speech_probs), int(np.ceil(min(max_end_s, rough_end_s + 1) / frame_duration_s)))
     if end_idx - start_idx <= 3:
@@ -455,7 +567,7 @@ def refine_tail_end_timestamp(
     else:
         p_smooth = p
 
-    # 2) 局部自适应阈值（尾窗内 20 分位 + 0.05）
+    # 2) 局部自适应阈值percentile + offset
     dyn_tau = float(np.percentile(p_smooth, percentile)) + offset
 
     # 3) 连续静音 + 滞回
@@ -468,9 +580,13 @@ def refine_tail_end_timestamp(
                     i + min_silence_frames + max(0, int(lookahead_ms / 1000.0 / frame_duration_s)))
                     ] < dyn_tau + 0.02
                 ):  # 滞回
-                cand = (start_idx + i) * frame_duration_s + safety_margin_ms / 1000.0
-                cand = max(cand, last_token_start_s + min_tail_keep_ms / 1000.0)
-                return min(cand, max_end_s)
+                return min(
+                    max(
+                        (start_idx + i) * frame_duration_s + safety_margin_ms / 1000.0,
+                        last_token_start_s + min_tail_keep_ms / 1000.0,
+                    ),
+                    max_end_s
+                )
 
     # 兜底：没找到稳定静音，保留原结束（不超过 VAD 上限）
     return min(rough_end_s, max_end_s)
@@ -661,18 +777,6 @@ def main():
             if getattr(args, p) != parser.get_default(p):
                 parser.error(f"【参数错误】检测到您设置了 --{p}，但未添加 --refine-tail 来启用该功能")
 
-    # ==== VAD 阈值参数校验和默认 ====
-    if args.vad_end_threshold is None:
-        args.vad_end_threshold = max(0.0, args.vad_threshold - 0.15)
-    if not (0.0 <= args.vad_threshold <= 1.0):
-        raise ValueError(f"vad_threshold 必须在（0-1）范围内，当前值错误")
-    if not (0.0 <= args.vad_end_threshold <= 1.0):
-        raise ValueError(f"vad_end_threshold 必须在（0-1）范围内，当前值错误")
-    if args.vad_end_threshold > args.vad_threshold:
-        raise ValueError(
-            f"vad_end_threshold 不能大于 vad_threshold"
-        )
-
     if not args.no_chunk:
         if onnxruntime is None:
             print("【错误】缺少 onnxruntime，请运行 'pip install onnxruntime'")
@@ -687,6 +791,22 @@ def main():
             print("请下载 model_quantized.onnx 并放入 models 文件夹")
             return
 
+
+    # ==== VAD 阈值参数校验和默认 ====
+    if args.vad_end_threshold is None:
+        args.vad_end_threshold = max(0, args.vad_threshold - 0.15)
+    if not (0.0 <= args.vad_threshold <= 1.0):
+        parser.error(f"vad_threshold 必须在（0-1）范围内，当前值错误")
+    if not (0.0 <= args.vad_end_threshold <= 1.0):
+        parser.error(f"vad_end_threshold 必须在（0-1）范围内，当前值错误")
+    if args.vad_end_threshold > args.vad_threshold:
+        parser.error(
+            f"vad_end_threshold 不能大于 vad_threshold"
+        )
+
+    if not (0.0 <= args.tail_percentile <= 100.0):
+        parser.error(f"tail_percentile 必须在（0-100）范围内，当前值错误")
+        
     # --- 准备路径和临时文件 ---
     input_path = Path(args.input_file)
     output_dir = input_path.parent.resolve()
@@ -704,9 +824,8 @@ def main():
     try:
         # --- ffmpeg 预处理：将输入文件转换为标准 WAV ---
         print(f"正在转换输入文件 '{input_path}' 为临时 WAV 文件……")
-        audio = AudioSegment.from_file(input_path)
         # 转换为单声道，16kHz采样率，这是ASR模型的标准格式
-        audio = audio.set_channels(1).set_frame_rate(SAMPLERATE)
+        audio = AudioSegment.from_file(input_path).set_channels(1).set_frame_rate(SAMPLERATE)
         audio.export(temp_wav_path, format="wav")
         print("转换完成")
 
@@ -725,7 +844,7 @@ def main():
             original_decoding_cfg = copy.deepcopy(model.cfg.decoding)
             
             # 同样使用深拷贝创建新配置，确保它与原始配置完全独立
-            new_decoding_cfg = copy.deepcopy(original_decoding_cfg)
+            new_decoding_cfg = copy.deepcopy(model.cfg.decoding)
             with open_dict(new_decoding_cfg): # 使用 open_dict 使配置可修改
                 new_decoding_cfg.beam.beam_size = args.beam
             
@@ -770,25 +889,26 @@ def main():
 
             # ==== 先做 VAD（双阈值 + 静音 + min_speech），不在此强制 30s ====
             # ==== 获取VAD分块，并缓存完整的语音概率 ====
-            smart_speeches, full_speech_probs, frame_duration_s = get_speech_timestamps_onnx(
-                torchaudio.load(temp_wav_path)[0],
+            waveform = torchaudio.load(temp_wav_path)[0]
+            speeches, speech_probs, frame_duration_s = get_speech_timestamps_onnx(
+                waveform,
                 onnx_session,
                 threshold=args.vad_threshold,
                 sampling_rate=SAMPLERATE,
                 neg_threshold=args.vad_end_threshold,
                 min_speech_duration_ms=int(args.min_speech_duration_ms),
-                min_silence_duration_ms=int(args.min_silence_duration_ms),
-                max_speech_duration_s=MAX_SPEECH_DURATION_S,  # 智能切分阶段限制 30s
+                min_silence_duration_ms=int(args.min_silence_duration_ms)
             )
 
-            if not smart_speeches:
+            if not speeches:
                 print("【警告】未侦测到语音活动")
+                recognition_end_time = time.time()
                 return
 
             # 先把 VAD 段转成毫秒区间（不做硬切分）
             base_ranges_ms = [
                 [int(seg["start"] * 1000.0), int(seg["end"] * 1000.0)]
-                for seg in smart_speeches
+                for seg in speeches
             ]
 
             # 合并所有重叠的 VAD 段
@@ -802,28 +922,40 @@ def main():
             # 记录这个VAD块在原始音频中的精确结束时间
             vad_chunk_end_times_s = [end_ms / 1000.0 for _, end_ms in merged_ranges_ms]
 
-            # 对超长块再做硬切分
             nonsilent_ranges_ms = []
+            
+            # 遍历每一个合并后的大段（可能是 5秒，也可能是 80秒）
             for start_ms, end_ms in merged_ranges_ms:
-                cur_start = start_ms
-                while cur_start < end_ms:
-                    cur_end = min(cur_start + int(MAX_SPEECH_DURATION_S * 1000), end_ms)
-                    nonsilent_ranges_ms.append([cur_start, cur_end])
+                long_segment = {
+                    'start': start_ms / 1000.0,
+                    'end': end_ms / 1000.0
+                }
+                
+                # 调用新的全局智能切分器
+                sub_segments = global_smart_segmenter(
+                    long_segment,
+                    speech_probs,
+                    waveform, # 传入波形算能量
+                    SAMPLERATE,
+                    frame_duration_s,
+                    MAX_SPEECH_DURATION_S, # 模型上限 (通常30s)
+                    args.vad_threshold
 
-                    if cur_end >= end_ms:
-                        break
-
-                    # 保留 1 秒重叠
-                    next_start = cur_end - 1000
-                    if next_start <= cur_start:
-                        next_start = cur_start + 500  # 兜底，避免死循环
-                    cur_start = next_start
+                )
+                
+                # 将切好的子段加入处理队列
+                for sub in sub_segments:
+                    nonsilent_ranges_ms.append([
+                        int(sub['start'] * 1000), 
+                        int(sub['end'] * 1000)
+                    ])
 
             print(
-                f"VAD 侦测到 {len(smart_speeches)} 个语音块，拆分超过 {MAX_SPEECH_DURATION_S} 秒的部分后，实际需要处理 {len(nonsilent_ranges_ms)} 个语音块"
+                f"VAD 侦测到 {len(speeches)} 个语音块，拆分超过 {MAX_SPEECH_DURATION_S} 秒的部分后，实际需要处理 {len(nonsilent_ranges_ms)} 个语音块"
             )
             if not nonsilent_ranges_ms:
                 print("【警告】经过过滤后无有效语音块")
+                recognition_end_time = time.time()
                 return
 
             chunk_ranges_s = []
@@ -834,14 +966,12 @@ def main():
                 end_ms = min(len(audio), unpadded_end_ms + args.keep_silence)
 
                 # 使用 pydub 切分音频块，将静音段添加到块的前后，完成填充
-                chunk = silence_padding + audio[start_ms:end_ms] + silence_padding
-
                 chunk_ranges_s.append((start_ms / 1000.0, end_ms / 1000.0))
                 chunk_path = temp_chunk_dir / f"chunk_{i + 1}.wav"
                 print(
                     f"正在处理语音块 {i + 1}/{len(nonsilent_ranges_ms)} （该块起止时间：{SRTWriter._format_time(unpadded_start_ms / 1000.0)} --> {SRTWriter._format_time(unpadded_end_ms / 1000.0)}，持续时间：{(unpadded_end_ms - unpadded_start_ms) / 1000.0:.2f} 秒）"
                 )
-                chunk.export(chunk_path, format="wav")
+                (silence_padding + audio[start_ms:end_ms] + silence_padding).export(chunk_path, format="wav")
                 
                 hyp, _ = model.transcribe(
                     [str(chunk_path)],
@@ -915,7 +1045,7 @@ def main():
                 all_segments[i].end_seconds = refine_tail_end_timestamp(
                     last_token_start_s=all_subwords[indices[-1]].seconds,# 直接从indices列表拿到最后一个子词的全局索引
                     rough_end_s=seg.end_seconds,
-                    speech_probs=full_speech_probs,
+                    speech_probs=speech_probs,
                     frame_duration_s=frame_duration_s,
                     max_end_s=max_end_s,
                     min_silence_duration_ms=int(args.min_silence_duration_ms),
@@ -939,7 +1069,7 @@ def main():
 
         # 检查用户是否指定了任何一种文件输出格式
         file_output_requested = any(
-            [
+            (
                 args.text,
                 args.segment,
                 args.segment2srt,
@@ -949,11 +1079,11 @@ def main():
                 args.subword2srt,
                 args.subword2json,
                 args.kass,
-            ]
+            )
         )
 
         if args.text or not file_output_requested:
-            full_text = " ".join([seg.text for seg in all_segments])
+            full_text = " ".join(seg.text for seg in all_segments)
 
         # 只有在用户完全没有指定任何输出参数时，才在控制台打印
         if not file_output_requested:
@@ -1067,7 +1197,7 @@ def main():
 
     finally:
         # 恢复原始解码策略，以防后续有其他操作
-        if 'model' in locals() and 'original_decoding_cfg' in locals():
+        if "original_decoding_cfg" in locals():
              print("正在恢复原始解码策略……")
              model.change_decoding_strategy(original_decoding_cfg)
 
