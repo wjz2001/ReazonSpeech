@@ -19,7 +19,7 @@ from omegaconf import open_dict
 from reazonspeech.nemo.asr import load_model
 from reazonspeech.nemo.asr.audio import SAMPLERATE
 from reazonspeech.nemo.asr.decode import find_end_of_segment, decode_hypothesis, PAD_SECONDS, SECONDS_PER_STEP, SUBWORDS_PER_SEGMENTS
-from reazonspeech.nemo.asr.interface import Segment, Subword
+from reazonspeech.nemo.asr.interface import Segment
 from reazonspeech.nemo.asr.writer import (
     SRTWriter,
     ASSWriter,
@@ -342,10 +342,10 @@ def global_smart_segmenter(long_segment, speech_probs, waveform, samplerate, fra
     """
     start_s = long_segment['start']
     end_s = long_segment['end']
-    duration_s = end_s - start_s
+    overlap_s = 1.0 # 保留1秒重叠，防止切在字中间
 
     # 计算必须切几刀
-    num_segments = math.ceil(duration_s / max_duration_s)
+    num_segments = math.ceil((end_s - start_s) / max_duration_s)
     if num_segments <= 1:
         return [long_segment]
 
@@ -394,7 +394,7 @@ def global_smart_segmenter(long_segment, speech_probs, waveform, samplerate, fra
     best_cuts_frames = []
     if len(candidates) >= num_cuts:
         best_cuts_frames = find_optimal_splits_dp_strict(
-            candidates, num_cuts, start_frame, end_frame, frame_duration_s, max_duration_s
+            candidates, num_cuts, start_frame, end_frame, frame_duration_s, (max_duration_s - overlap_s)
         )
     
     # 构建结果
@@ -403,19 +403,19 @@ def global_smart_segmenter(long_segment, speech_probs, waveform, samplerate, fra
         # Fallback: 强制均匀切分
         curr = start_s
         while curr < end_s:
-            next_cut = min(curr + max_duration_s - 1, end_s)
+            # 留1秒余量
+            next_cut = curr + max_duration_s
             if next_cut >= end_s: 
                 final_segments.append({'start': curr, 'end': end_s})
                 break
             final_segments.append({'start': curr, 'end': next_cut})
-            curr = next_cut 
+            curr = next_cut - overlap_s
     else:
         current_start_s = start_s
-        overlap_s = 1.0 # 保留1秒重叠，防止切在字中间
         for cut_frame in best_cuts_frames:
             split_s = cut_frame * frame_duration_s
             final_segments.append({'start': current_start_s, 'end': split_s})
-            current_start_s = max(start_s, split_s - overlap_s)
+            current_start_s = split_s - overlap_s
         final_segments.append({'start': current_start_s, 'end': end_s})
 
     return final_segments
@@ -554,7 +554,7 @@ def refine_tail_end_timestamp(
     offset                # 在自适应阈值的基础上增加的固定偏移量，值越大，越容易将高概率区域有语音区域判为静音
 ):
     # 仅在“最后子词之后”的尾窗内搜索
-    start_idx = int(max(0, last_token_start_s) / frame_duration_s)
+    start_idx = int(last_token_start_s / frame_duration_s)
     # 尾部最多多看 1s
     end_idx = min(len(speech_probs), int(np.ceil(min(max_end_s, rough_end_s + 1) / frame_duration_s)))
     if end_idx - start_idx <= 3:
@@ -638,7 +638,7 @@ def main():
     parser.add_argument(
         "--vad_threshold",
         type=float,
-        default=0.25,
+        default=0.4,
         help="【VAD】判断为语音的置信度阈值（0-1）",
     )
     # VAD 结束阈值（双阈值滞回）
@@ -754,6 +754,25 @@ def main():
     )
 
     args = parser.parse_args()
+    # 校验 --no-chunk 和 VAD 参数的冲突
+    if args.no_chunk:
+    # 只有当用户修改了默认值，但加了 --no-chunk 时才报错
+        # 定义所有 VAD 相关的参数名
+        vad_params = [
+            "vad_threshold",
+            "vad_end_threshold",
+            "min_speech_duration_ms",
+            "min_silence_duration_ms",
+            "keep_silence"
+        ]
+        
+        # 动态检查当前参数值是否等于定义时的 default 值
+        # getattr(args, p) 获取当前解析到的值
+        # parser.get_default(p) 获取定义时的默认值
+        for p in vad_params:
+            if getattr(args, p) != parser.get_default(p):
+                parser.error(f"【参数错误】已添加 --no-chunk，不能设置参数 --{p}")
+
     # 校验 --no-chunk 和 --refine-tail 的冲突
     if args.no_chunk and args.refine_tail:
         parser.error("【参数冲突】使用--refine-tail（段尾精修）功能必须开启 VAD，因此不能与 --no-chunk 同时使用")
@@ -775,7 +794,7 @@ def main():
         # parser.get_default(p) 获取定义时的默认值
         for p in tail_params:
             if getattr(args, p) != parser.get_default(p):
-                parser.error(f"【参数错误】检测到您设置了 --{p}，但未添加 --refine-tail 来启用该功能")
+                parser.error(f"【参数错误】未添加 --refine-tail，不能设置参数 --{p}")
 
     if not args.no_chunk:
         if onnxruntime is None:
@@ -791,22 +810,21 @@ def main():
             print("请下载 model_quantized.onnx 并放入 models 文件夹")
             return
 
+        # ==== VAD 阈值参数校验和默认 ====
+        if args.vad_end_threshold is None:
+            args.vad_end_threshold = max(0, args.vad_threshold - 0.15)
+        if not (0.0 <= args.vad_threshold <= 1.0):
+            parser.error(f"vad_threshold 必须在（0-1）范围内，当前值错误")
+        if not (0.0 <= args.vad_end_threshold <= 1.0):
+            parser.error(f"vad_end_threshold 必须在（0-1）范围内，当前值错误")
+        if args.vad_end_threshold > args.vad_threshold:
+            parser.error(
+                f"vad_end_threshold 不能大于 vad_threshold"
+            )
+    
+        if not (0.0 <= args.tail_percentile <= 100.0):
+            parser.error(f"tail_percentile 必须在（0-100）范围内，当前值错误")
 
-    # ==== VAD 阈值参数校验和默认 ====
-    if args.vad_end_threshold is None:
-        args.vad_end_threshold = max(0, args.vad_threshold - 0.15)
-    if not (0.0 <= args.vad_threshold <= 1.0):
-        parser.error(f"vad_threshold 必须在（0-1）范围内，当前值错误")
-    if not (0.0 <= args.vad_end_threshold <= 1.0):
-        parser.error(f"vad_end_threshold 必须在（0-1）范围内，当前值错误")
-    if args.vad_end_threshold > args.vad_threshold:
-        parser.error(
-            f"vad_end_threshold 不能大于 vad_threshold"
-        )
-
-    if not (0.0 <= args.tail_percentile <= 100.0):
-        parser.error(f"tail_percentile 必须在（0-100）范围内，当前值错误")
-        
     # --- 准备路径和临时文件 ---
     input_path = Path(args.input_file)
     output_dir = input_path.parent.resolve()
@@ -962,33 +980,108 @@ def main():
             chunk_subwords_list = []
 
             for i, (unpadded_start_ms, unpadded_end_ms) in enumerate(nonsilent_ranges_ms):
+                # --- 准备一级语音块 ---
+                # 计算包含静音保护的起止时间
                 start_ms = max(0, unpadded_start_ms - args.keep_silence)
                 end_ms = min(len(audio), unpadded_end_ms + args.keep_silence)
-
-                # 使用 pydub 切分音频块，将静音段添加到块的前后，完成填充
-                chunk_ranges_s.append((start_ms / 1000.0, end_ms / 1000.0))
-                chunk_path = temp_chunk_dir / f"chunk_{i + 1}.wav"
-                print(
-                    f"正在处理语音块 {i + 1}/{len(nonsilent_ranges_ms)} （该块起止时间：{SRTWriter._format_time(unpadded_start_ms / 1000.0)} --> {SRTWriter._format_time(unpadded_end_ms / 1000.0)}，持续时间：{(unpadded_end_ms - unpadded_start_ms) / 1000.0:.2f} 秒）"
-                )
-                (silence_padding + audio[start_ms:end_ms] + silence_padding).export(chunk_path, format="wav")
                 
-                hyp, _ = model.transcribe(
-                    [str(chunk_path)],
-                    return_hypotheses=True,
-                    verbose=False,
-                )
-                if hyp and hyp[0]:
-                    ret = decode_hypothesis(model, hyp[0])
-                    if ret.subwords:
-                        chunk_subwords_list.append([
-                            Subword(
-                                seconds=sub.seconds + start_ms / 1000.0,
-                                token_id=sub.token_id,
-                                token=sub.token,
-                            )
-                            for sub in ret.subwords
-                        ]) # 额外记录当前块的子词)
+                # 导出当前的一级块
+                chunk_path = temp_chunk_dir / f"chunk_{i + 1}.wav"
+                # 先赋值给 chunk 变量，以便后续二次切分时使用，再导出文件
+                chunk = silence_padding + audio[start_ms:end_ms] + silence_padding
+                chunk.export(chunk_path, format="wav")
+                
+                # 记录该块在整段音频中的物理起始偏移量（秒）
+                chunk_global_offset_s = start_ms / 1000.0
+                # 计算当前块的净时长（包含padding）
+                chunk_duration_s = (end_ms - start_ms) / 1000.0
+                print(
+                    f"正在处理语音块 {i + 1}/{len(nonsilent_ranges_ms)} （该块起止时间：{SRTWriter._format_time(unpadded_start_ms / 1000.0)} --> {SRTWriter._format_time(unpadded_end_ms / 1000.0)}，时长：{(unpadded_end_ms - unpadded_start_ms) / 1000.0:.2f} 秒）",
+                    end="", flush=True,
+                    )
+
+                final_subwords_in_this_chunk = []
+                
+                # --- 决策逻辑：直接识别 vs 二次 VAD 拆分 ---
+                # 设定阈值：如果块时长超过模型最大允许时长的 1/3，则视为“长块”，需要二次拆解
+                if chunk_duration_s <= MAX_SPEECH_DURATION_S / 3.0:
+                    # === 分支 A：短块，直接识别 ===
+                    print(" --> 短块，直接识别")
+                    hyp, _ = model.transcribe(
+                        [str(chunk_path)],
+                        return_hypotheses=True,
+                        verbose=False,
+                    )
+                    if hyp and hyp[0]:
+                        ret = decode_hypothesis(model, hyp[0])
+                        if ret.subwords:
+                            # 坐标变换：全局时间 = 一级块偏移 + 相对时间
+                            for sub in ret.subwords:
+                                sub.seconds += chunk_global_offset_s
+                                final_subwords_in_this_chunk.append(sub)
+                else:
+                    # === 分支 B：长块，执行二次 VAD 拆分后再识别 ===
+                    print(" --> 长块，执行二次 VAD 拆分")
+                    
+                    # 加载一级块的波形
+                    chunk_waveform, _ = torchaudio.load(chunk_path)
+                    
+                    # 运行局部 VAD
+                    sub_speeches, _, _ = get_speech_timestamps_onnx(
+                        chunk_waveform,
+                        onnx_session,
+                        threshold=args.vad_threshold,
+                        sampling_rate=SAMPLERATE,
+                        neg_threshold=args.vad_end_threshold,
+                        min_speech_duration_ms=int(args.min_speech_duration_ms),
+                        min_silence_duration_ms=int(args.min_silence_duration_ms)
+                    )
+                    
+                    if not sub_speeches:
+                        # 兜底策略：如果二次 VAD 没切出来（例如全是噪音），回退到整块识别
+                        print("    【提示】二次 VAD 未发现有效分割点，回退到整块识别")
+                        # 构造一个覆盖整个 chunk 的虚拟 VAD 段
+                        # chunk 是 pydub 对象，len(chunk) 返回毫秒数，需转为秒
+                        sub_speeches = [{'start': 0.0, 'end': len(chunk) / 1000.0}]
+                    else:
+                        print(f"    --> 拆分并逐个识别 {len(sub_speeches)} 个子片段")
+                        
+                    # 遍历二次拆分出的子块
+                    for sub_idx, sub_seg in enumerate(sub_speeches):
+                        # 计算子块在一级块内部的起止时间 (ms)
+                        # sub_seg['start'] 是相对于 chunk_path (0s) 的时间
+                        sub_start_ms = int(sub_seg['start'] * 1000)
+                        sub_end_ms = int(sub_seg['end'] * 1000)
+                        
+                        # 提取子块音频并加上静音保护
+                        # 导出临时子块文件
+                        sub_chunk_path = temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav"
+                        (silence_padding + chunk[sub_start_ms:sub_end_ms] + silence_padding).export(sub_chunk_path,format="wav")
+
+                        if len(sub_speeches) != 1:
+                            print(f"第 {i + 1}-{sub_idx + 1} 段 {(sub_end_ms - sub_start_ms) / 1000.0:.2f} 秒：")
+                        
+                        # 识别子块内容
+                        hyp, _ = model.transcribe(
+                            [str(sub_chunk_path)],
+                            return_hypotheses=True,
+                            verbose=False,
+                        )
+                        
+                        if hyp and hyp[0]:
+                            ret = decode_hypothesis(model, hyp[0])
+                            if ret.subwords:
+                                # 最终时间 = 一级块全局偏移 + 二级块在一级块内的偏移 + 识别出的相对时间
+                                # 因为 sub_seg['start'] 是基于含填充的父chunk计算的，它包含了父chunk头部的 0.5s 静音，必须扣除
+                                base_offset = chunk_global_offset_s + sub_seg['start'] - PAD_SECONDS
+                                for sub in ret.subwords:
+                                    sub.seconds += base_offset
+                                    final_subwords_in_this_chunk.append(sub)
+
+                # --- 结果收集 ---
+                if final_subwords_in_this_chunk:
+                    chunk_subwords_list.append(final_subwords_in_this_chunk)
+                    chunk_ranges_s.append((start_ms / 1000.0, end_ms / 1000.0))
 
             if chunk_subwords_list:
                 # 所有块处理完后，再执行一次合并，如果只有一个块，无需合并
