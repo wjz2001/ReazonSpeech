@@ -74,7 +74,7 @@ set "chunkParams="
 choice /c YN /m "是否需要修改默认的VAD参数？"
 
 if %ERRORLEVEL% == 2 (
-    goto AskRefineTail
+    goto AskZCR
 )
 echo.
 
@@ -96,6 +96,39 @@ set /p "keep=输入 keep_silence（在语音块前后扩展的时长（毫秒）
 if defined keep set "chunkParams=!chunkParams! --keep_silence !keep!"
 
 echo 已设置自定义 VAD 参数
+
+echo.
+
+REM --- 询问 ZCR (过零率) 参数 ---
+:AskZCR
+
+echo ======================================================================
+
+set "zcrParams="
+
+echo.
+choice /c YN /m "是否开启过零率（ZCR）检测？（保护清辅音不被切断）"
+
+if %ERRORLEVEL% == 2 (
+    goto AskRefineTail
+)
+
+set "zcrParams= --zcr"
+
+echo.
+
+choice /c YN /m "是否启用自适应 ZCR 阈值？（Y=自动计算，zcr_threshold 兜底；N=仅使用zcr_threshold）"
+if %ERRORLEVEL% == 1 set "zcrParams=!zcrParams! --auto_zcr"
+
+echo.
+
+echo 请输入 ZCR 手动阈值，默认值（0.15）
+
+set /p "zcrTh=输入 zcr_threshold："
+
+if defined zcrTh set "zcrParams=!zcrParams! --zcr_threshold !zcrTh!"
+
+echo 已设置 ZCR 参数
 
 echo.
 
@@ -261,13 +294,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!tailParams!!beamParams! !debugOption!!outputOptions!
+echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!beamParams! !debugOption!!outputOptions!
 
 echo ======================================================================
 
 echo.
 
-python asr.py "!inputFile!" %chunkOption%!chunkParams!!tailParams!!beamParams! !debugOption!!outputOptions!
+python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!beamParams! !debugOption!!outputOptions!
 
 echo.
 
