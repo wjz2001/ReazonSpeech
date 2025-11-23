@@ -83,8 +83,8 @@ def calculate_frame_cost(frame_idx, speech_probs, waveform, samplerate, frame_du
         min(int((frame_idx + 1) * frame_duration_s * samplerate), waveform.shape[1])
     ]
     # [修复] 边界情况不能返回0 (会被误认为是极佳切点)，应返回中性偏高代价
-    if chunk.numel() <= 1:
-        return prob + 10.0 
+    if chunk.numel() <= int(0.01 * samplerate):
+        return 100.0 
 
     # --- 去直流 ---
     chunk = chunk - chunk.mean()
@@ -102,7 +102,7 @@ def calculate_frame_cost(frame_idx, speech_probs, waveform, samplerate, frame_du
     # 符号相反
     # 任意一侧幅度超过噪声门限 (表示穿越了噪声带)
     if use_zcr:
-        zcr_rate = compute_chunk_zcr(chunk, noise_threshold)
+        zcr_rate = compute_chunk_zcr(chunk, noise_threshold, samplerate)
 
         if zcr_rate > zcr_threshold: 
             zcr_cost = zcr_rate * 50.0 
@@ -141,7 +141,7 @@ def calibrate_zcr_threshold(waveform, speech_probs, noise_threshold, frame_durat
     # 统计分位数
     # 资料建议：τ_v = P90 (浊音上限), τ_u = P10 (非语音下限)
     tau_v = np.percentile(zcr_array[voiced_mask], 90)
-    tau_u = np.percentile(zcr_array[unvoiced_mask], 10) # 实际上这里应该找高ZCR群体的下限，但资料里的 P10 是指 unvoiced 分布的左侧
+    tau_u = np.percentile(zcr_array[unvoiced_mask], 10) # 非语音区域的 ZCR 下限（P10）
     
     # 计算自适应阈值
     adaptive_th = 0.5 * (tau_v + tau_u)
@@ -155,14 +155,14 @@ def calibrate_zcr_threshold(waveform, speech_probs, noise_threshold, frame_durat
         print("计算阈值超出安全范围（0.05~0.5），回退默认值")
         return None
 
-def compute_chunk_zcr(chunk, noise_threshold):
+def compute_chunk_zcr(chunk, noise_threshold, samplerate):
     """
     【核心原子函数】计算单个音频片段的 ZCR 率。
     被 calculate_frame_cost, refine_tail_end_timestamp 调用。
     确保所有地方的算法完全一致。
     """
-    if chunk.numel() <= 1:
-        return 0.0
+    if chunk.numel() <= int(0.01 * samplerate):
+        return 1.0
 
     # 去直流 (DC Removal)
     chunk = chunk - chunk.mean()
@@ -213,7 +213,7 @@ def compute_global_zcr_vectorized(waveform, samplerate, frame_duration_s, noise_
 def create_precise_segments_from_subwords(
     all_subwords, vad_chunk_end_times_s = None, no_chunk = False, debug = False
 ):
-    # 初始化一个新的空列表
+    # 如果未提供 VAD 边界时间，则初始化为空列表
     if vad_chunk_end_times_s is None:
         vad_chunk_end_times_s = []
 
@@ -236,8 +236,6 @@ def create_precise_segments_from_subwords(
                 vad_chunk_end_times_s[vad_cursor] if vad_cursor < len(vad_chunk_end_times_s) else float("inf")
             )
 
-    # 计算子词平均持续时长和子词结束时间
-    average_duration = SECONDS_PER_STEP
     durations = []
 
     if len(all_subwords) > 1:
@@ -246,16 +244,14 @@ def create_precise_segments_from_subwords(
             for i in range(len(all_subwords) - 1)
         ]
 
-    positive_durations = [d for d in durations if d > 0]
-    if positive_durations:
-        average_duration = sum(positive_durations) / len(positive_durations)
-
     # --- 动态计算停顿阈值 ---
     pause_threshold = float('inf') # 默认阈值为无穷大，即默认禁用此功能
     # 只有当有足够多的数据点（例如超过20个子词间隔）时，才计算并启用阈值
     MIN_SAMPLES_FOR_THRESHOLD = SUBWORDS_PER_SEGMENTS * 2 
-    if len(durations) > MIN_SAMPLES_FOR_THRESHOLD and positive_durations:
-        pause_threshold = np.percentile(positive_durations, 95) 
+    if len(durations) > MIN_SAMPLES_FOR_THRESHOLD:
+        positive_durations = [d for d in durations if d > 0]
+        if positive_durations:
+            pause_threshold = np.percentile(positive_durations, 95) 
 
     subword_end_seconds = []
     for i, sub in enumerate(all_subwords):
@@ -263,7 +259,7 @@ def create_precise_segments_from_subwords(
         # 直接从缓存中读取VAD边界，不再需要游标
         end_time = min(
             all_subwords[i + 1].seconds if i < len(all_subwords) - 1
-            else sub.seconds + average_duration,
+            else sub.seconds + SECONDS_PER_STEP,
             subword_vad_end_times[i]
         )
     
@@ -410,7 +406,7 @@ def get_speech_timestamps_onnx(
     waveform,
     onnx_session,
     threshold,
-    sampling_rate,
+    samplerate,
     neg_threshold, #语音结束阈值（低阈值）
     min_speech_duration_ms, #最小语音段时长
     min_silence_duration_ms #多长静音视为真正间隔
@@ -436,7 +432,7 @@ def get_speech_timestamps_onnx(
     # 转回 Numpy 以便进入 Python 循环
     speech_probs = torch.sigmoid(torch.logsumexp(logits[:,1:], dim=1) - logits[:, 0]).numpy()
 
-    frame_duration_s = (waveform.shape[2] / sampling_rate) / logits.shape[0]
+    frame_duration_s = (waveform.shape[2] / samplerate) / logits.shape[0]
 
     speeches = []
     current_speech = None
@@ -525,12 +521,10 @@ def global_smart_segmenter(long_segment, speech_probs, waveform, samplerate, fra
         mask = (p_curr < max(0.15, vad_threshold - 0.1)) & (p_curr <= p_prev) & (p_curr <= p_next)
         
         # 获取满足条件的相对索引
-        relative_indices = np.where(mask)[0]
-        
         # 还原绝对索引：+1 是因为 p_curr 从切片的第1个元素开始，+search_start 是切片偏移
-        candidate_indices = relative_indices + 1 + search_start
+        candidate_indices = np.where(mask)[0] + 1 + search_start
 
-        # 遍历筛选出的索引计算成本 (此时循环次数大大减少)
+        # 遍历筛选出的索引计算成本
         for idx in candidate_indices:
             cost = calculate_frame_cost(idx, speech_probs, waveform, samplerate, frame_duration_s, vad_threshold, noise_threshold, use_zcr, zcr_threshold)
             candidates.append({'frame': idx, 'cost': cost})
@@ -714,14 +708,13 @@ def refine_tail_end_timestamp(
     for i in range(0, len(p_smooth) - min_silence_frames):
         if np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
             # --- ZCR 校验 ---
-            w_start = int((start_idx + i) * frame_duration_s * samplerate)
-            w_end = min(w_start + int(0.05 * samplerate), waveform.shape[1])
-            chunk = waveform[0, w_start:w_end]
+            if use_zcr:
+                w_start = int((start_idx + i) * frame_duration_s * samplerate)
+                w_end = min(w_start + int(0.05 * samplerate), waveform.shape[1])
+                chunk = waveform[0, w_start:w_end]
             
-            # 只有当 chunk 足够长(>10ms)才进行 ZCR 计算，避免除零或无效计算
-            if use_zcr and chunk.numel() > int(0.01 * samplerate):
                 # ZCR 判定
-                zcr_value = compute_chunk_zcr(chunk, noise_threshold)
+                zcr_value = compute_chunk_zcr(chunk, noise_threshold, samplerate)
                 if zcr_value > zcr_threshold:
                     if debug:
                         print(f"【ZCR】检测到清音！时间点：{SRTWriter._format_time((start_idx + i) * frame_duration_s)}，ZCR值：{zcr_value:.3f}（阈值: {zcr_threshold}）")
@@ -1010,8 +1003,6 @@ def main():
 
     # --- 准备路径和临时文件 ---
     input_path = Path(args.input_file)
-    output_dir = input_path.parent.resolve()
-    base_name = input_path.stem
 
     # 创建一个临时的 WAV 文件
     # delete=False 确保在 with 块外使用它，最后手动删除
@@ -1055,7 +1046,6 @@ def main():
 
         # --- 逐块识别并校正时间戳 ---
         all_subwords = []
-        vad_chunk_end_times_s = []  # 用于存储VAD块的结束时间
 
         # --- 计时开始：核心识别流程 ---
         recognition_start_time = time.time()
@@ -1095,7 +1085,7 @@ def main():
                 waveform,
                 onnx_session,
                 threshold=args.vad_threshold,
-                sampling_rate=SAMPLERATE,
+                samplerate=SAMPLERATE,
                 neg_threshold=args.vad_end_threshold,
                 min_speech_duration_ms=int(args.min_speech_duration_ms),
                 min_silence_duration_ms=int(args.min_silence_duration_ms)
@@ -1137,9 +1127,6 @@ def main():
                 print(f"原 {len(base_ranges_ms)} 个 VAD 语音块已合并为 {len(merged_ranges_ms)} 个 VAD 语音块")
             else:
                 print(f"没有需要合并的 VAD 语音块")
-
-            # 记录这个VAD块在原始音频中的精确结束时间
-            vad_chunk_end_times_s = [end_ms / 1000.0 for _, end_ms in merged_ranges_ms]
 
             nonsilent_ranges_ms = []
             
@@ -1183,6 +1170,9 @@ def main():
 
             chunk_ranges_s = []
             chunk_subwords_list = []
+            # 临时列表，用于收集第一次与第二次 VAD 的结束时间
+            new_vad_boundaries = [] 
+            vad_chunk_end_times_s = []  # 用于存储VAD块的结束时间
 
             for i, (unpadded_start_ms, unpadded_end_ms) in enumerate(nonsilent_ranges_ms):
                 # --- 准备一级语音块 ---
@@ -1208,6 +1198,10 @@ def main():
                 if ((end_ms - start_ms) / 1000.0) <= MAX_SPEECH_DURATION_S / 3.0:
                     # === 分支 A：短块，直接识别 ===
                     print(" --> 短块，直接识别")
+
+                    # 短块没有运行二次VAD，直接使用一级VAD的原始结束时间
+                    new_vad_boundaries.append(unpadded_end_ms / 1000.0)
+
                     hyp, _ = model.transcribe(
                         [str(chunk_path)],
                         return_hypotheses=True,
@@ -1224,15 +1218,12 @@ def main():
                     # === 分支 B：长块，执行二次 VAD 拆分后再识别 ===
                     print(" --> 长块，执行二次 VAD 拆分")
                     
-                    # 加载一级块的波形
-                    chunk_waveform, _ = torchaudio.load(chunk_path)
-                    
                     # 运行局部 VAD
                     sub_speeches, _, _ = get_speech_timestamps_onnx(
-                        chunk_waveform,
+                        torchaudio.load(chunk_path)[0],
                         onnx_session,
                         threshold=args.vad_threshold,
-                        sampling_rate=SAMPLERATE,
+                        samplerate=SAMPLERATE,
                         neg_threshold=args.vad_end_threshold,
                         min_speech_duration_ms=int(args.min_speech_duration_ms),
                         min_silence_duration_ms=int(args.min_silence_duration_ms)
@@ -1247,6 +1238,11 @@ def main():
 
                     refined_sub_speeches = []
                     for seg in sub_speeches:
+                        # sub_seg['end'] 是相对于含 Padding 的 chunk 的时间
+                        # start_ms 是 chunk 在原音频中的起始时间（含 keep_silence）
+                        # PAD_SECONDS 是 chunk 头部人为添加的静音
+                        new_vad_boundaries.append((start_ms / 1000.0) + seg['end'] - PAD_SECONDS)
+
                         if (seg['end'] - seg['start']) <= MAX_SPEECH_DURATION_S:
                             # 长度正常，直接加入
                             refined_sub_speeches.append(seg)
@@ -1313,6 +1309,10 @@ def main():
                 print("所有语音块处理完毕，正在去重……")
                 all_subwords = merge_overlap_dedup(chunk_subwords_list, chunk_ranges_s) if len(chunk_subwords_list) > 1 else chunk_subwords_list[0]
                 print(f"语音块去重完毕")
+
+                # 排序，确保时间轴单调递增
+                vad_chunk_end_times_s = sorted(new_vad_boundaries)
+
             else:
                 all_subwords = []
 
@@ -1391,6 +1391,9 @@ def main():
         print("=" * 70)
         print("识别完成，正在生成输出文件……")
 
+        output_dir = input_path.parent.resolve()
+        base_name = input_path.stem
+
         # 检查用户是否指定了任何一种文件输出格式
         file_output_requested = any(
             (
@@ -1427,7 +1430,6 @@ def main():
             output_path = output_dir / f"{base_name}.segments.txt"
             with output_path.open("w", encoding="utf-8") as f:
                 writer = TextWriter(f)
-                writer.write_header()  # 虽然为空，但保持接口一致性
                 for seg in all_segments:
                     writer.write(seg)
             print(f"带时间戳的文本片段已保存为：{output_path}")
@@ -1436,7 +1438,6 @@ def main():
             output_path = output_dir / f"{base_name}.srt"
             with output_path.open("w", encoding="utf-8") as f:
                 writer = SRTWriter(f)
-                writer.write_header()
                 for seg in all_segments:
                     writer.write(seg)
             print(f"文本片段 SRT 字幕文件已保存为：{output_path}")
