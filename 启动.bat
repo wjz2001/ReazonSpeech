@@ -83,7 +83,7 @@ echo 请输入新数值，或直接按回车以使用默认值
 set /p "vadThresh=输入 vad_threshold（语音置信度，默认：0.4，范围：0~1）："
 if defined vadThresh set "chunkParams=!chunkParams! --vad_threshold !vadThresh!"
 
-set /p "vadEndThresh=输入 vad_end_threshold（语音是否结束置信度，默认：智能，范围：0~1）："
+set /p "vadEndThresh=输入 vad_end_threshold（语音是否结束置信度，默认：智能，范围：0.05~1）："
 if defined vadEndThresh set "chunkParams=!chunkParams! --vad_end_threshold !vadEndThresh!"
 
 set /p "minSpeech=输入 min_speech_duration_ms（移除短于此时长（毫秒）的语音块，默认：100）："
@@ -158,7 +158,7 @@ echo.
 
 echo 请输入新数值，或直接按回车以使用默认值
 
-set /p "t_per=输入 tail_percentile（自适应阈值，默认：30.0，值越大越容易判为静音）："
+set /p "t_per=输入 tail_percentile（自适应阈值，默认：20，值越大越容易判为静音）："
 if defined t_per set "tailParams=!tailParams! --tail_percentile !t_per!"
 
 set /p "t_off=输入 tail_offset（阈值偏移量，默认：0.05，值越大越容易判为静音）："
