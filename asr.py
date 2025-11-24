@@ -43,16 +43,16 @@ class Logger:
 
     def info(self, *args, **kwargs):
         """普通信息：始终显示"""
-        logger.info(*args, **kwargs)
+        print(*args, **kwargs)
 
     def warn(self, *args, **kwargs):
         """警告信息：始终显示"""
-        logger.info("【警告】", *args, **kwargs)
+        print("【警告】", *args, **kwargs)
 
     def debug(self, *args, **kwargs):
         """调试信息：仅在 --debug 开启时显示"""
         if self.debug_mode:
-            logger.info("【调试】", *args, **kwargs)
+            print("【调试】", *args, **kwargs)
 
 # 初始化全局日志实例
 logger = Logger()
@@ -136,7 +136,7 @@ def calibrate_zcr_threshold(speech_probs, zcr_array):
     unvoiced_mask = speech_probs < 0.2
     
     if voiced_mask.sum() < 10 or unvoiced_mask.sum() < 10:
-        logger.warn("【ZCR】浊音/静音样本区分度不足，回退默认值")
+        logger.debug("【ZCR】浊音/静音样本区分度不足，回退默认值")
         return None
 
     # 统计分位数
@@ -147,11 +147,11 @@ def calibrate_zcr_threshold(speech_probs, zcr_array):
     # 计算自适应阈值
     adaptive_th = 0.5 * (tau_v + tau_u)
     
-    logger.info(f"【ZCR】浊音 P90 = {tau_v:.6f}，非语音 P10 = {tau_u:.6f}，计算阈值 = {adaptive_th:.6f}")
+    logger.debug(f"【ZCR】浊音 P90 = {tau_v:.6f}，非语音 P10 = {tau_u:.6f}，计算阈值 = {adaptive_th:.6f}")
 
     # 安全检查：如果计算出的阈值太极端，说明数据分布有问题
     if not (0.05 < adaptive_th < 0.5):
-        logger.warn("【ZCR】计算阈值超出安全范围（0.05~0.5），回退默认值")
+        logger.debug("【ZCR】计算阈值超出安全范围（0.05~0.5），回退默认值")
         return None
     return adaptive_th
 
@@ -163,9 +163,9 @@ def compute_global_zcr_vectorized(waveform, frame_length):
     # waveform: (1, T)
     waveform_centered = waveform - waveform.mean(dim=-1, keepdim=True)
 
-    logger.info("【ZCR】正在计算全局背景底噪水平……")    
+    logger.debug("【ZCR】正在计算全局背景底噪水平……")    
     noise_threshold = calculate_dynamic_noise_threshold(waveform_centered, frame_length)
-    logger.info(f"【ZCR】全局底噪门限已设定为：{noise_threshold:.6f}")
+    logger.debug(f"【ZCR】全局底噪门限已设定为：{noise_threshold:.6f}")
 
     # 等价于 abs > threshold
     is_loud = (waveform_centered.abs() > noise_threshold)
