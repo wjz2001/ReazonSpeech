@@ -653,10 +653,10 @@ def refine_tail_end_timestamp(
                     logger.debug(f"【ZCR】检测到清音！时间点：{SRTWriter._format_time((start_idx + i) * frame_duration_s)}，ZC值：{zcr_value:.6f}（阈值: {zcr_threshold}）")
                     continue # 包含清音，直接在此处 continue
 
-            if np.any(p_smooth[
+            if not np.any(p_smooth[
                 i + min_silence_frames : 
                 min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / 1000.0 / frame_duration_s))
-                ] < min(0.98, dyn_tau + 0.05) ):  # 滞回
+                ] >= min(0.98, dyn_tau + 0.05) ):  # 滞回
                 return min(
                     max(
                         (start_idx + i) * frame_duration_s + safety_margin_ms / 1000.0,
