@@ -1246,7 +1246,7 @@ def main():
         if args.refine_tail: # 只在启用精修且map存在时精修
             logger.info("【精修】正在修除每段的尾部静音……")
 
-            for segment in all_segments:
+            for i, segment in enumerate(all_segments):
                 # 安全检查：是否存在 indices 和 vad_limit 属性
                 indices = getattr(segment, "subword_indices", None)
                 vad_limit = getattr(segment, "vad_limit", None)
@@ -1260,7 +1260,7 @@ def main():
                     rough_end_s = segment.end_seconds,
                     speech_probs = speech_probs,
                     frame_duration_s = frame_duration_s,
-                    max_end_s = vad_limit,
+                    max_end_s = min(vad_limit, all_segments[i + 1].start_seconds) if i < len(all_segments) - 1 else vad_limit,
                     min_silence_duration_ms = int(args.min_silence_duration_ms),
                     lookahead_ms = args.tail_lookahead_ms,
                     safety_margin_ms = args.tail_safety_margin_ms,
