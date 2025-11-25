@@ -87,27 +87,21 @@ def calculate_frame_cost(frame_idx, speech_probs, energy_array, vad_threshold, u
     prob = speech_probs[frame_idx]
     if prob > vad_threshold:
         return 100.0 # 惩罚高概率点，强硬约束,确信是语音的地方绝不切
-        
-    # --- 能量成本 (查表优化) ---
-    energy_cost = min(energy_array[frame_idx], 0.5) * 10.0
-
 
     # --- 动态抗噪过零率 (Robust ZCR) ---
     # 逻辑：(过零) AND (穿越点的幅度足够大，不仅是微小抖动)
     # 标准做法：check max(abs(x[n]), abs(x[n+1])) > th
     zcr_cost = 0.0
     if use_zcr and zcr_array is not None:
-        zcr_rate = zcr_array[frame_idx]
-
-        if zcr_rate > zcr_threshold: 
-            zcr_cost = zcr_rate * 50.0 
+        if zcr_array[frame_idx] > zcr_threshold: 
+            zcr_cost = zcr_array[frame_idx] * 50.0 
 
     # 局部平滑度 (斜率)
     slope_cost = 0.0
     if 0 < frame_idx < len(speech_probs) - 1:
         slope_cost = abs(speech_probs[frame_idx + 1] - speech_probs[frame_idx - 1]) * 2.0
 
-    return prob + energy_cost + slope_cost + zcr_cost
+    return prob + min(energy_array[frame_idx], 0.5) * 10.0 + slope_cost + zcr_cost
 
 def calibrate_zcr_threshold(speech_probs, zcr_array):
     """
@@ -535,11 +529,11 @@ def merge_overlap_dedup(chunk_results):
     """
     重叠区域：文本相同则去重，否则保留双方并打印提示
     """
-    def _overlap_interval(start_s, end_s):
-        s, e = max(start_s[0], end_s[0]), min(start_s[1], end_s[1])
+    def _overlap_interval(start, end):
+        s, e = max(start[0], end[0]), min(start[1], end[1])
         return (s, e) if e > s else (None, None)
 
-    merged = chunk_results[0]["subwords"]
+    merged = list(chunk_results[0]["subwords"])
 
     for i in range(1, len(chunk_results)):
         curr_subs = chunk_results[i]["subwords"]
@@ -629,6 +623,8 @@ def refine_tail_end_timestamp(
     # 仅在“最后子词之后”的尾窗内搜索
     start_idx = int(last_token_start_s / frame_duration_s)
     end_idx = min(len(speech_probs), int(np.ceil(max_end_s / frame_duration_s)))
+    if start_idx >= len(speech_probs):
+        return min(rough_end_s, max_end_s)
     # 至少要有 4 帧才能进行有效的统计学分析
     if end_idx - start_idx <= 4:
         return min(rough_end_s, max_end_s)
@@ -1029,36 +1025,38 @@ def main():
             # 先计算每一帧对应的采样点数（四舍五入），避免浮点累积误差
             frame_length = int(round(frame_duration_s * SAMPLERATE))
 
-            # 向量化计算全局能量
-            logger.debug("正在计算全局能量分布……")
-            # 转为 numpy 以便后续快速索引 (如果显存紧张，保持tensor也行，但numpy读写通常更快)
-            energy_array = compute_global_energy_vectorized(waveform, frame_length).numpy()
-            
-            # 对齐长度（防止 pooling 的 ceil_mode 导致多出一帧）
-            energy_array = energy_array[:min(len(energy_array), len(speech_probs))]
-            logger.debug("全局能量计算完成")
-
             # 如需要 ZCR，则一次性计算全局 ZCR 向量
             zcr_array = None
             final_zcr_threshold = args.zcr_threshold # 默认为手动值
             if args.zcr:
-                zcr_array = compute_global_zcr_vectorized(waveform, frame_length).numpy()
-                # 确保与 VAD 帧一一对应， (因为池化 padding 可能导致长度差 1)
-                min_len = min(len(zcr_array), len(speech_probs))
-                zcr_array = zcr_array[:min_len]
-                speech_probs = speech_probs[:min_len]
+                zcr_array = compute_global_zcr_vectorized(waveform, frame_length).numpy()                
 
-                # 确定最终使用的 ZCR 阈值
-                if args.auto_zcr:
-                    # 只有开启了 ZCR 且开启了 Auto 才进行校准
-                    calibrated_val = calibrate_zcr_threshold(
-                        speech_probs, zcr_array
-                    )
-                    if calibrated_val is not None:
-                        final_zcr_threshold = calibrated_val
-                        logger.info(f"【ZCR】ZCR 自适应阈值已调整为：{final_zcr_threshold:.6f}")
-                    else:
-                        logger.warn(f"【ZCR】自适应阈值校准失败，使用值 {final_zcr_threshold}")
+            # 向量化计算全局能量
+            logger.debug("正在计算全局能量分布……")
+            # 转为 numpy 以便后续快速索引 (如果显存紧张，保持tensor也行，但numpy读写通常更快)
+            energy_array = compute_global_energy_vectorized(waveform, frame_length).numpy()
+
+            #这一行代码会自动忽略为 None 的 zcr_array，只计算存在的数组的最小长度
+            min_len = min(len(x) for x in [speech_probs, energy_array, zcr_array] if x is not None)
+            
+            # 对齐长度（防止 pooling 的 ceil_mode 导致多出一帧）
+            energy_array = energy_array[:min_len]
+            speech_probs = speech_probs[:min_len]
+            if zcr_array is not None:
+                zcr_array = zcr_array[:min_len]
+            logger.debug("全局能量计算完成")
+
+            # 确定最终使用的 ZCR 阈值
+            if args.auto_zcr:
+                # 只有开启了 ZCR 且开启了 Auto 才进行校准
+                calibrated_val = calibrate_zcr_threshold(
+                    speech_probs, zcr_array
+                )
+                if calibrated_val is not None:
+                    final_zcr_threshold = calibrated_val
+                    logger.info(f"【ZCR】ZCR 自适应阈值已调整为：{final_zcr_threshold:.6f}")
+                else:
+                    logger.warn(f"【ZCR】自适应阈值校准失败，使用值 {final_zcr_threshold}")
 
             # 合并所有重叠的 VAD 段
             logger.debug("【VAD】正在合并重叠的语音块……")
@@ -1152,12 +1150,56 @@ def main():
                         sub_speeches = [[0.0, len(chunk) / 1000.0]]
 
                     refined_sub_speeches = []
-                    for seg in sub_speeches:
+                    idx = 0
+                    while idx < len(sub_speeches):
+                        seg = sub_speeches[idx]
+                        
                         # seg 是列表 [start, end]
                         # seg[1] 是相对于含 Padding 的 chunk 的时间
                         # start_ms 是 chunk 在原音频中的起始时间（含 keep_silence）
                         # PAD_SECONDS 是 chunk 头部人为添加的静音
                         vad_chunk_end_times_s.append((start_ms / 1000.0) + seg[1] - PAD_SECONDS)
+
+                        # 短片段合并逻辑
+                        seg_duration = seg[1] - seg[0]
+
+                        if seg_duration <= 1.0:
+                            # 获取前后邻居
+                            prev_seg = refined_sub_speeches[-1] if refined_sub_speeches else None
+                            next_seg = sub_speeches[idx + 1] if idx + 1 < len(sub_speeches) else None
+                            dur_prev = (prev_seg[1] - prev_seg[0]) if prev_seg else float('inf')
+                            dur_next = (next_seg[1] - next_seg[0]) if next_seg else float('inf')
+
+                            target_side = None # "left" or "right"
+
+                            # --- 决定优先尝试哪一边 (找短的) ---
+                            if prev_seg and next_seg:
+                                target_side = "left" if dur_prev <= dur_next else "right"
+                            elif prev_seg:
+                                target_side = "left"
+                            elif next_seg:
+                                target_side = "right"
+
+                            # --- 检查约束并执行合并 ---
+                            if target_side == "left":
+                                # 计算预期时长：前段起点 到 当前段终点
+                                if seg[1] - prev_seg[0] <= MAX_SPEECH_DURATION_S:
+                                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向左合并: 前段 {dur_prev:.2f} 秒 --> 延长至 {dur_prev + seg_duration:.2f} 秒")
+                                    prev_seg[1] = seg[1]
+                                    idx += 1
+                                    continue
+                                else:
+                                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向左合并后超过 {MAX_SPEECH_DURATION_S} 秒，放弃")
+
+                            elif target_side == "right":
+                                # 计算预期时长：当前段起点 到 后段终点
+                                if next_seg[1] - seg[0] <= MAX_SPEECH_DURATION_S:
+                                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向右合并: 后段 {dur_next:.2f} 秒 --> 延长至 {seg_duration + dur_next:.2f}")
+                                    next_seg[0] = seg[0]
+                                    idx += 1
+                                    continue
+                                else:
+                                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向右合并后超过 {MAX_SPEECH_DURATION_S} 秒，放弃")
 
                         if (seg[1] - seg[0]) <= MAX_SPEECH_DURATION_S:
                             # 长度正常，直接加入
@@ -1179,6 +1221,7 @@ def main():
                                 
                                 # 移动游标，回退 overlap_s 以形成重叠
                                 curr = next_cut - OVERLAP_S
+                        idx += 1
 
                     if len(refined_sub_speeches) > 1:
                         logger.info(f"    --> 拆分并逐个识别 {len(refined_sub_speeches)} 个子片段")
