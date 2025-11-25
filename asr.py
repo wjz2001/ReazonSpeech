@@ -637,7 +637,9 @@ def refine_tail_end_timestamp(
     p_smooth = np.convolve(speech_probs[start_idx:end_idx], np.ones(5, dtype=np.float32) / 5.0, mode="same")
 
     # 局部自适应阈值percentile + offset
-    dyn_tau = float(np.percentile(p_smooth, percentile)) + offset
+    # 限制阈值范围，防止极端情况导致逻辑失效
+    # 0.10 保证底噪容忍度，0.95 保证不会因为全 1.0 的概率导致无法切割
+    dyn_tau = np.clip(float(np.percentile(p_smooth, percentile)) + offset, 0.10, 0.95)
 
     # 连续静音 + 滞回
     min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
@@ -651,12 +653,10 @@ def refine_tail_end_timestamp(
                     logger.debug(f"【ZCR】检测到清音！时间点：{SRTWriter._format_time((start_idx + i) * frame_duration_s)}，ZC值：{zcr_value:.6f}（阈值: {zcr_threshold}）")
                     continue # 包含清音，直接在此处 continue
 
-            if np.all(
-                p_smooth[
-                    i + min_silence_frames:min(len(p_smooth),
-                    i + min_silence_frames + max(0, int(lookahead_ms / 1000.0 / frame_duration_s)))
-                    ] < dyn_tau + 0.02
-                ):  # 滞回
+            if np.any(p_smooth[
+                i + min_silence_frames : 
+                min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / 1000.0 / frame_duration_s))
+                ] < min(0.98, dyn_tau + 0.05) ):  # 滞回
                 return min(
                     max(
                         (start_idx + i) * frame_duration_s + safety_margin_ms / 1000.0,
