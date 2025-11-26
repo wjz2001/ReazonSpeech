@@ -17,11 +17,23 @@ class Subword:
     token: str
 
 @dataclass
+class PreciseSubword(Subword):
+    """继承自 Subword，包含结束时间与 VAD 限制"""
+    end_seconds: float
+    vad_limit: float
+
+@dataclass
 class Segment:
     """A segment of transcription with timestamps"""
     start_seconds: float
     end_seconds: float
     text: str
+
+@dataclass
+class PreciseSegment(Segment):
+    """继承自 Segment，强制要求包含 vad_limit 和 subword_indices"""
+    vad_limit: float
+    subwords: list[PreciseSubword]
 
 @dataclass
 class TranscribeResult:
