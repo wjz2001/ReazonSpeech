@@ -122,7 +122,7 @@ if %ERRORLEVEL% == 1 set "zcrParams=!zcrParams! --auto_zcr"
 
 echo.
 
-echo 请输入 ZCR 手动阈值，默认值（0.15）
+echo 请输入 ZCR 手动阈值，，或直接按回车以使用默认值（0.15）
 
 set /p "zcrTh=输入 zcr_threshold："
 

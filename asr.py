@@ -447,7 +447,7 @@ def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_dur
     """
 
     # 计算必须切几刀
-    num_cuts = max(0, math.ceil((end_s - start_s) / max_duration_s) - 1)
+    num_cuts = max(0, math.ceil((end_s - start_s) / (max_duration_s - overlap_s)) - 1)
     if num_cuts == 0:
          return [[start_s, end_s]]
 
@@ -506,24 +506,6 @@ def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_dur
     final_segments.append([segment_start_s, end_s])
 
     return final_segments
-
-def merge_overlapping_intervals(speeches):
-    """仅合并物理上重叠的区间。"""
-    if not speeches:
-        return []
-    
-    # 初始化 merged，直接提取第一个元素的数值，存为列表 [start, end]
-    merged = [list(speeches[0])]
-
-    for seg in speeches[1:]:
-        # 比较当前段的 start 和上一段合并后的 end
-        # seg[0] 是 start, seg[1] 是 end
-        if seg[0] < merged[-1][1]: 
-            merged[-1][1] = max(merged[-1][1], seg[1])
-        else:
-            merged.append([seg[0], seg[1]])
-            
-    return merged
 
 def merge_overlap_dedup(chunk_results):
     """
@@ -587,6 +569,64 @@ def merge_overlap_dedup(chunk_results):
         merged = prev_non_overlap + final_overlap + curr_non_overlap
 
     return merged
+
+def merge_short_segments_adaptive(segments, max_duration, min_duration = 1.0):
+    """
+    把短于 min_duration 的片段合并到相邻较短的片段中，
+    优先合并更短的一侧，并确保合并后的总时长不超过 max_duration
+    """
+    if not segments:
+        return []
+
+    # 创建副本以避免修改原始数据
+    working_segments = [list(s) for s in segments]
+    short_merged = []
+    
+    i = 0
+    while i < len(working_segments):
+        seg = working_segments[i]
+        seg_duration = seg[1] - seg[0]
+
+        if seg_duration <= min_duration:
+            # 获取前后邻居
+            prev_seg = short_merged[-1] if short_merged else None
+            next_seg = working_segments[i + 1] if i + 1 < len(working_segments) else None
+            
+            dur_prev = (prev_seg[1] - prev_seg[0]) if prev_seg else float('inf')
+            dur_next = (next_seg[1] - next_seg[0]) if next_seg else float('inf')
+
+            target_side = None # "left" or "right"
+            if prev_seg and next_seg:
+                target_side = "left" if dur_prev <= dur_next else "right"
+            elif prev_seg:
+                target_side = "left"
+            elif next_seg:
+                target_side = "right"
+
+            if target_side == "left":
+                # 计算预期时长：前段起点 到 当前段终点
+                if seg[1] - prev_seg[0] <= max_duration:
+                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向左合并: 前段 {dur_prev:.2f} 秒 --> 延长至 {dur_prev + seg_duration:.2f} 秒")
+                    prev_seg[1] = seg[1]
+                    i += 1
+                    continue
+                else:
+                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向左合并后超过 {max_duration} 秒，放弃")
+
+            elif target_side == "right":
+                # 计算预期时长：当前段起点 到 后段终点
+                if next_seg[1] - seg[0] <= max_duration:
+                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向右合并: 后段 {dur_next:.2f} 秒 --> 延长至 {seg_duration + dur_next:.2f} 秒")
+                    next_seg[0] = seg[0]
+                    i += 1
+                    continue
+                else:
+                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向右合并后超过 {max_duration} 秒，放弃")
+
+        short_merged.append(seg)
+        i += 1
+        
+    return short_merged
 
 def open_folder(path):
     """根据不同操作系统，使用默认的文件浏览器打开指定路径的文件夹"""
@@ -1059,8 +1099,11 @@ def main():
                     logger.warn(f"【ZCR】自适应阈值校准失败，使用值 {final_zcr_threshold}")
 
             # 合并所有重叠的 VAD 段
-            logger.debug("【VAD】正在合并重叠的语音块……")
-            merged_ranges_s = merge_overlapping_intervals(speeches)
+            logger.debug("【VAD】正在合并短于1秒的语音块……")
+            merged_ranges_s = merge_short_segments_adaptive(
+                speeches, 
+                MAX_SPEECH_DURATION_S
+            )
             if len(speeches) != len(merged_ranges_s):
                 logger.debug(f"【VAD】原 {len(speeches)} 个语音块已合并为 {len(merged_ranges_s)} 个语音块")
             else:
@@ -1149,58 +1192,19 @@ def main():
                         # chunk 是 pydub 对象，len(chunk) 返回毫秒数，需转为秒
                         sub_speeches = [[0.0, len(chunk) / 1000.0]]
 
-                    refined_sub_speeches = []
-                    idx = 0
-                    while idx < len(sub_speeches):
-                        seg = sub_speeches[idx]
-                        
+                    for seg in sub_speeches:
                         # seg 是列表 [start, end]
                         # seg[1] 是相对于含 Padding 的 chunk 的时间
                         # start_ms 是 chunk 在原音频中的起始时间（含 keep_silence）
                         # PAD_SECONDS 是 chunk 头部人为添加的静音
                         vad_chunk_end_times_s.append((start_ms / 1000.0) + seg[1] - PAD_SECONDS)
 
-                        # 短片段合并逻辑
-                        seg_duration = seg[1] - seg[0]
-
-                        if seg_duration <= 1.0:
-                            # 获取前后邻居
-                            prev_seg = refined_sub_speeches[-1] if refined_sub_speeches else None
-                            next_seg = sub_speeches[idx + 1] if idx + 1 < len(sub_speeches) else None
-                            dur_prev = (prev_seg[1] - prev_seg[0]) if prev_seg else float('inf')
-                            dur_next = (next_seg[1] - next_seg[0]) if next_seg else float('inf')
-
-                            target_side = None # "left" or "right"
-
-                            # --- 决定优先尝试哪一边 (找短的) ---
-                            if prev_seg and next_seg:
-                                target_side = "left" if dur_prev <= dur_next else "right"
-                            elif prev_seg:
-                                target_side = "left"
-                            elif next_seg:
-                                target_side = "right"
-
-                            # --- 检查约束并执行合并 ---
-                            if target_side == "left":
-                                # 计算预期时长：前段起点 到 当前段终点
-                                if seg[1] - prev_seg[0] <= MAX_SPEECH_DURATION_S:
-                                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向左合并: 前段 {dur_prev:.2f} 秒 --> 延长至 {dur_prev + seg_duration:.2f} 秒")
-                                    prev_seg[1] = seg[1]
-                                    idx += 1
-                                    continue
-                                else:
-                                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向左合并后超过 {MAX_SPEECH_DURATION_S} 秒，放弃")
-
-                            elif target_side == "right":
-                                # 计算预期时长：当前段起点 到 后段终点
-                                if next_seg[1] - seg[0] <= MAX_SPEECH_DURATION_S:
-                                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向右合并: 后段 {dur_next:.2f} 秒 --> 延长至 {seg_duration + dur_next:.2f}")
-                                    next_seg[0] = seg[0]
-                                    idx += 1
-                                    continue
-                                else:
-                                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向右合并后超过 {MAX_SPEECH_DURATION_S} 秒，放弃")
-
+                    merged_sub_speeches = merge_short_segments_adaptive(
+                            sub_speeches, 
+                            MAX_SPEECH_DURATION_S
+                        )
+                    refined_sub_speeches = []
+                    for seg in merged_sub_speeches:
                         if (seg[1] - seg[0]) <= MAX_SPEECH_DURATION_S:
                             # 长度正常，直接加入
                             refined_sub_speeches.append(seg)
@@ -1221,7 +1225,6 @@ def main():
                                 
                                 # 移动游标，回退 overlap_s 以形成重叠
                                 curr = next_cut - OVERLAP_S
-                        idx += 1
 
                     if len(refined_sub_speeches) > 1:
                         logger.info(f"    --> 拆分并逐个识别 {len(refined_sub_speeches)} 个子片段")
