@@ -252,7 +252,7 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
         if positive_durations:
             pause_threshold = np.percentile(positive_durations, 95) 
 
-    all_segments = []
+    raw_segments = []
     start = 0
 
     while start < len(all_subwords):
@@ -291,21 +291,9 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
         for i in range(len(all_split_points) - 1):
             current_subwords = all_subwords[all_split_points[i] + 1:all_split_points[i + 1] + 1]
 
-            if not no_remove_punc: 
-                # 检查最后一个子词是否是标点
-                if current_subwords[-1].token in TOKEN_PUNC:
-                    # 去掉空白后检查是不是“全标点”句（防止把只有标点的片段删空），只要不是“所有子词都在TOKEN_PUNC里”，就执行剔除
-                    if not all((s.token in TOKEN_PUNC or not s.token.strip()) for s in current_subwords):
-                        # 剔除最后一个子词（标点）
-                        removed_punc = current_subwords.pop()
-                        logger.debug(f"已剔除 {SRTWriter._format_time(removed_punc.seconds)} --> {SRTWriter._format_time(removed_punc.end_seconds)}：{removed_punc.token}")
-                        # 将标点的持续时间加到倒数第二个子词（现在的最后一个）上
-                        # 延长前一个词的结束时间到标点的结束时间
-                        current_subwords[-1].end_seconds = removed_punc.end_seconds
-
             text = "".join(s.token for s in current_subwords)
             if text:
-                all_segments.append(PreciseSegment(
+                raw_segments.append(PreciseSegment(
                     start_seconds=current_subwords[0].seconds,
                     end_seconds=current_subwords[-1].end_seconds,
                     text=text,
@@ -315,7 +303,58 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
 
         start = end_idx + 1
 
-    return all_segments, all_subwords
+    if not raw_segments:
+        return [], all_subwords
+    # 合并纯标点/空格片段
+    merged_segments = [raw_segments[0]]
+    for i in range(1, len(raw_segments)):
+        curr_seg = raw_segments[i]
+        prev_seg = merged_segments[-1]
+
+        # 如果所有子词都是标点或空字符
+        if all((s.token in TOKEN_PUNC or not s.token.strip()) for s in curr_seg.subwords):
+            # 把上一段 PreciseSegment 的最后一个子词的结束时间设为甲（当前段）的开始时间
+            if prev_seg.subwords:
+                prev_seg.subwords[-1].end_seconds = curr_seg.start_seconds
+
+            # 打印 Debug 日志
+            if logger.debug_mode:
+                logger.debug((
+                    f"{SRTWriter._format_time(prev_seg.start_seconds)} --> {SRTWriter._format_time(prev_seg.end_seconds)}：{prev_seg.text}"
+                    f" 和 "
+                    f"{SRTWriter._format_time(curr_seg.start_seconds)} --> {SRTWriter._format_time(curr_seg.end_seconds)}：{curr_seg.text}"
+                    f"已合并"
+                ))
+
+            # 合并内容
+            prev_seg.end_seconds = curr_seg.end_seconds
+            prev_seg.text += curr_seg.text
+            prev_seg.vad_limit = curr_seg.vad_limit
+            prev_seg.subwords.extend(curr_seg.subwords)
+        else:
+            merged_segments.append(curr_seg)
+
+    # 统一执行句末标点剔除 (如果在参数中启用) 
+    all_segments = []
+    if not no_remove_punc: 
+        for seg in merged_segments:
+            current_subwords = seg.subwords
+            # 检查最后一个子词是否是标点
+            if current_subwords[-1].token in TOKEN_PUNC:
+                # 去掉空白后检查是不是“全标点”句（防止把只有标点的片段删空），只要不是“所有子词都在TOKEN_PUNC里”，就执行剔除
+                if not all((s.token in TOKEN_PUNC or not s.token.strip()) for s in current_subwords):
+                    # 剔除最后一个子词（标点）
+                    removed_punc = current_subwords.pop()
+                    logger.debug(f"已剔除 {SRTWriter._format_time(removed_punc.seconds)} --> {SRTWriter._format_time(removed_punc.end_seconds)}：{removed_punc.token}")
+                    # 将标点的持续时间加到倒数第二个子词（现在的最后一个）上
+                    # 延长前一个词的结束时间到标点的结束时间
+                    current_subwords[-1].end_seconds = removed_punc.end_seconds
+                    # 同步更新 Segment 的属性
+                    seg.end_seconds =current_subwords[-1].end_seconds
+                    seg.text = "".join(s.token for s in current_subwords)
+            all_segments.append(seg)
+
+    return all_segments or merged_segments, all_subwords
 
 def find_optimal_splits_dp_strict(candidates, num_cuts, start_frame, end_frame, frame_duration_s, max_duration_s):
     """严格硬约束的动态规划算法。"""
@@ -608,7 +647,7 @@ def merge_short_segments_adaptive(segments, max_duration, min_duration=1.0):
 
     # 创建副本以避免修改原始数据
     working_segments = [list(s) for s in segments]
-    short_merged = []
+    result = []
     
     i = 0
     while i < len(working_segments):
@@ -617,44 +656,44 @@ def merge_short_segments_adaptive(segments, max_duration, min_duration=1.0):
 
         if seg_duration <= min_duration:
             # 获取前后邻居
-            prev_seg = short_merged[-1] if short_merged else None
+            prev_seg = result[-1] if result else None
             next_seg = working_segments[i + 1] if i + 1 < len(working_segments) else None
             
             dur_prev = (prev_seg[1] - prev_seg[0]) if prev_seg else float('inf')
             dur_next = (next_seg[1] - next_seg[0]) if next_seg else float('inf')
 
+            # 向左合的新时长 = 当前结束 - 前段开始
+            dur_if_left = (seg[1] - prev_seg[0]) if prev_seg else float('inf')
+            # 向右合的新时长 = 后段结束 - 当前开始
+            dur_if_right = (next_seg[1] - seg[0]) if next_seg else float('inf')
+
             target_side = None # "left" or "right"
-            if prev_seg and next_seg:
+            if dur_if_left <= max_duration and dur_if_right <= max_duration:
                 target_side = "left" if dur_prev <= dur_next else "right"
-            elif prev_seg:
+            # 只有左边合法（意味着右边超长或不存在）
+            elif dur_if_left <= max_duration:
                 target_side = "left"
-            elif next_seg:
+            # 只有右边合法（意味着左边超长或不存在）
+            elif dur_if_right <= max_duration:
                 target_side = "right"
 
             if target_side == "left":
-                # 计算预期时长：前段起点 到 当前段终点
-                if seg[1] - prev_seg[0] <= max_duration:
-                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向左合并: 前段 {dur_prev:.2f} 秒 --> 延长至 {dur_prev + seg_duration:.2f} 秒")
-                    prev_seg[1] = seg[1]
-                    i += 1
-                    continue
-                else:
-                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向左合并后超过 {max_duration} 秒，放弃")
-
+                logger.debug(f"【VAD】片段（{seg_duration:.2f} 秒）{SRTWriter._format_time(seg[0])} --> {SRTWriter._format_time(seg[1])}，向左合并: 前段（{dur_prev:.2f} 秒）{SRTWriter._format_time(prev_seg[0])} -->{SRTWriter._format_time(prev_seg[1])} 延长至 {dur_prev + seg_duration:.2f} 秒")
+                prev_seg[1] = seg[1]
+                i += 1
+                continue
             elif target_side == "right":
-                # 计算预期时长：当前段起点 到 后段终点
-                if next_seg[1] - seg[0] <= max_duration:
-                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向右合并: 后段 {dur_next:.2f} 秒 --> 延长至 {seg_duration + dur_next:.2f} 秒")
-                    next_seg[0] = seg[0]
-                    i += 1
-                    continue
-                else:
-                    logger.debug(f"【VAD】片段({seg_duration:.2f} 秒)，向右合并后超过 {max_duration} 秒，放弃")
+                logger.debug(f"【VAD】片段（{seg_duration:.2f} 秒）{SRTWriter._format_time(seg[0])} --> {SRTWriter._format_time(seg[1])}，向右合并: 后段（{dur_next:.2f} 秒）{SRTWriter._format_time(next_seg[0])}--{SRTWriter._format_time(next_seg[1])} 延长至 {seg_duration + dur_next:.2f} 秒")
+                next_seg[0] = seg[0]
+                i += 1
+                continue
+            else:
+                logger.debug(f"【VAD】片段（{seg_duration:.2f} 秒）{SRTWriter._format_time(seg[0])} --> {SRTWriter._format_time(seg[1])} 合并后超过 {max_duration} 秒，放弃")
 
-        short_merged.append(seg)
+        result.append(seg)
         i += 1
         
-    return short_merged
+    return result
 
 def open_folder(path):
     """根据不同操作系统，使用默认的文件浏览器打开指定路径的文件夹"""
@@ -1080,6 +1119,7 @@ def main():
         # PAD_SECONDS 是以秒为单位，pydub 需要毫秒
         silence_padding = AudioSegment.silent(duration=PAD_SECONDS * 1000, frame_rate=SAMPLERATE)
 
+        vad_chunk_end_times_s = []  # 用于存储VAD块的结束时间
         if args.no_chunk:
             # --- 不分块的逻辑 ---
             # 分配临时文件名
@@ -1091,7 +1131,6 @@ def main():
             raw_subwords = transcribe_audio(model, temp_full_wav_path)
 
         else:
-            vad_chunk_end_times_s = []  # 用于存储VAD块的结束时间
             temp_chunk_dir = Path(tempfile.mkdtemp())
             logger.info("【VAD】正在从本地路径加载 Pyannote-segmentation-3.0 模型……")
             vad_model_load_start = time.time()  # <--- 计时开始
@@ -1239,7 +1278,7 @@ def main():
                                 OVERLAP_S
                             ))
                     logger.debug(
-                            f"【VAD】侦测到 {len(sub_speeches)} 个语音块，保守拆分超过 {MAX_SPEECH_DURATION_S} 秒的部分后，实际需要处理 {len(nonsilent_ranges_s)} 个语音块"
+                            f"【VAD】侦测到 {len(sub_speeches)} 个子语音块，保守拆分超过 {MAX_SPEECH_DURATION_S} 秒的部分"
                         )
 
                     refined_sub_speeches = []
@@ -1269,7 +1308,7 @@ def main():
                                 curr = next_cut - OVERLAP_S
 
                     if len(refined_sub_speeches) > 1:
-                        logger.info(f"    --> 拆分并逐个识别 {len(refined_sub_speeches)} 个子片段")
+                        logger.info(f"    --> 需要识别 {len(refined_sub_speeches)} 个子片段")
                         
                     # 遍历二次拆分出的子块
                     for sub_idx, sub_seg in enumerate(refined_sub_speeches):
