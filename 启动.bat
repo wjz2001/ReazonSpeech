@@ -63,7 +63,7 @@ echo ======================================================================
 set "chunkOption="
 choice /c YN /m "是否使用智能语音分块？（Y=是，推荐使用；N=否，除非音频极短或为了测试，否则不推荐使用）"
 if %ERRORLEVEL% == 2 (
-    set "chunkOption=--no-chunk"
+    set "chunkOption= --no-chunk"
     goto AskBeamParams
 )
 
@@ -193,10 +193,19 @@ set "beamParams="  REM 首先确保变量为空
 set /p "beamSize=输入 beam_size（集束搜索宽度，默认：4，范围：4~64（仅整数），更大的值可能更准确但更慢）："
 
 if NOT "!beamSize!"=="" (
-    set "beamParams=--beam !beamSize!"
+    set "beamParams= --beam !beamSize!"
 )
 
 echo 已设置高级识别参数
+
+echo.
+
+REM --- 新增：询问是否保留句末标点 ---
+:AskPunctuation
+
+set "puncOption="
+choice /c YN /m "是否剔除句末标点？（Y=是，自动剔除句末标点；N=否，保留句末标点）"
+if %ERRORLEVEL% == 2 set "chunkOption= --no-remove-punc"
 
 echo.
 
@@ -207,7 +216,7 @@ echo.
 
 choice /c YN /m "是否启用调试模式？（保留临时文件并自动打开目录）"
 
-if %ERRORLEVEL% == 1 set "debugOption=--debug"
+if %ERRORLEVEL% == 1 set "debugOption= --debug"
 
 REM --- 询问输出方式 ---
 :AskOutputLoop
@@ -294,13 +303,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!beamParams! !debugOption!!outputOptions!
+echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!beamParams!!puncOption!!debugOption!!outputOptions!
 
 echo ======================================================================
 
 echo.
 
-python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!beamParams! !debugOption!!outputOptions!
+python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!beamParams!!puncOption!!debugOption!!outputOptions!
 
 echo.
 

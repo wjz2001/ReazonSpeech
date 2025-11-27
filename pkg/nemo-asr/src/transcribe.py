@@ -75,13 +75,13 @@ def load_model(device=None):
     # 4. 核心逻辑：检查本地模型是否存在
     if os.path.exists(local_model_path):
         # 如果文件存在，就从本地加载
-        print(f"【提示】在 '{local_model_path}' 找到本地模型")
+        print(f"【提示】在 '{model_dir}' 找到本地模型 '{model_name}'")
         print(f"【提示】正在从本地加载模型……")
         return EncDecRNNTBPEModel.restore_from(restore_path=local_model_path,
                                               map_location=device)
     else:
         # 如果文件不存在，执行原始的下载逻辑
-        print(f"【提示】在 '{local_model_path}' 未找到本地模型")
+        print(f"【提示】在 '{model_dir}' 未找到本地模型 '{model_name}'")
         print(f"【提示】准备从 Hugging Face 下载模型……")
         # 确保模型目录存在，以便下载的文件可以被 NeMo 缓存到默认位置
         # (注意: from_pretrained 有自己的缓存机制，通常在用户主目录下的 .cache)
