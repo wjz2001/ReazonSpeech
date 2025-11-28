@@ -345,7 +345,7 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
                     # 延长前一个词的结束时间到标点的结束时间
                     current_subwords[-1].end_seconds = removed_punc.end_seconds
                     # 同步更新 Segment 的属性
-                    seg.end_seconds =current_subwords[-1].end_seconds
+                    seg.end_seconds = current_subwords[-1].end_seconds
                     seg.text = "".join(s.token for s in current_subwords)
             all_segments.append(seg)
 
@@ -370,8 +370,7 @@ def find_optimal_splits_dp_strict(candidates, num_cuts, start_frame, end_frame, 
         for j in range(i - 1, len(candidates)):
             curr_frame = candidates[j]["frame"]
             for k in range(i - 2, j):
-                prev_frame = candidates[k]["frame"]
-                segment_len = curr_frame - prev_frame
+                segment_len = curr_frame - candidates[k]["frame"]
                 
                 if min_frames <= segment_len <= max_frames:
                     prev_cost, prev_path = dp[i-1][k]
@@ -835,7 +834,7 @@ def main():
         description="使用 ReazonSpeech 模型识别语音，并按指定格式输出结果。基于静音的智能分块方式识别长音频，以保证准确率并解决显存问题"
     )
 
-    # 必须：音频/视频文件路径
+    # 音频/视频文件路径
     parser.add_argument(
         "input_file",
         help="需要识别语音的音频/视频文件路径",
@@ -1094,6 +1093,10 @@ def main():
     temp_chunk_dir = None
 
     # --- 执行核心的语音识别流程 ---
+    vad_model_load_start = 0
+    vad_model_load_end = 0
+    recognition_start_time = 0
+    recognition_end_time = 0
     try:
         # --- ffmpeg 预处理：将输入文件转换为标准 WAV ---
         logger.info(f"正在转换输入文件 '{input_path}'……")
@@ -1207,11 +1210,10 @@ def main():
                 start_ms = max(0, int(unpadded_start_s * 1000) - args.keep_silence)
                 end_ms = min(len(audio), int(unpadded_end_s * 1000) + args.keep_silence)
                 
-                # 导出当前的一级块
+                # 定义路径对象
                 chunk_path = temp_chunk_dir / f"chunk_{i + 1}.wav"
                 # 先赋值给 chunk 变量，以便后续二次切分时使用，再导出文件
                 chunk = silence_padding + audio[start_ms:end_ms] + silence_padding
-                chunk.export(chunk_path, format="wav")
                 
                 logger.info(
                     f"【VAD】正在处理语音块 {i + 1}/{len(merged_ranges_s)} （该块起止时间：{SRTWriter._format_time(unpadded_start_s)} --> {SRTWriter._format_time(unpadded_end_s)}，时长：{(unpadded_end_s - unpadded_start_s):.2f} 秒）",
@@ -1225,6 +1227,8 @@ def main():
                 if unpadded_end_s - unpadded_start_s <= MAX_SPEECH_DURATION_S / 3.0:
                     # === 分支 A：短块，直接识别 ===
                     logger.info(" --> 短块，直接识别")
+                    # 立刻导出该块
+                    chunk.export(chunk_path, format="wav")
 
                     # 短块没有运行二次VAD，直接使用一级VAD的原始结束时间
                     vad_chunk_end_times_s.append(unpadded_end_s)
@@ -1236,6 +1240,9 @@ def main():
                 else:
                     # === 分支 B：长块，执行二次 VAD 拆分后再识别 ===
                     logger.info(" --> 长块，执行二次 VAD 拆分")
+                    # debug模式下为了检查才导出该块
+                    if args.debug:
+                        chunk.export(chunk_path, format="wav")
                     
                     chunk_tensor = convert_audio_to_tensor(chunk)
                     # 运行局部 VAD
@@ -1375,21 +1382,21 @@ def main():
 
             for i, segment in enumerate(all_segments):
                 # 遍历map，所以需要通过索引i来更新原始的all_segments列表
-                segment.end_seconds = refine_tail_end_timestamp(
-                    last_token_start_s = segment.subwords[-1].seconds,
-                    rough_end_s = segment.end_seconds,
-                    speech_probs = speech_probs,
-                    frame_duration_s = frame_duration_s,
-                    max_end_s = min(segment.vad_limit, all_segments[i + 1].start_seconds) if i < len(all_segments) - 1 else segment.vad_limit,
-                    min_silence_duration_ms = int(args.min_silence_duration_ms),
-                    lookahead_ms = args.tail_lookahead_ms,
-                    safety_margin_ms = args.tail_safety_margin_ms,
-                    min_tail_keep_ms = args.tail_min_keep_ms,
-                    percentile = args.tail_percentile,
-                    offset = args.tail_offset,
-                    use_zcr = args.zcr,
-                    zcr_threshold = final_zcr_threshold,
-                    zcr_array = zcr_array
+                segment.end_seconds=refine_tail_end_timestamp(
+                    segment.subwords[-1].seconds,
+                    segment.end_seconds,
+                    speech_probs,
+                    frame_duration_s,
+                    min(segment.vad_limit, all_segments[i + 1].start_seconds) if i < len(all_segments) - 1 else segment.vad_limit,
+                    int(args.min_silence_duration_ms),
+                    args.tail_lookahead_ms,
+                    args.tail_safety_margin_ms,
+                    args.tail_min_keep_ms,
+                    args.tail_percentile,
+                    args.tail_offset,
+                    args.zcr,
+                    final_zcr_threshold,
+                    zcr_array
                 )
 
             # 邻段防重叠微调（保持你原来的逻辑）
@@ -1529,24 +1536,19 @@ def main():
                 f"ReazonSpeech模型加载耗时：{format_duration(_ASR_MODEL_LOAD_COST)}"
             )
 
-        # 安全地获取 VAD 加载的起止时间，如果不存在则默认为 0
-        vad_model_load_start = locals().get("vad_model_load_start", 0)
-        vad_model_load_end = locals().get("vad_model_load_end", 0)
-        # 安全地获取识别的起止时间，如果不存在则默认为 0
-        recognition_start_time = locals().get("recognition_start_time", 0)
-        recognition_end_time = locals().get("recognition_end_time", 0)
-        # 只有当VAD加载时间大于0时才打印，否则不显示
-        if vad_model_load_end - vad_model_load_start > 0:
-            logger.info(
-                f"Pyannote-segmentation-3.0 模型加载耗时：{format_duration(vad_model_load_end - vad_model_load_start)}"
-            )
-            logger.info(
-                f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time - (vad_model_load_end - vad_model_load_start))}"
-            )
-        else:
-            logger.info(
-                f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time)}"
-            )
+        if recognition_end_time - recognition_start_time > 0:
+            # 只有当VAD加载时间大于0时才打印，否则不显示
+            if vad_model_load_end - vad_model_load_start > 0:
+                logger.info(
+                    f"Pyannote-segmentation-3.0 模型加载耗时：{format_duration(vad_model_load_end - vad_model_load_start)}"
+                )
+                logger.info(
+                    f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time - (vad_model_load_end     - vad_model_load_start))}"
+                )
+            else:
+                logger.info(
+                    f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time)}"
+                )
 
         logger.info("=" * 70)
         if args.debug:
