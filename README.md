@@ -14,7 +14,7 @@ project.
 
 如果你的设备未安装python3.10，请照此[教程](https://pvt9.com/_posts/pythoninstall)安装
 
-如果你在国内，自行搜索“pip 使用国内镜像源”相关教程
+如果你在国内，请自行搜索“pip 使用国内镜像源”相关教程
 
 
 ### 一、下载程序
