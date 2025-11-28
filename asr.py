@@ -408,6 +408,25 @@ def format_duration(seconds):
 
     return "".join(parts)
 
+# 全局变量：用于缓存加载好的模型
+_ASR_MODEL = None
+_ASR_MODEL_LOAD_COST = 0.0
+def get_asr_model():
+    """
+    获取 Reazonspeech 模型的单例
+    如果模型未加载，则加载并缓存；如果已加载，则直接返回
+    """
+    global _ASR_MODEL, _ASR_MODEL_LOAD_COST
+    if _ASR_MODEL is None:
+        logger.info("正在加载 Reazonspeech ……")
+        asr_model_load_start = time.time()  # <--- 计时开始
+        # 调用原有的 load_model 函数
+        _ASR_MODEL = load_model()
+        asr_model_load_end = time.time()  # <--- 计时结束
+        logger.info(f"Reazonspeech 加载完成")
+        _ASR_MODEL_LOAD_COST = asr_model_load_end - asr_model_load_start
+    return _ASR_MODEL
+
 # --- ONNX VAD 辅助函数 ---
 def get_speech_timestamps_onnx(
     waveform,
@@ -1082,12 +1101,8 @@ def main():
         audio = AudioSegment.from_file(input_path).set_channels(1).set_frame_rate(SAMPLERATE).set_sample_width(2)
         logger.info("转换完成")
 
-        # --- 加载模型 (只需一次) ---
-        logger.info("正在加载 Reazonspeech ……")
-        asr_model_load_start = time.time()  # <--- 计时开始
-        model = load_model()
-        asr_model_load_end = time.time()  # <--- 计时结束
-        logger.info(f"Reazonspeech 加载完成")
+        # 使用单例模式获取模型，避免重复加载
+        model = get_asr_model()
 
         # 获取模型最大允许输入语音块长度
         MAX_SPEECH_DURATION_S = model.cfg.train_ds.max_duration
@@ -1508,12 +1523,10 @@ def main():
              model.change_decoding_strategy(original_decoding_cfg)
 
         logger.info("=" * 70)
-        # 安全地获取 ReazonSpeech 模型加载的起止时间，如果不存在则默认为 0
-        asr_model_load_start = locals().get("asr_model_load_start", 0)
-        asr_model_load_end = locals().get("asr_model_load_end", 0)
-        if asr_model_load_end - asr_model_load_start > 0:
+        # 使用全局记录的加载耗时
+        if _ASR_MODEL_LOAD_COST > 0:
             logger.info(
-                f"ReazonSpeech模型加载耗时：{format_duration(asr_model_load_end - asr_model_load_start)}"
+                f"ReazonSpeech模型加载耗时：{format_duration(_ASR_MODEL_LOAD_COST)}"
             )
 
         # 安全地获取 VAD 加载的起止时间，如果不存在则默认为 0
