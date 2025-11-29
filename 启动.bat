@@ -31,6 +31,22 @@ echo.
 REM --- 获取音视频文件路径 ---
 :GetFile
 
+REM 【重要】在此处清空所有可能用到的临时变量，防止循环处理时残留上一次的设置
+set "inputFile="
+set "chunkOption="
+set "chunkParams="
+set "tailParams="
+set "zcrParams="
+set "beamParams="
+set "puncOption="
+set "debugOption="
+set "outputOptions="
+REM 清空临时输入变量
+set "vadThresh=" & set "vadEndThresh=" & set "minSpeech=" & set "minSilence=" & set "keep="
+set "t_per=" & set "t_off=" & set "t_look=" & set "t_safe=" & set "t_keep=" & set "t_high="
+set "zcrTh=" & set "beamSize="
+
+
 echo ======================================================================
 
 set "inputFile="
@@ -74,7 +90,7 @@ set "chunkParams="
 choice /c YN /m "是否需要修改默认的VAD参数？"
 
 if %ERRORLEVEL% == 2 (
-    goto AskZCR
+    goto AskRefineTail
 )
 echo.
 
@@ -99,39 +115,6 @@ echo 已设置自定义 VAD 参数
 
 echo.
 
-REM --- 询问 ZCR (过零率) 参数 ---
-:AskZCR
-
-echo ======================================================================
-
-set "zcrParams="
-
-echo.
-choice /c YN /m "是否开启过零率（ZCR）检测？（保护清辅音不被切断）"
-
-if %ERRORLEVEL% == 2 (
-    goto AskRefineTail
-)
-
-set "zcrParams= --zcr"
-
-echo.
-
-choice /c YN /m "是否启用自适应 ZCR 阈值？（Y=自动计算，zcr_threshold 兜底；N=仅使用zcr_threshold）"
-if %ERRORLEVEL% == 1 set "zcrParams=!zcrParams! --auto_zcr"
-
-echo.
-
-echo 请输入 ZCR 手动阈值，或直接按回车以使用默认值（0.15）
-
-set /p "zcrTh=输入 zcr_threshold："
-
-if defined zcrTh set "zcrParams=!zcrParams! --zcr_threshold !zcrTh!"
-
-echo 已设置 ZCR 参数
-
-echo.
-
 REM --- 4.5. 询问段尾精修参数 (只有启用了VAD才会走到这里) ---
 :AskRefineTail
 echo ======================================================================
@@ -142,7 +125,7 @@ echo.
 choice /c YN /m "是否启用“段尾精修”功能？"
 
 if %ERRORLEVEL% == 2 (
-    goto AskBeamParams
+    goto AskZCR
 )
 
 REM 用户选择了开启精修
@@ -173,7 +156,43 @@ if defined t_safe set "tailParams=!tailParams! --tail_safety_margin_ms !t_safe!"
 set /p "t_keep=输入 tail_min_keep_ms（强制保留时长（毫秒），默认：30）："
 if defined t_keep set "tailParams=!tailParams! --tail_min_keep_ms !t_keep!"
 
+set /p "t_high=输入 tail_zcr_high_ratio（疑似静音窗口内高于 ZCR 阈值的帧超过此比例时才会判定为清音，必须开启 ZCR ，默认：0.3，范围：0.1~0.5）："
+if defined t_high set "tailParams=!tailParams! --tail_zcr_high_ratio !t_high!"
+
 echo 已设置段尾精修参数
+
+echo.
+
+REM --- 询问 ZCR (过零率) 参数 ---
+:AskZCR
+
+echo ======================================================================
+
+set "zcrParams="
+
+echo.
+choice /c YN /m "是否开启过零率（ZCR）检测？（保护清辅音不被切断）"
+
+if %ERRORLEVEL% == 2 (
+    goto AskBeamParams
+)
+
+set "zcrParams= --zcr"
+
+echo.
+
+choice /c YN /m "是否启用自适应 ZCR 阈值？（Y=自动计算，zcr_threshold 兜底；N=仅使用zcr_threshold）"
+if %ERRORLEVEL% == 1 set "zcrParams=!zcrParams! --auto_zcr"
+
+echo.
+
+echo 请输入 ZCR 手动阈值，或直接按回车以使用默认值（0.15）
+
+set /p "zcrTh=输入 zcr_threshold："
+
+if defined zcrTh set "zcrParams=!zcrParams! --zcr_threshold !zcrTh!"
+
+echo 已设置 ZCR 参数
 
 echo.
 

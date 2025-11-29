@@ -733,7 +733,8 @@ def refine_tail_end_timestamp(
     offset,               # 在自适应阈值的基础上增加的固定偏移量，值越大，越容易将高概率区域有语音区域判为静音
     use_zcr,
     zcr_threshold,
-    zcr_array
+    zcr_array,
+    tail_zcr_high_ratio        # 高ZCR帧的占比阈值
 ):
     # 仅在“最后子词之后”的尾窗内搜索
     start_idx = int(last_token_start_s / frame_duration_s)
@@ -756,9 +757,19 @@ def refine_tail_end_timestamp(
         if np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
             # --- ZCR 校验 ---
             if use_zcr:
-                if (zcr_value := zcr_array[start_idx + i]) > zcr_threshold:
-                    logger.debug(f"【ZCR】检测到清音！时间点：{SRTWriter._format_time((start_idx + i) * frame_duration_s)}，ZC值：{zcr_value:.6f}（阈值: {zcr_threshold}）")
-                    continue # 包含清音，直接在此处 continue
+                z_start = start_idx + i
+                z_end = z_start + min_silence_frames
+                
+                # 获取窗口内的 ZCR 数据
+                # 计算窗口内超过 ZCR 阈值的帧的比例
+                # np.mean(布尔数组) 相当于计算 True 的百分比
+                high_zcr_ratio = np.mean(zcr_array[z_start : z_end] > zcr_threshold)
+                
+                # 只有当高 ZCR 帧的比例超过设定值（如 0.3）时，才触发保护
+                if high_zcr_ratio > tail_zcr_high_ratio:
+                    if logger.debug_mode:
+                        logger.debug(f"【ZCR】疑似静音段 {SRTWriter._format_time(z_start * frame_duration_s)} --> {SRTWriter._format_time(z_end * frame_duration_s)} 内高频帧占比 {high_zcr_ratio:.2f} > {tail_zcr_high_ratio}，视为清辅音，跳过切分")
+                    continue 
 
             if not np.any(p_smooth[
                 i + min_silence_frames : 
@@ -836,14 +847,16 @@ def main():
         "--vad_threshold",
         type=float,
         default=0.4,
-        help="【VAD】判断为语音的置信度阈值（0-1）",
+        metavar="[0-1]",
+        help="【VAD】判断为语音的置信度阈值",
     )
     # VAD 结束阈值（双阈值滞回）
     parser.add_argument(
         "--vad_end_threshold",
         type=float,
         default=None,
-        help="【VAD】判断为语音结束后静音的置信度阈值（0.05-1），默认值是vad_threshold的值减去0.15",
+        metavar="[0.05-1]",
+        help="【VAD】判断为语音结束后静音的置信度阈值，默认值是vad_threshold的值减去0.15",
     )
     parser.add_argument(
         "--min_speech_duration_ms",
@@ -894,7 +907,8 @@ def main():
         "--tail_percentile",
         type=float,
         default=20,
-        help="【精修】自适应阈值（0-100）。值越大，越容易将高概率语音区域判为静音",
+        metavar="[0-100]",
+        help="【精修】自适应阈值，值越大，越容易将高概率语音区域判为静音",
     )
     parser.add_argument(
         "--tail_offset",
@@ -919,6 +933,13 @@ def main():
         type=int,
         default=30,
         help="【精修】强制保留在段尾的最小时长（毫秒），保证听感自然",
+    )
+    parser.add_argument(
+        "--tail_zcr_high_ratio",
+        type=float,
+        default=0.3, 
+        metavar="[0.1-0.5]",
+        help="【精修】ZCR保护触发比例：在疑似静音窗口内，高于 ZCR 阈值的帧超过此比例时，才会判定为清音",
     )
 
     # 输出格式参数
@@ -1003,6 +1024,8 @@ def main():
     if not args.zcr:
         if getattr(args, "zcr_threshold") != parser.get_default("zcr_threshold"):
             parser.error(f"【参数错误】未添加 --zcr，不能设置参数 --zcr_threshold")
+        if getattr(args, "tail_zcr_high_ratio") != parser.get_default("tail_zcr_high_ratio"):
+            parser.error(f"【参数错误】未添加 --zcr，不能设置参数 --tail_zcr_high_ratio")
         if args.auto_zcr:
             parser.error(f"【参数错误】未添加 --zcr，不能设置参数 --auto_zcr")
 
@@ -1017,7 +1040,8 @@ def main():
             "tail_offset",
             "tail_lookahead_ms",
             "tail_safety_margin_ms",
-            "tail_min_keep_ms"
+            "tail_min_keep_ms",
+            "tail_zcr_high_ratio"
         ]:
             if getattr(args, p) != parser.get_default(p):
                 parser.error(f"【参数错误】未添加 --refine-tail，不能设置参数 --{p}")
@@ -1046,8 +1070,13 @@ def main():
                 f"vad_end_threshold 不能大于 vad_threshold"
             )
     
-        if args.refine_tail and not (0.0 <= args.tail_percentile <= 100.0):
-            parser.error(f"tail_percentile 必须在（0-100）范围内，当前值错误")
+        if args.refine_tail:
+            if not (0.0 <= args.tail_percentile <= 100.0):
+                parser.error(f"tail_percentile 必须在（0-100）范围内，当前值错误")
+            if not (0.1 <= args.tail_zcr_high_ratio <= 0.5):
+                parser.error("tail_zcr_high_ratio 必须在（0.1-0.5）范围内，当前值错误")
+
+        
 
     # --- 准备路径和临时文件 ---
     input_path = Path(args.input_file)
@@ -1356,7 +1385,8 @@ def main():
                     args.tail_offset,
                     args.zcr,
                     final_zcr_threshold,
-                    zcr_array
+                    zcr_array,
+                    args.tail_zcr_high_ratio
                 )
 
             # 邻段防重叠微调（保持你原来的逻辑）
