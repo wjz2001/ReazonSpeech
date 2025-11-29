@@ -53,31 +53,8 @@ class Logger:
 # 初始化全局日志实例
 logger = Logger()
 
-def calculate_dynamic_noise_threshold(waveform_centered, frame_length):
-    """
-    计算动态噪声门限。
-    使用 10% 分位数代替 min，防止极静帧导致门限失效。
-    """
-
-    # 扫描全篇找每帧最大值
-    # ceil_mode=True 保证处理尾部数据
-    # 展平以便计算分位数
-    frame_maxs_flat = torch.nn.functional.max_pool1d(
-        # 取绝对值
-        waveform_centered.abs().unsqueeze(0), 
-        kernel_size=frame_length, 
-        stride=frame_length,
-        ceil_mode=True
-    ).view(-1) # 输出形状 [1, 1, NumFrames]
-
-    # 使用 10% 分位数 (Quantile) 代替 Min
-    # 这能有效忽略偶尔出现的数字静音 (0值)，找到真正的“底噪层”
-    # 乘以 2 倍作为安全门限，并设定 1e-4 的硬下限
-    return max(torch.quantile(frame_maxs_flat, 0.10).item() * 2, 1e-4)
-
 def calculate_frame_cost(frame_idx, speech_probs, energy_array, vad_threshold, zcr_threshold, zcr_array):
     """计算单帧作为切分点的代价（代价越低越适合切分）。
-       边界情况返回高代价。
        ZCR 判定使用 max(|x1|, |x2|) > th。
     """
     # 基础 VAD 概率成本
@@ -126,61 +103,6 @@ def calibrate_zcr_threshold(speech_probs, zcr_array):
     logger.debug(f"【ZCR】浊音 P90 = {tau_v:.6f}，非语音 P10 = {tau_u:.6f}，计算阈值 = {adaptive_th:.6f}")
     return adaptive_th
 
-def compute_global_energy_vectorized(waveform, frame_length):
-    """
-    【向量化全篇计算】一次性计算所有帧的能量（标准差 std）
-    逻辑等同于：对每一帧执行 torch.std(chunk, unbiased=False)
-    """
-    # 计算局部均值 E[x]
-    # waveform shape: (1, T)
-    local_mean = torch.nn.functional.avg_pool1d(
-        waveform, 
-        kernel_size=frame_length, 
-        stride=frame_length,
-        ceil_mode=True
-    )
-    
-    # 计算局部平方均值 E[x^2]
-    local_sq_mean = torch.nn.functional.avg_pool1d(
-        waveform.pow(2), 
-        kernel_size=frame_length, 
-        stride=frame_length,
-        ceil_mode=True
-    )
-    
-    # 计算方差 Var = E[x^2] - (E[x])^2
-    # clamp(min=0) 防止浮点误差导致出现极小的负数
-    # 开根号得到 std
-    # view(-1) 展平为 (NumFrames, )
-    return torch.sqrt((local_sq_mean - local_mean.pow(2)).clamp(min=0)).view(-1)
-
-def compute_global_zcr_vectorized(waveform, frame_length):
-    """
-    【向量化全篇计算】使用 PyTorch 卷积/池化操作一次性计算全篇 ZCR，速度比 for 循环快几百倍
-    """
-    # 预处理：去直流
-    # waveform: (1, T)
-    logger.debug("【ZCR】正在计算背景底噪水平……")   
-    waveform_centered = waveform - waveform.mean(dim=-1, keepdim=True)
-    noise_threshold = calculate_dynamic_noise_threshold(waveform_centered, frame_length)
-    logger.debug(f"【ZCR】底噪门限已设定为：{noise_threshold:.6f}")
-
-    # 等价于 abs > threshold
-    is_loud = (waveform_centered.abs() > noise_threshold)
-    
-    # 必须保证 stride 和 frame_length 一致，才能和 VAD 帧对齐
-    # 输出形状: (Num_Frames, )
-    return torch.nn.functional.avg_pool1d(
-        # 向量化计算所有采样点的过零情况 (1, T-1)
-        # 等价于 chunk[:-1] * chunk[1:]
-        # 逻辑或: 左边响 OR 右边响
-        # 得到“有效过零点”的布尔矩阵 (1, T-1)
-        (((waveform_centered[:, :-1] * waveform_centered[:, 1:]) < 0) & (is_loud[:, :-1] | is_loud[:, 1:])).float().unsqueeze(0), # 需要 (N, C, L)
-        kernel_size=frame_length,
-        stride=frame_length,
-        ceil_mode=True # 保证处理尾部
-    ).view(-1) # 使用 .view(-1) 将输出展平为一维向量
-
 def convert_audio_to_tensor(initial_audio):
     """
     将 Pydub AudioSegment 转换为 PyTorch Tensor (float32, [-1, 1])。
@@ -197,8 +119,6 @@ def convert_audio_to_tensor(initial_audio):
     return torch.from_numpy(np.frombuffer(initial_audio.raw_data, dtype=np.int16)).float().div_(32768.0).unsqueeze(0)
 
 def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, total_duration_s, no_remove_punc):
-    if not raw_subwords:
-        return [], []
 
     all_subwords = []
     durations = [] 
@@ -239,23 +159,23 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
     # --- 动态计算停顿阈值 ---
     pause_threshold = float("inf") # 默认阈值为无穷大，即默认禁用此功能
     # 只有当有足够多的数据点（例如超过20个子词间隔）时，才计算并启用阈值
-    MIN_SAMPLES_FOR_THRESHOLD = SUBWORDS_PER_SEGMENTS * 2  # 提出来
+    MIN_SAMPLES_FOR_THRESHOLD = SUBWORDS_PER_SEGMENTS * 2
     if len(durations) > MIN_SAMPLES_FOR_THRESHOLD:
         pause_threshold = np.percentile(durations, 95) 
 
-    raw_segments = []
+    all_segments = []
     start = 0
 
     while start < len(all_subwords):
         current_limit = all_subwords[start].vad_limit
         # 现在我们可以直接在 all_subwords 中向后扫描，找到 vad_limit 变化的索引。
         next_group_start_idx = start
+        pause_split_indices = []
         while next_group_start_idx < len(all_subwords) and all_subwords[next_group_start_idx].vad_limit == current_limit:
             next_group_start_idx += 1
             
         # 确定当前 VAD 块内的搜索边界
         # 基于语速/停顿的边界补充
-        pause_split_indices = []
         if ((end_idx := min(next_group_start_idx - 1, find_end_of_segment(all_subwords, start))) - start + 1) > MIN_SAMPLES_FOR_THRESHOLD:
             # 使用列表推导式直接筛选
             pause_split_indices = [
@@ -278,68 +198,75 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
         all_split_points = [start - 1] + pause_split_indices + [end_idx]
 
         for i in range(len(all_split_points) - 1):
+            # 提取当前片段的子词
             current_subwords = all_subwords[all_split_points[i] + 1:all_split_points[i + 1] + 1]
-
-            if text := "".join(s.token for s in current_subwords):
-                raw_segments.append(PreciseSegment(
-                    start_seconds=current_subwords[0].seconds,
-                    end_seconds=current_subwords[-1].end_seconds,
+    
+            # 预先获取时间边界和文本，用于判断和日志
+            curr_start = current_subwords[0].seconds
+            curr_end = current_subwords[-1].end_seconds
+            curr_limit = current_subwords[0].vad_limit
+            curr_text_raw = "".join(s.token for s in current_subwords) # 原始文本
+    
+            # 判断是否为纯标点/空格片段
+            if all((s.token in TOKEN_PUNC or not s.token.strip()) for s in current_subwords):
+                # === 分支 A：纯标点片段 ===
+                if all_segments:
+                    prev_seg = all_segments[-1]
+                    
+                    if logger.debug_mode:
+                        # 注意：此时 prev_seg 还没更新，curr_text_raw 是即将被合并（或丢弃）的标点
+                        logger.debug((
+                            f"{SRTWriter._format_time(prev_seg.start_seconds)} --> {SRTWriter._format_time(prev_seg.end_seconds)}：{prev_seg.text}"
+                            f" 和 "
+                            f"{SRTWriter._format_time(curr_start)} --> {SRTWriter._format_time(curr_end)}：{curr_text_raw}"
+                            f" 已合并"
+                        ))
+    
+                    # 无论是否保留标点，时间与vad边界都要吸收
+                    prev_seg.end_seconds = curr_end
+                    prev_seg.vad_limit = curr_limit 
+                    
+                    # 将上一段最后一个子词的结束时间也拉长
+                    if no_remove_punc:
+                        # 如果保留标点，合并文本和实体
+                        prev_seg.subwords[-1].end_seconds = curr_start
+                        prev_seg.text += curr_text_raw
+                        prev_seg.subwords.extend(current_subwords)
+                    else:
+                        prev_seg.subwords[-1].end_seconds = curr_end
+                else:
+                    pass # 开头纯标点丢弃
+    
+            else:
+                # === 分支 B：含正文的片段 ===
+                
+                # 如果需要剔除句末标点
+                if not no_remove_punc:
+                    # 检查最后一个子词是否是标点
+                    if current_subwords[-1].token in TOKEN_PUNC:
+                        removed_punc = current_subwords.pop()
+    
+                        if logger.debug_mode:
+                            logger.debug(f"已剔除 {SRTWriter._format_time(removed_punc.seconds)} --> {SRTWriter._format_time(removed_punc.end_seconds)}：{removed_punc.token}")
+    
+                        # 因为不是全标点句，pop 后列表一定不为空
+                        # 填补时间空缺
+                        current_subwords[-1].end_seconds = removed_punc.end_seconds
+                
+                # 重新生成最终文本（可能已剔除标点）
+                text = "".join(s.token for s in current_subwords)
+                
+                # 创建新片段
+                all_segments.append(PreciseSegment(
+                    start_seconds=curr_start,
+                    end_seconds=curr_end,
                     text=text,
-                    vad_limit=current_subwords[0].vad_limit,
+                    vad_limit=curr_limit,
                     subwords=current_subwords
                 ))
 
+        # 更新外层循环游标
         start = end_idx + 1
-
-    if not raw_segments:
-        return [], all_subwords
-    # 合并纯标点/空格片段
-    merged_segments = [raw_segments[0]]
-    for i in range(1, len(raw_segments)):
-        curr_seg = raw_segments[i]
-        # 如果所有子词都是标点或空字符
-        if all((s.token in TOKEN_PUNC or not s.token.strip()) for s in curr_seg.subwords):
-            # 把上一段 PreciseSegment 的最后一个子词的结束时间设为甲（当前段）的开始时间
-            if (prev_seg := merged_segments[-1]).subwords:
-                prev_seg.subwords[-1].end_seconds = curr_seg.start_seconds
-
-            # 打印 Debug 日志
-            if logger.debug_mode:
-                logger.debug((
-                    f"{SRTWriter._format_time(prev_seg.start_seconds)} --> {SRTWriter._format_time(prev_seg.end_seconds)}：{prev_seg.text}"
-                    f" 和 "
-                    f"{SRTWriter._format_time(curr_seg.start_seconds)} --> {SRTWriter._format_time(curr_seg.end_seconds)}：{curr_seg.text}"
-                    f"已合并"
-                ))
-
-            # 合并内容
-            prev_seg.end_seconds = curr_seg.end_seconds
-            prev_seg.text += curr_seg.text
-            prev_seg.vad_limit = curr_seg.vad_limit
-            prev_seg.subwords.extend(curr_seg.subwords)
-        else:
-            merged_segments.append(curr_seg)
-
-    # 统一执行句末标点剔除 (如果在参数中启用) 
-    all_segments = []
-    if not no_remove_punc: 
-        for seg in merged_segments:
-            # 检查最后一个子词是否是标点
-            if seg.subwords[-1].token in TOKEN_PUNC:
-                # 去掉空白后检查是不是“全标点”句（防止把只有标点的片段删空），只要不是“所有子词都在TOKEN_PUNC里”，就执行剔除
-                if not all((s.token in TOKEN_PUNC or not s.token.strip()) for s in seg.subwords):
-                    # 剔除最后一个子词（标点）
-                    removed_punc = seg.subwords.pop()
-                    logger.debug(f"已剔除 {SRTWriter._format_time(removed_punc.seconds)} --> {SRTWriter._format_time(removed_punc.end_seconds)}：{removed_punc.token}")
-                    # 将标点的持续时间加到倒数第二个子词（现在的最后一个）上
-                    # 延长前一个词的结束时间到标点的结束时间
-                    seg.subwords[-1].end_seconds = removed_punc.end_seconds
-                    # 同步更新 Segment 的属性
-                    seg.end_seconds = seg.subwords[-1].end_seconds
-                    seg.text = "".join(s.token for s in seg.subwords)
-            all_segments.append(seg)
-    else:
-        all_segments = merged_segments
 
     return all_segments, all_subwords
 
@@ -455,8 +382,7 @@ def get_speech_timestamps_onnx(
         if not triggered:
             if prob >= threshold:
                 triggered = True
-                current_speech_start = i * frame_duration_s 
-                temp_silence_start_frame = None
+                current_speech_start = i * frame_duration_s
             continue
 
         # --- 处于语音段中时，跟踪静音区域 ---
@@ -707,24 +633,79 @@ def open_folder(path):
         logger.warn(f"尝试自动打开目录失败：{e}，请手动访问：{path}")
 
 def prepare_acoustic_features(waveform, speech_probs, frame_duration_s, use_zcr):
-    """
-    计算并对齐声学特征（能量、ZCR），供智能切分使用。
-    """
-    # 先计算每一帧对应的采样点数（四舍五入），避免浮点累积误差
-    frame_length = int(round(frame_duration_s * SAMPLERATE))
+    """计算并对齐声学特征（能量、ZCR），供智能切分使用。"""
 
-    # 如需要 ZCR，则一次性计算全局/局部 ZCR 向量
-    logger.debug("正在计算声学特征（能量和ZCR）……")
+    # 计算帧长
+    frame_length = int(round(frame_duration_s * SAMPLERATE))
+    
+    # 计算能量 (Standard Deviation)
+    # 逻辑：Var = E[x^2] - (E[x])^2，等同于对每一帧执行 torch.std(chunk, unbiased=False)
+    logger.debug("正在计算声学特征（能量）……")
+    
+    # 计算 E[x]
+    local_mean = torch.nn.functional.avg_pool1d(
+        waveform, 
+        kernel_size=frame_length, 
+        stride=frame_length,
+        ceil_mode=True
+    )
+    
+    # 计算 E[x^2]
+    local_sq_mean = torch.nn.functional.avg_pool1d(
+        waveform.pow(2), 
+        kernel_size=frame_length, 
+        stride=frame_length,
+        ceil_mode=True
+    )
+    
+    # 得到能量数组 (std)
+    # clamp(min=0) 防止浮点误差导致出现极小的负数
+    # view(-1) 展平为 (NumFrames, )
+    energy_array = torch.sqrt((local_sq_mean - local_mean.pow(2)).clamp(min=0)).view(-1).numpy()
+
+    # 计算 ZCR 
     zcr_array = None
     if use_zcr:
-        # compute_global_zcr_vectorized 返回的是 Tensor，需要转 numpy
-        zcr_array = compute_global_zcr_vectorized(waveform, frame_length).numpy()
+        logger.debug("正在计算声学特征（ZCR）……")
+        
+        # 去直流，waveform shape: (1, T)
+        waveform_centered = waveform - waveform.mean(dim=-1, keepdim=True)
+        logger.debug("【ZCR】正在计算背景底噪水平……")   
+        # 计算动态噪声门限，扫描全篇找每帧最大值
+        frame_maxs_flat = torch.nn.functional.max_pool1d(
+            # 取绝对值
+            waveform_centered.abs().unsqueeze(0), 
+            kernel_size=frame_length, 
+            stride=frame_length,
+            ceil_mode=True
+        ).view(-1)# 输出形状 [1, 1, NumFrames]
+        
+        # 使用 10% 分位数代替 Min，防止极静帧导致门限失效
+        # 这能有效忽略偶尔出现的数字静音 (0值)，找到真正的“底噪层”
+        # 乘以 2 倍作为安全门限，并设定 1e-4 的硬下限
+        noise_threshold = max(torch.quantile(frame_maxs_flat, 0.10).item() * 2, 1e-4)
+        logger.debug(f"【ZCR】底噪门限已设定为：{noise_threshold:.6f}")
 
-    # 向量化计算能量
-    # compute_global_energy_vectorized 返回的是 Tensor，需要转 numpy
-    energy_array = compute_global_energy_vectorized(waveform, frame_length).numpy()
+        # 计算 ZCR
+        # 判定大音量区域
+        is_loud = (waveform_centered.abs() > noise_threshold)
+        
+        # 向量化计算过零
+        # 逻辑：(过零) AND (至少一边是大音量)
+        zcr_tensor = torch.nn.functional.avg_pool1d(
+            # 向量化计算所有采样点的过零情况 (1, T-1)
+            # 等价于 chunk[:-1] * chunk[1:]
+            # 逻辑或: 左边响 OR 右边响
+            # 得到“有效过零点”的布尔矩阵 (1, T-1)
+            (((waveform_centered[:, :-1] * waveform_centered[:, 1:]) < 0) & (is_loud[:, :-1] | is_loud[:,1:])).float().unsqueeze(0), # 需要 (N, C, L)
+            kernel_size=frame_length,
+            stride=frame_length,
+            ceil_mode=True # 保证处理尾部
+        ).view(-1) # 使用 .view(-1) 将输出展平为一维向量
+        
+        zcr_array = zcr_tensor.numpy()
 
-    # 对齐长度：这一行代码会自动忽略为 None 的 zcr_array，只计算存在的数组的最小长度
+    # 对齐长度
     # 防止 pooling 的 ceil_mode 导致多出一帧，或者 VAD 模型输出少一帧的情况
     min_len = min(len(x) for x in [speech_probs, energy_array, zcr_array] if x is not None)
     
@@ -801,7 +782,7 @@ def transcribe_audio(model, audio_input):
     """
     if (hyp := model.transcribe(
             # convert_audio_to_tensor 返回的是 [1, T] 的 Tensor
-            # NeMo 喜欢 1D 输入 [T]，所以我们要把 Batch 维度挤掉 (squeeze)
+            # NeMo 喜欢 1D 输入 [T]，所以要把 Batch 维度挤掉 (squeeze)
             # 结果变成形状为 [T] 的 Tensor
             audio=[convert_audio_to_tensor(audio_input).squeeze(0)],
             return_hypotheses=True,
@@ -1495,8 +1476,8 @@ def main():
     finally:
         # 恢复原始解码策略，以防后续有其他操作
         if original_decoding_cfg is not None:
-             logger.info("正在恢复原始解码策略……")
-             model.change_decoding_strategy(original_decoding_cfg)
+            logger.info("正在恢复原始解码策略……")
+            model.change_decoding_strategy(original_decoding_cfg)
 
         logger.info("=" * 70)
         # 使用全局记录的加载耗时
