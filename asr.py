@@ -3,7 +3,6 @@ import copy
 import math
 import os
 import tempfile
-import shutil
 import sys
 import subprocess
 import torch
@@ -76,7 +75,7 @@ def calculate_dynamic_noise_threshold(waveform_centered, frame_length):
     # 乘以 2 倍作为安全门限，并设定 1e-4 的硬下限
     return max(torch.quantile(frame_maxs_flat, 0.10).item() * 2, 1e-4)
 
-def calculate_frame_cost(frame_idx, speech_probs, energy_array, vad_threshold, use_zcr, zcr_threshold, zcr_array):
+def calculate_frame_cost(frame_idx, speech_probs, energy_array, vad_threshold, zcr_threshold, zcr_array):
     """计算单帧作为切分点的代价（代价越低越适合切分）。
        边界情况返回高代价。
        ZCR 判定使用 max(|x1|, |x2|) > th。
@@ -89,12 +88,12 @@ def calculate_frame_cost(frame_idx, speech_probs, energy_array, vad_threshold, u
     # 逻辑：(过零) AND (穿越点的幅度足够大，不仅是微小抖动)
     # 标准做法：check max(abs(x[n]), abs(x[n+1])) > th
     zcr_cost = 0.0
-    if use_zcr and zcr_array is not None:
+    if zcr_array is not None:
         if zcr_array[frame_idx] > zcr_threshold: 
             zcr_cost = zcr_array[frame_idx] * 50.0 
 
     # 局部平滑度 (斜率)
-    slope_cost = abs(speech_probs[frame_idx + 1] - speech_probs[frame_idx - 1]) * 2.0 if 0 < frame_idx < len(speech_probs) - 1 else 0.0
+    slope_cost = abs(speech_probs[frame_idx + 1] - speech_probs[frame_idx - 1]) * 2.0
 
     return speech_probs[frame_idx] + min(energy_array[frame_idx], 0.5) * 10.0 + slope_cost + zcr_cost
 
@@ -161,8 +160,9 @@ def compute_global_zcr_vectorized(waveform, frame_length):
     """
     # 预处理：去直流
     # waveform: (1, T)
-    logger.debug("【ZCR】正在计算背景底噪水平……")    
-    noise_threshold = calculate_dynamic_noise_threshold((waveform_centered := waveform - waveform.mean(dim=-1, keepdim=True)), frame_length)
+    logger.debug("【ZCR】正在计算背景底噪水平……")   
+    waveform_centered = waveform - waveform.mean(dim=-1, keepdim=True)
+    noise_threshold = calculate_dynamic_noise_threshold(waveform_centered, frame_length)
     logger.debug(f"【ZCR】底噪门限已设定为：{noise_threshold:.6f}")
 
     # 等价于 abs > threshold
@@ -188,6 +188,7 @@ def convert_audio_to_tensor(initial_audio):
     """
 
     # 零拷贝读取 (bytes -> numpy int16 view)
+    # 从 int16 到 float32，数据量翻倍
     # initial_audio.raw_data 是 bytes，np.frombuffer 创建视图，不复制内存
     # 由于已经强制转为 16-bit，这里固定用 int16
     # 直接读取为 int16，转为 Tensor 后再除以 32768.0，减少一次 numpy 层的 float32 内存分配
@@ -525,7 +526,7 @@ def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_dur
         # 还原绝对索引：+1 是因为 p_curr 从切片的第1个元素开始，+search_start 是切片偏移
         # 遍历筛选出的索引计算成本
         for idx in (np.where(mask)[0] + 1 + search_start):
-            cost = calculate_frame_cost(idx, speech_probs, energy_array, vad_threshold, use_zcr, zcr_threshold, zcr_array)
+            cost = calculate_frame_cost(idx, speech_probs, energy_array, vad_threshold, zcr_threshold, zcr_array)
             candidates.append({"frame": idx, "cost": cost})
     
     # 执行 DP
@@ -555,10 +556,10 @@ def merge_overlap_dedup(chunk_results):
         s, e = max(range_a[0], range_b[0]), min(range_a[1], range_b[1])
         return (s, e) if e > s else (None, None)
     
-    def _is_essentially_empty(tokens):
-        """判断 token 列表是否实质上为空（即为空列表，或仅包含TOKEN_PUNC）"""
-        # 将所有 token 拼接后检查，如果只有空格或空字符串，视为空
-        text = "".join(tokens).strip()
+    def _is_essentially_empty(chars):
+        """判断 chars 列表是否实质上为空（即为空列表，或仅包含TOKEN_PUNC）"""
+        # 将所有 chars 拼接后检查，如果只有空格或空字符串，视为空
+        text = "".join(chars).strip()
         # 检查是否所有字符都在TOKEN_PUNC集合中
         return not text or all(char in TOKEN_PUNC for char in text)
 
@@ -760,7 +761,7 @@ def refine_tail_end_timestamp(
     if start_idx >= len(speech_probs) or end_idx - start_idx <= 4:
         return min(rough_end_s, max_end_s)
 
-    # 短窗平滑
+    # 短窗平滑，5 是窗口大小
     p_smooth = np.convolve(speech_probs[start_idx:end_idx], np.ones(5, dtype=np.float32) / 5.0, mode="same")
 
     # 局部自适应阈值percentile + offset
@@ -768,8 +769,9 @@ def refine_tail_end_timestamp(
     # 0.10 保证底噪容忍度，0.95 保证不会因为全 1.0 的概率导致无法切割
     dyn_tau = np.clip(float(np.percentile(p_smooth, percentile)) + offset, 0.10, 0.95)
 
+    min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
     # 连续静音 + 滞回
-    for i in range(0, len(p_smooth) - (min_silence_frames := max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s)))):
+    for i in range(0, len(p_smooth) - min_silence_frames):
         if np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
             # --- ZCR 校验 ---
             if use_zcr:
@@ -792,15 +794,16 @@ def refine_tail_end_timestamp(
     # 兜底：没找到稳定静音，保留原结束时间
     return min(rough_end_s, max_end_s)
 
-def transcribe_audio(model, audio_path):
+def transcribe_audio(model, audio_input):
     """
     封装转录逻辑：调用模型 -> 解码 -> 返回子词列表。
     如果失败或无结果，返回空列表。
     """
-    
-    # 检查是否有有效结果
     if (hyp := model.transcribe(
-            [str(audio_path)],
+            # convert_audio_to_tensor 返回的是 [1, T] 的 Tensor
+            # NeMo 喜欢 1D 输入 [T]，所以我们要把 Batch 维度挤掉 (squeeze)
+            # 结果变成形状为 [T] 的 Tensor
+            audio=[convert_audio_to_tensor(audio_input).squeeze(0)],
             return_hypotheses=True,
             verbose=False,
         )[0]) and hyp[0]:
@@ -1075,6 +1078,7 @@ def main():
     vad_model_load_end = 0
     recognition_start_time = 0
     recognition_end_time = 0
+    original_decoding_cfg = None
     try:
         # --- ffmpeg 预处理：将输入文件转换为标准 WAV ---
         logger.info(f"正在转换输入文件 '{input_path}'……")
@@ -1112,16 +1116,21 @@ def main():
         vad_chunk_end_times_s = []  # 用于存储VAD块的结束时间
         if args.no_chunk:
             # --- 不分块的逻辑 ---
-            # 分配临时文件名
-            fd, temp_full_wav_path = tempfile.mkstemp(suffix=".wav")
-            os.close(fd) # 关闭文件描述符，只保留路径
-            temp_full_wav_path = Path(temp_full_wav_path)
+            # 准备完整的音频对象
+            full_audio = silence_padding + audio + silence_padding
+            
+            # 仅在 debug 模式下保存文件
+            if args.debug:
+                # 分配临时文件名
+                fd, temp_full_wav_path = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)# 关闭文件描述符，只保留路径
+                temp_full_wav_path = Path(temp_full_wav_path)
+                full_audio.export(temp_full_wav_path, format="wav")
+
             logger.info("未使用VAD，一次性处理整个文件……")
-            (silence_padding + audio + silence_padding).export(temp_full_wav_path, format="wav")
-            raw_subwords = transcribe_audio(model, temp_full_wav_path)
+            raw_subwords = transcribe_audio(model, full_audio)
 
         else:
-            temp_chunk_dir = Path(tempfile.mkdtemp())
             logger.info("【VAD】正在从本地路径加载 Pyannote-segmentation-3.0 模型……")
             vad_model_load_start = time.time()  # <--- 计时开始
             onnx_session = onnxruntime.InferenceSession(
@@ -1147,12 +1156,13 @@ def main():
                 logger.warn("【VAD】未侦测到语音活动")
                 return
 
-            speech_probs, _, zcr_array = prepare_acoustic_features(
-                waveform, 
-                speech_probs, 
-                frame_duration_s, 
-                args.zcr
-            )
+            if args.auto_zcr or args.refine_tail:
+                speech_probs, _, zcr_array = prepare_acoustic_features(
+                    waveform, 
+                    speech_probs, 
+                    frame_duration_s, 
+                    args.zcr
+                )
 
             # 确定最终使用的 ZCR 阈值
             final_zcr_threshold = args.zcr_threshold
@@ -1178,16 +1188,19 @@ def main():
 
             chunk_results = []
 
+            if args.debug:
+                temp_chunk_dir = Path(tempfile.mkdtemp())
             for i, (unpadded_start_s, unpadded_end_s) in enumerate(merged_ranges_s):
                 # --- 准备一级语音块 ---
                 # 计算包含静音保护的起止时间
                 start_ms = max(0, int(unpadded_start_s * 1000) - args.keep_silence)
                 end_ms = min(len(audio), int(unpadded_end_s * 1000) + args.keep_silence)
-                
-                # 定义路径对象
-                chunk_path = temp_chunk_dir / f"chunk_{i + 1}.wav"
                 # 先赋值给 chunk 变量，以便后续二次切分时使用，再导出文件
                 chunk = silence_padding + audio[start_ms:end_ms] + silence_padding
+                # debug模式下为了检查才导出该块
+                if args.debug:
+                    # 定义路径对象
+                    chunk.export(temp_chunk_dir / f"chunk_{i + 1}.wav", format="wav")
                 
                 logger.info(
                     f"【VAD】正在处理语音块 {i + 1}/{len(merged_ranges_s)} （该块起止时间：{SRTWriter._format_time(unpadded_start_s)} --> {SRTWriter._format_time(unpadded_end_s)}，时长：{(unpadded_end_s - unpadded_start_s):.2f} 秒）",
@@ -1195,29 +1208,23 @@ def main():
                     )
 
                 final_subwords_in_this_chunk = []
+
                 
                 # 设定阈值：如果块时长超过模型最大允许时长的 1/3，则视为“长块”，需要二次拆解
                 # 计算当前块的净时长
                 if unpadded_end_s - unpadded_start_s <= MAX_SPEECH_DURATION_S / 3.0:
                     # === 分支 A：短块，直接识别 ===
                     logger.info(" --> 短块，直接识别")
-                    # 立刻导出该块
-                    chunk.export(chunk_path, format="wav")
-
                     # 短块没有运行二次VAD，直接使用一级VAD的原始结束时间
                     vad_chunk_end_times_s.append(unpadded_end_s)
 
                     # 坐标变换：全局时间 = 一级块偏移 + 相对时间
-                    for sub in transcribe_audio(model, chunk_path):
+                    for sub in transcribe_audio(model, chunk):
                         sub.seconds += start_ms / 1000.0
                         final_subwords_in_this_chunk.append(sub)
                 else:
                     # === 分支 B：长块，执行二次 VAD 拆分后再识别 ===
                     logger.info(" --> 长块，执行二次 VAD 拆分")
-                    # debug模式下为了检查才导出该块
-                    if args.debug:
-                        chunk.export(chunk_path, format="wav")
-                    
                     # 运行局部 VAD
                     sub_speeches, sub_speech_probs, sub_frame_duration_s = get_speech_timestamps_onnx(
                         (chunk_tensor := convert_audio_to_tensor(chunk)), # 从内存 chunk 对象转换
@@ -1297,8 +1304,11 @@ def main():
                     for sub_idx, sub_seg in enumerate(refined_sub_speeches):
                         # sub_seg[0] 是相对于 chunk_path (0s) 的时间
                         # 提取子块音频并加上静音保护
-                        # 导出临时子块文件
-                        (silence_padding + chunk[int(sub_seg[0] * 1000):int(sub_seg[1] * 1000)] + silence_padding).export((sub_chunk_path := temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav"), format="wav")
+                        # 先在内存中切分好 sub_chunk
+                        sub_chunk = silence_padding + chunk[int(sub_seg[0] * 1000):int(sub_seg[1] * 1000)] + silence_padding
+                        # Debug 时导出临时子块文件
+                        if args.debug:
+                            sub_chunk.export((temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav"), format="wav")
 
                         if len(refined_sub_speeches) != 1:
                             logger.info(f"第 {i + 1}-{sub_idx + 1} 段 {sub_seg[1] - sub_seg[0]:.2f} 秒：")
@@ -1307,7 +1317,7 @@ def main():
                         # 最终时间 = 一级块全局偏移 + 二级块在一级块内的偏移 + 识别出的相对时间
                         # 因为 sub_seg["start"] 是基于含填充的父chunk计算的，它包含了父chunk头部的 0.5s 静音，必须扣除
                         base_offset = start_ms / 1000.0 + sub_seg[0] - PAD_SECONDS
-                        for sub in transcribe_audio(model, sub_chunk_path):
+                        for sub in transcribe_audio(model, sub_chunk):
                             sub.seconds += base_offset
                             final_subwords_in_this_chunk.append(sub)
 
@@ -1484,7 +1494,7 @@ def main():
 
     finally:
         # 恢复原始解码策略，以防后续有其他操作
-        if "original_decoding_cfg" in locals():
+        if original_decoding_cfg is not None:
              logger.info("正在恢复原始解码策略……")
              model.change_decoding_strategy(original_decoding_cfg)
 
@@ -1518,17 +1528,6 @@ def main():
             if temp_chunk_dir:
                 logger.info(f"临时分块目录位于: {temp_chunk_dir}")
                 open_folder(temp_chunk_dir) # 调用新函数打开文件夹
-
-        else:
-            # 删除临时的 WAV 文件
-            if temp_full_wav_path and temp_full_wav_path.exists():
-                temp_full_wav_path.unlink()
-                logger.info(f"\n临时文件 '{temp_full_wav_path}' 已删除")
-
-            # 使用 shutil.rmtree 来删除临时块目录及其所有内容
-            if temp_chunk_dir:
-                shutil.rmtree(temp_chunk_dir, ignore_errors=True)
-                logger.info(f"临时块目录 '{temp_chunk_dir.name}' 已删除")
 
 if __name__ == "__main__":
     main()
