@@ -205,7 +205,7 @@ REM --- 新增：询问是否保留句末标点 ---
 
 set "puncOption="
 choice /c YN /m "是否剔除句末标点？（Y=是，自动剔除句末标点；N=否，保留句末标点）"
-if %ERRORLEVEL% == 2 set "chunkOption= --no-remove-punc"
+if %ERRORLEVEL% == 2 set "puncOption= --no-remove-punc"
 
 echo.
 

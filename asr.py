@@ -109,7 +109,6 @@ def calibrate_zcr_threshold(speech_probs, zcr_array):
     # 注意：这里的 unvoiced 其实包含静音和清音，但这不影响我们找下界
     voiced_mask = speech_probs > 0.8
     unvoiced_mask = speech_probs < 0.2
-    
     if voiced_mask.sum() < 10 or unvoiced_mask.sum() < 10:
         logger.debug("【ZCR】浊音/静音样本区分度不足，回退默认值")
         return None
@@ -120,14 +119,12 @@ def calibrate_zcr_threshold(speech_probs, zcr_array):
     tau_u = np.percentile(zcr_array[unvoiced_mask], 10) # 非语音区域的 ZCR 下限（P10）
     
     # 计算自适应阈值
-    adaptive_th = 0.5 * (tau_v + tau_u)
-    
-    logger.debug(f"【ZCR】浊音 P90 = {tau_v:.6f}，非语音 P10 = {tau_u:.6f}，计算阈值 = {adaptive_th:.6f}")
-
     # 安全检查：如果计算出的阈值太极端，说明数据分布有问题
-    if not (0.05 <= adaptive_th <= 0.5):
+    if not (0.05 <= (adaptive_th := 0.5 * (tau_v + tau_u)) <= 0.5):
         logger.debug("【ZCR】计算阈值超出安全范围（0.05~0.5），回退默认值")
         return None
+    
+    logger.debug(f"【ZCR】浊音 P90 = {tau_v:.6f}，非语音 P10 = {tau_u:.6f}，计算阈值 = {adaptive_th:.6f}")
     return adaptive_th
 
 def compute_global_energy_vectorized(waveform, frame_length):
@@ -164,10 +161,8 @@ def compute_global_zcr_vectorized(waveform, frame_length):
     """
     # 预处理：去直流
     # waveform: (1, T)
-    waveform_centered = waveform - waveform.mean(dim=-1, keepdim=True)
-
     logger.debug("【ZCR】正在计算背景底噪水平……")    
-    noise_threshold = calculate_dynamic_noise_threshold(waveform_centered, frame_length)
+    noise_threshold = calculate_dynamic_noise_threshold((waveform_centered := waveform - waveform.mean(dim=-1, keepdim=True)), frame_length)
     logger.debug(f"【ZCR】底噪门限已设定为：{noise_threshold:.6f}")
 
     # 等价于 abs > threshold
@@ -243,7 +238,7 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
     # --- 动态计算停顿阈值 ---
     pause_threshold = float("inf") # 默认阈值为无穷大，即默认禁用此功能
     # 只有当有足够多的数据点（例如超过20个子词间隔）时，才计算并启用阈值
-    MIN_SAMPLES_FOR_THRESHOLD = SUBWORDS_PER_SEGMENTS * 2 
+    MIN_SAMPLES_FOR_THRESHOLD = SUBWORDS_PER_SEGMENTS * 2  # 提出来
     if len(durations) > MIN_SAMPLES_FOR_THRESHOLD:
         pause_threshold = np.percentile(durations, 95) 
 
@@ -258,11 +253,9 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
             next_group_start_idx += 1
             
         # 确定当前 VAD 块内的搜索边界
-        end_idx = min(next_group_start_idx - 1, find_end_of_segment(all_subwords, start))
-
         # 基于语速/停顿的边界补充
         pause_split_indices = []
-        if (end_idx - start + 1) > MIN_SAMPLES_FOR_THRESHOLD:
+        if ((end_idx := min(next_group_start_idx - 1, find_end_of_segment(all_subwords, start))) - start + 1) > MIN_SAMPLES_FOR_THRESHOLD:
             # 使用列表推导式直接筛选
             pause_split_indices = [
                 start + k for k, d in enumerate(durations[start:end_idx]) 
@@ -286,8 +279,7 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
         for i in range(len(all_split_points) - 1):
             current_subwords = all_subwords[all_split_points[i] + 1:all_split_points[i + 1] + 1]
 
-            text = "".join(s.token for s in current_subwords)
-            if text:
+            if text := "".join(s.token for s in current_subwords):
                 raw_segments.append(PreciseSegment(
                     start_seconds=current_subwords[0].seconds,
                     end_seconds=current_subwords[-1].end_seconds,
@@ -304,12 +296,10 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
     merged_segments = [raw_segments[0]]
     for i in range(1, len(raw_segments)):
         curr_seg = raw_segments[i]
-        prev_seg = merged_segments[-1]
-
         # 如果所有子词都是标点或空字符
         if all((s.token in TOKEN_PUNC or not s.token.strip()) for s in curr_seg.subwords):
             # 把上一段 PreciseSegment 的最后一个子词的结束时间设为甲（当前段）的开始时间
-            if prev_seg.subwords:
+            if (prev_seg := merged_segments[-1]).subwords:
                 prev_seg.subwords[-1].end_seconds = curr_seg.start_seconds
 
             # 打印 Debug 日志
@@ -333,23 +323,24 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
     all_segments = []
     if not no_remove_punc: 
         for seg in merged_segments:
-            current_subwords = seg.subwords
             # 检查最后一个子词是否是标点
-            if current_subwords[-1].token in TOKEN_PUNC:
+            if seg.subwords[-1].token in TOKEN_PUNC:
                 # 去掉空白后检查是不是“全标点”句（防止把只有标点的片段删空），只要不是“所有子词都在TOKEN_PUNC里”，就执行剔除
-                if not all((s.token in TOKEN_PUNC or not s.token.strip()) for s in current_subwords):
+                if not all((s.token in TOKEN_PUNC or not s.token.strip()) for s in seg.subwords):
                     # 剔除最后一个子词（标点）
-                    removed_punc = current_subwords.pop()
+                    removed_punc = seg.subwords.pop()
                     logger.debug(f"已剔除 {SRTWriter._format_time(removed_punc.seconds)} --> {SRTWriter._format_time(removed_punc.end_seconds)}：{removed_punc.token}")
                     # 将标点的持续时间加到倒数第二个子词（现在的最后一个）上
                     # 延长前一个词的结束时间到标点的结束时间
-                    current_subwords[-1].end_seconds = removed_punc.end_seconds
+                    seg.subwords[-1].end_seconds = removed_punc.end_seconds
                     # 同步更新 Segment 的属性
-                    seg.end_seconds = current_subwords[-1].end_seconds
-                    seg.text = "".join(s.token for s in current_subwords)
+                    seg.end_seconds = seg.subwords[-1].end_seconds
+                    seg.text = "".join(s.token for s in seg.subwords)
             all_segments.append(seg)
+    else:
+        all_segments = merged_segments
 
-    return all_segments or merged_segments, all_subwords
+    return all_segments, all_subwords
 
 def find_optimal_splits_dp_strict(candidates, num_cuts, start_frame, end_frame, frame_duration_s, max_duration_s):
     """严格硬约束的动态规划算法。"""
@@ -360,9 +351,7 @@ def find_optimal_splits_dp_strict(candidates, num_cuts, start_frame, end_frame, 
 
     # 第一刀
     for j in range(len(candidates)):
-        cut_frame = candidates[j]["frame"]
-        segment_len = cut_frame - start_frame
-        if min_frames <= segment_len <= max_frames:
+        if min_frames <= (cut_frame := candidates[j]["frame"]) - start_frame <= max_frames:
             dp[1][j] = (candidates[j]["cost"], [cut_frame])
 
     # 后续每一刀
@@ -370,9 +359,7 @@ def find_optimal_splits_dp_strict(candidates, num_cuts, start_frame, end_frame, 
         for j in range(i - 1, len(candidates)):
             curr_frame = candidates[j]["frame"]
             for k in range(i - 2, j):
-                segment_len = curr_frame - candidates[k]["frame"]
-                
-                if min_frames <= segment_len <= max_frames:
+                if min_frames <= curr_frame - candidates[k]["frame"] <= max_frames:
                     prev_cost, prev_path = dp[i-1][k]
                     if prev_cost != float("inf"):
                         new_total_cost = prev_cost + candidates[j]["cost"]
@@ -484,9 +471,8 @@ def get_speech_timestamps_onnx(
         if temp_silence_start_frame is not None:
             # ==== 将 ms/s 转为帧数 ====
             if (i - temp_silence_start_frame) >= min_silence_frames:
-                end_time = temp_silence_start_frame * frame_duration_s
                 # 访问列表索引 0 即start
-                if (end_time - current_speech_start) * 1000.0 >= min_speech_duration_ms:
+                if ((end_time := temp_silence_start_frame * frame_duration_s) - current_speech_start) * 1000.0 >= min_speech_duration_ms:
                     speeches.append([current_speech_start, end_time])
                     # 收尾并准备下一段
                 triggered = False
@@ -495,8 +481,7 @@ def get_speech_timestamps_onnx(
 
     # --- 处理结尾残留的语音段 ---
     if triggered and current_speech_start is not None:
-        end_time = len(speech_probs) * frame_duration_s
-        if (end_time - current_speech_start) * 1000.0 >= min_speech_duration_ms:
+        if ((end_time := len(speech_probs) * frame_duration_s) - current_speech_start) * 1000.0 >= min_speech_duration_ms:
             speeches.append([current_speech_start, end_time])
 
     # 完整的语音概率数组 speech_probs 和每一帧的持续时间 frame_duration_s
@@ -508,8 +493,7 @@ def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_dur
     """
 
     # 计算必须切几刀
-    num_cuts = max(0, math.ceil((end_s - start_s) / (max_duration_s - overlap_s)) - 1)
-    if num_cuts == 0:
+    if (num_cuts := max(0, math.ceil((end_s - start_s) / (max_duration_s - overlap_s)) - 1)) == 0:
         return [[start_s, end_s]]
 
     start_frame = int(start_s / frame_duration_s)
@@ -539,10 +523,8 @@ def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_dur
         
         # 获取满足条件的相对索引
         # 还原绝对索引：+1 是因为 p_curr 从切片的第1个元素开始，+search_start 是切片偏移
-        candidate_indices = np.where(mask)[0] + 1 + search_start
-
         # 遍历筛选出的索引计算成本
-        for idx in candidate_indices:
+        for idx in (np.where(mask)[0] + 1 + search_start):
             cost = calculate_frame_cost(idx, speech_probs, energy_array, vad_threshold, use_zcr, zcr_threshold, zcr_array)
             candidates.append({"frame": idx, "cost": cost})
     
@@ -561,32 +543,24 @@ def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_dur
     final_segments = []
     segment_start_s = start_s
     for cut_frame in best_cuts_frames:
-        split_s = cut_frame * frame_duration_s
-        final_segments.append([segment_start_s, split_s])
+        final_segments.append([segment_start_s, (split_s := cut_frame * frame_duration_s)])
         segment_start_s = split_s - overlap_s
     final_segments.append([segment_start_s, end_s])
 
     return final_segments
 
 def merge_overlap_dedup(chunk_results):
-    """
-    重叠区域：文本相同则去重，否则保留双方并打印提示
-    """
-    def _overlap_interval(start, end):
-        s, e = max(start[0], end[0]), min(start[1], end[1])
+    """重叠区域：文本相同则去重，否则保留双方并打印提示"""
+    def _overlap_interval(range_a, range_b):
+        s, e = max(range_a[0], range_b[0]), min(range_a[1], range_b[1])
         return (s, e) if e > s else (None, None)
     
-    # 定义辅助函数：判断 token 列表是否实质上为空（即为空列表，或仅包含TOKEN_PUNC）
     def _is_essentially_empty(tokens):
-        if not tokens:
-            return True
-        # 将所有 token 拼接后检查
+        """判断 token 列表是否实质上为空（即为空列表，或仅包含TOKEN_PUNC）"""
+        # 将所有 token 拼接后检查，如果只有空格或空字符串，视为空
         text = "".join(tokens).strip()
-        # 如果只有空格或空字符串，视为空
-        if not text:
-            return True
         # 检查是否所有字符都在TOKEN_PUNC集合中
-        return all(char in TOKEN_PUNC for char in text)
+        return not text or all(char in TOKEN_PUNC for char in text)
 
     merged = list(chunk_results[0]["subwords"])
 
@@ -607,19 +581,15 @@ def merge_overlap_dedup(chunk_results):
         prev_non_overlap = [s for s in merged if s.seconds < s_ov]
         # 旧块中属于重叠区的子词
         prev_overlap = [s for s in merged if s_ov <= s.seconds < e_ov]
-        # 提取旧块 token 文本
+        # 提取旧块重叠区的 token 文本
         prev_tokens = [s.token for s in prev_overlap]
         
         # 新块中不属于重叠区的子词
         curr_non_overlap = [s for s in curr_subs if s.seconds >= e_ov]
         # 新块中属于重叠区的子词
         curr_overlap = [s for s in curr_subs if s_ov <= s.seconds < e_ov]
-        # 提取新块 token 文本
+        # 提取新块重叠区的 token 文本
         curr_tokens = [s.token for s in curr_overlap]
-
-        # 计算是否为“实质空”（空列表或纯标点）
-        prev_is_empty = _is_essentially_empty(prev_tokens)
-        curr_is_empty = _is_essentially_empty(curr_tokens)
 
         # 判定：是否完全一致
         if prev_tokens == curr_tokens:
@@ -629,12 +599,12 @@ def merge_overlap_dedup(chunk_results):
                 logger.debug(f"已合并重叠区域，该区域起止时间：{SRTWriter._format_time(s_ov)} --> {SRTWriter._format_time(e_ov)}")
         # 旧块是空的（或纯标点），不管新块有没有内容 -> 信任新块（覆盖旧的）
         # 这涵盖了：旧无新有（用新）、旧无新无（用新，即更新标点）、旧标点新内容（用新）
-        elif prev_is_empty:
+        elif _is_essentially_empty(prev_tokens):
             final_overlap = curr_overlap
             
         # 旧块有实质内容，但新块是空的（或纯标点） -> 信任旧块
         # 这涵盖了：旧有新无（保留旧的，丢弃新产生的纯标点噪音）
-        elif curr_is_empty:
+        elif _is_essentially_empty(curr_tokens):
             final_overlap = prev_overlap
         else:
             # 旧块和新块的重叠部分都保留，按时间排序
@@ -664,9 +634,8 @@ def merge_short_segments_adaptive(segments, max_duration, min_duration=1.0):
     i = 0
     while i < len(working_segments):
         seg = working_segments[i]
-        seg_duration = seg[1] - seg[0]
 
-        if seg_duration <= min_duration:
+        if (seg_duration := seg[1] - seg[0]) <= min_duration:
             # 获取前后邻居
             prev_seg = result[-1] if result else None
             next_seg = working_segments[i + 1] if i + 1 < len(working_segments) else None
@@ -695,7 +664,7 @@ def merge_short_segments_adaptive(segments, max_duration, min_duration=1.0):
                 i += 1
                 continue
             elif target_side == "right":
-                logger.debug(f"【VAD】片段（{seg_duration:.2f} 秒）{SRTWriter._format_time(seg[0])} --> {SRTWriter._format_time(seg[1])}，向右合并: 后段（{dur_next:.2f} 秒）{SRTWriter._format_time(next_seg[0])}--{SRTWriter._format_time(next_seg[1])} 延长至 {seg_duration + dur_next:.2f} 秒")
+                logger.debug(f"【VAD】片段（{seg_duration:.2f} 秒）{SRTWriter._format_time(seg[0])} --> {SRTWriter._format_time(seg[1])}，向右合并: 后段（{dur_next:.2f} 秒）{SRTWriter._format_time(next_seg[0])} -->{SRTWriter._format_time(next_seg[1])} 延长至 {seg_duration + dur_next:.2f} 秒")
                 next_seg[0] = seg[0]
                 i += 1
                 continue
@@ -708,18 +677,31 @@ def merge_short_segments_adaptive(segments, max_duration, min_duration=1.0):
     return result
 
 def open_folder(path):
-    """根据不同操作系统，使用默认的文件浏览器打开指定路径的文件夹"""
-    if not path.is_dir():
+    """
+    根据不同操作系统，使用默认的文件浏览器打开指定路径的文件夹
+    如果 path 是文件，则打开其所在文件夹并选中（高亮）该文件（仅限 Win/Mac）
+    如果 path 是文件夹，则直接打开该文件夹
+    """
+    path = Path(path).resolve() # 确保是绝对路径
+    if not path.exists():
         logger.warn(f"目录 '{path}' 不存在，无法自动打开")
         return
     try:
         if sys.platform == "win32":
-            os.startfile(path)
+            if path.is_file():
+                # Windows 使用 explorer /select,"文件路径" 来高亮文件
+                subprocess.run(["explorer", "/select,", str(path)])
+            else:
+                os.startfile(path)
+
         elif sys.platform == "darwin":  # macOS
-            subprocess.run(["open", path])
+            # macOS 使用 open -R "文件路径" 来在 Finder 中揭示文件
+            subprocess.run(["open", "-R", str(path)])
+
         else:  # Linux and other Unix-like
-            subprocess.run(["xdg-open", path])
-        logger.info(f"已自动为您打开临时分块目录：{path}")
+            target = path.parent if path.is_file() else path
+            subprocess.run(["xdg-open", str(target)])
+        logger.info(f"已自动为您打开目录：{path}")
     except Exception as e:
         logger.warn(f"尝试自动打开目录失败：{e}，请手动访问：{path}")
 
@@ -787,13 +769,11 @@ def refine_tail_end_timestamp(
     dyn_tau = np.clip(float(np.percentile(p_smooth, percentile)) + offset, 0.10, 0.95)
 
     # 连续静音 + 滞回
-    min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
-    for i in range(0, len(p_smooth) - min_silence_frames):
+    for i in range(0, len(p_smooth) - (min_silence_frames := max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s)))):
         if np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
             # --- ZCR 校验 ---
             if use_zcr:
-                zcr_value = zcr_array[start_idx + i]
-                if zcr_value > zcr_threshold:
+                if (zcr_value := zcr_array[start_idx + i]) > zcr_threshold:
                     logger.debug(f"【ZCR】检测到清音！时间点：{SRTWriter._format_time((start_idx + i) * frame_duration_s)}，ZC值：{zcr_value:.6f}（阈值: {zcr_threshold}）")
                     continue # 包含清音，直接在此处 continue
 
@@ -817,13 +797,13 @@ def transcribe_audio(model, audio_path):
     封装转录逻辑：调用模型 -> 解码 -> 返回子词列表。
     如果失败或无结果，返回空列表。
     """
-    hyp = model.transcribe(
+    
+    # 检查是否有有效结果
+    if (hyp := model.transcribe(
             [str(audio_path)],
             return_hypotheses=True,
             verbose=False,
-        )[0]
-    # 检查是否有有效结果
-    if hyp and hyp[0]:
+        )[0]) and hyp[0]:
         return decode_hypothesis(model, hyp[0]).subwords
     return []
 
@@ -1063,9 +1043,7 @@ def main():
             logger.warn("缺少 onnxruntime，请运行 'pip install onnxruntime'")
             return
 
-        local_onnx_model_path = Path(__file__).resolve().parent / "models" / "model_quantized.onnx"
-
-        if not local_onnx_model_path.exists():
+        if not (local_onnx_model_path := Path(__file__).resolve().parent / "models" / "model_quantized.onnx").exists():
             logger.warn(
                 f"Pyannote-segmentation-3.0 模型未在 '{local_onnx_model_path}' 中找到"
             )
@@ -1137,7 +1115,7 @@ def main():
             # 分配临时文件名
             fd, temp_full_wav_path = tempfile.mkstemp(suffix=".wav")
             os.close(fd) # 关闭文件描述符，只保留路径
-            temp_full_wav_path = Path(temp_full_wav_path) 
+            temp_full_wav_path = Path(temp_full_wav_path)
             logger.info("未使用VAD，一次性处理整个文件……")
             (silence_padding + audio + silence_padding).export(temp_full_wav_path, format="wav")
             raw_subwords = transcribe_audio(model, temp_full_wav_path)
@@ -1155,10 +1133,8 @@ def main():
 
             # ==== 先做 VAD（双阈值 + 静音 + min_speech），不在此强制 30s ====
             # ==== 获取VAD分块，并缓存完整的语音概率 ====
-            # waveform shape: [1, T]
-            waveform = convert_audio_to_tensor(audio) # 从内存转换
             speeches, speech_probs, frame_duration_s = get_speech_timestamps_onnx(
-                waveform, 
+                (waveform := convert_audio_to_tensor(audio)), # waveform shape: [1, T]
                 onnx_session,
                 threshold=args.vad_threshold,
                 neg_threshold=args.vad_end_threshold,
@@ -1182,10 +1158,9 @@ def main():
             final_zcr_threshold = args.zcr_threshold
             if args.auto_zcr:
                 # 只有开启了 ZCR 且开启了 Auto 才进行校准
-                calibrated_val = calibrate_zcr_threshold(
+                if (calibrated_val := calibrate_zcr_threshold(
                     speech_probs, zcr_array
-                )
-                if calibrated_val is not None:
+                )) is not None:
                     final_zcr_threshold = calibrated_val
                     logger.info(f"【ZCR】ZCR 自适应阈值已调整为：{final_zcr_threshold:.6f}")
                 else:
@@ -1193,11 +1168,10 @@ def main():
 
             # 合并所有重叠的 VAD 段
             logger.debug("【VAD】正在合并短于1秒的语音块……")
-            merged_ranges_s = merge_short_segments_adaptive(
+            if len(speeches) != len(merged_ranges_s := merge_short_segments_adaptive(
                 speeches, 
                 MAX_SPEECH_DURATION_S
-            )
-            if len(speeches) != len(merged_ranges_s):
+            )):
                 logger.debug(f"【VAD】原 {len(speeches)} 个语音块已合并为 {len(merged_ranges_s)} 个语音块")
             else:
                 logger.debug(f"【VAD】没有需要合并的语音块")
@@ -1244,10 +1218,9 @@ def main():
                     if args.debug:
                         chunk.export(chunk_path, format="wav")
                     
-                    chunk_tensor = convert_audio_to_tensor(chunk)
                     # 运行局部 VAD
                     sub_speeches, sub_speech_probs, sub_frame_duration_s = get_speech_timestamps_onnx(
-                        chunk_tensor, # 从内存 chunk 对象转换
+                        (chunk_tensor := convert_audio_to_tensor(chunk)), # 从内存 chunk 对象转换
                         onnx_session,
                         threshold=args.vad_threshold,
                         neg_threshold=args.vad_end_threshold,
@@ -1306,10 +1279,8 @@ def main():
                             curr = seg[0]
                             while curr < seg[1]:
                                 # 计算这一刀的结束点
-                                next_cut = curr + MAX_SPEECH_DURATION_S
-                                
                                 # 如果这一刀切到了末尾之后，就直接用末尾
-                                if next_cut >= seg[1]:
+                                if (next_cut := curr + MAX_SPEECH_DURATION_S) >= seg[1]:
                                     refined_sub_speeches.append([curr, seg[1]])
                                     break
                                 
@@ -1327,8 +1298,7 @@ def main():
                         # sub_seg[0] 是相对于 chunk_path (0s) 的时间
                         # 提取子块音频并加上静音保护
                         # 导出临时子块文件
-                        sub_chunk_path = temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav"
-                        (silence_padding + chunk[int(sub_seg[0] * 1000):int(sub_seg[1] * 1000)] + silence_padding).export(sub_chunk_path, format="wav")
+                        (silence_padding + chunk[int(sub_seg[0] * 1000):int(sub_seg[1] * 1000)] + silence_padding).export((sub_chunk_path := temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav"), format="wav")
 
                         if len(refined_sub_speeches) != 1:
                             logger.info(f"第 {i + 1}-{sub_idx + 1} 段 {sub_seg[1] - sub_seg[0]:.2f} 秒：")
@@ -1373,7 +1343,6 @@ def main():
         logger.info("正在根据子词和VAD边界生成精确文本片段……")
 
         all_segments, all_subwords = create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, len(audio) / 1000.0, no_remove_punc=args.no_remove_punc)
-        
 
         logger.info("文本片段生成完成")
 
@@ -1382,7 +1351,7 @@ def main():
 
             for i, segment in enumerate(all_segments):
                 # 遍历map，所以需要通过索引i来更新原始的all_segments列表
-                segment.end_seconds=refine_tail_end_timestamp(
+                segment.end_seconds = refine_tail_end_timestamp(
                     segment.subwords[-1].seconds,
                     segment.end_seconds,
                     speech_probs,
@@ -1414,22 +1383,20 @@ def main():
         base_name = input_path.stem
 
         # 检查用户是否指定了任何一种文件输出格式
-        file_output_requested = any(
-            (
-                args.text,
-                args.segment,
-                args.segment2srt,
-                args.segment2vtt,
-                args.segment2tsv,
-                args.subword,
-                args.subword2srt,
-                args.subword2json,
-                args.kass,
-            )
-        )
-
-        if args.text or not file_output_requested:
-            full_text = " ".join(segment.text for segment in all_segments)
+        if not (file_output_requested := any(
+                    (
+                        args.text,
+                        args.segment,
+                        args.segment2srt,
+                        args.segment2vtt,
+                        args.segment2tsv,
+                        args.subword,
+                        args.subword2srt,
+                        args.subword2json,
+                        args.kass,
+                    )
+                )) or args.text:
+                    full_text = " ".join(segment.text for segment in all_segments)
 
         # 只有在用户完全没有指定任何输出参数时，才在控制台打印
         if not file_output_requested:
@@ -1440,30 +1407,27 @@ def main():
             logger.info("请使用 -text，-segment2srt，-kass 等参数将结果保存为文件")
 
         if args.text:
-            output_path = output_dir / f"{base_name}.txt"
-            with output_path.open("w", encoding="utf-8") as f: # Path 对象自带 open 方法
+            # Path 对象自带 open 方法
+            with (output_path := output_dir / f"{base_name}.txt").open("w", encoding="utf-8") as f: 
                 f.write(full_text)
             logger.info(f"完整的识别文本已保存为：{output_path}")
 
         if args.segment:
-            output_path = output_dir / f"{base_name}.segments.txt"
-            with output_path.open("w", encoding="utf-8") as f:
+            with (output_path := output_dir / f"{base_name}.segments.txt").open("w", encoding="utf-8") as f:
                 writer = TextWriter(f)
                 for segment in all_segments:
                     writer.write(segment)
             logger.info(f"带时间戳的文本片段已保存为：{output_path}")
 
         if args.segment2srt:
-            output_path = output_dir / f"{base_name}.srt"
-            with output_path.open("w", encoding="utf-8") as f:
+            with (output_path := output_dir / f"{base_name}.srt").open("w", encoding="utf-8") as f:
                 writer = SRTWriter(f)
                 for segment in all_segments:
                     writer.write(segment)
             logger.info(f"文本片段 SRT 字幕文件已保存为：{output_path}")
 
         if args.segment2vtt:
-            output_path = output_dir / f"{base_name}.vtt"
-            with output_path.open("w", encoding="utf-8") as f:
+            with (output_path := output_dir / f"{base_name}.vtt").open("w", encoding="utf-8") as f:
                 writer = VTTWriter(f)
                 writer.write_header()
                 for segment in all_segments:
@@ -1471,8 +1435,7 @@ def main():
             logger.info(f"文本片段 WebVTT 字幕文件已保存为：{output_path}")
 
         if args.segment2tsv:
-            output_path = output_dir / f"{base_name}.tsv"
-            with output_path.open("w", encoding="utf-8") as f:
+            with (output_path := output_dir / f"{base_name}.tsv").open("w", encoding="utf-8") as f:
                 writer = TSVWriter(f)
                 writer.write_header()
                 for segment in all_segments:
@@ -1480,8 +1443,7 @@ def main():
             logger.info(f"文本片段 TSV 文件已保存为：{output_path}")
 
         if args.subword:
-            output_path = output_dir / f"{base_name}.subwords.txt"
-            with output_path.open("w", encoding="utf-8") as f:
+            with (output_path := output_dir / f"{base_name}.subwords.txt").open("w", encoding="utf-8") as f:
                 for sub in all_subwords:
                     f.write(
                         f"[{SRTWriter._format_time(sub.seconds)}] {sub.token.replace(' ', '')}\n"
@@ -1489,8 +1451,7 @@ def main():
             logger.info(f"带时间戳的所有子词信息已保存为：{output_path}")
 
         if args.subword2srt:
-            output_path = output_dir / f"{base_name}.subwords.srt"
-            with output_path.open("w", encoding="utf-8") as f:
+            with (output_path := output_dir / f"{base_name}.subwords.srt").open("w", encoding="utf-8") as f:
                 for i, sub in enumerate(all_subwords):
                     f.write(f"{i + 1}\n")
                     f.write(f"{SRTWriter._format_time(sub.seconds)} --> {SRTWriter._format_time(sub.end_seconds)}\n")
@@ -1499,8 +1460,7 @@ def main():
             logger.info(f"所有子词信息的 SRT 文件已保存为：{output_path}")
 
         if args.subword2json:
-            output_path = output_dir / f"{base_name}.subwords.json"
-            with output_path.open("w", encoding="utf-8") as f:
+            with (output_path := output_dir / f"{base_name}.subwords.json").open("w", encoding="utf-8") as f:
                 json.dump(
                     [{"token": sub.token, "timestamp": sub.seconds} for sub in all_subwords],
                     f, ensure_ascii=False, indent=4
@@ -1508,8 +1468,7 @@ def main():
             logger.info(f"所有子词信息的 JSON 文件已保存为：{output_path}")
 
         if args.kass:
-            output_path = output_dir / f"{base_name}.ass"
-            with output_path.open("w", encoding="utf-8-sig") as f:
+            with (output_path := output_dir / f"{base_name}.ass").open("w", encoding="utf-8-sig") as f:
 
                 # 使用 writer 生成标准文件头
                 writer = ASSWriter(f)
@@ -1543,7 +1502,7 @@ def main():
                     f"Pyannote-segmentation-3.0 模型加载耗时：{format_duration(vad_model_load_end - vad_model_load_start)}"
                 )
                 logger.info(
-                    f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time - (vad_model_load_end     - vad_model_load_start))}"
+                    f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time - (vad_model_load_end - vad_model_load_start))}"
                 )
             else:
                 logger.info(
@@ -1555,17 +1514,18 @@ def main():
             logger.info("调试模式已启用，保留临时文件和目录")
             if temp_full_wav_path:
                 logger.info(f"临时 WAV 文件位于: {temp_full_wav_path}")
+                open_folder(temp_full_wav_path)
             if temp_chunk_dir:
                 logger.info(f"临时分块目录位于: {temp_chunk_dir}")
                 open_folder(temp_chunk_dir) # 调用新函数打开文件夹
 
         else:
-            # --- 清理工作：删除临时的 WAV 文件 ---
+            # 删除临时的 WAV 文件
             if temp_full_wav_path and temp_full_wav_path.exists():
                 temp_full_wav_path.unlink()
                 logger.info(f"\n临时文件 '{temp_full_wav_path}' 已删除")
 
-        # 使用 shutil.rmtree 来删除临时块目录及其所有内容
+            # 使用 shutil.rmtree 来删除临时块目录及其所有内容
             if temp_chunk_dir:
                 shutil.rmtree(temp_chunk_dir, ignore_errors=True)
                 logger.info(f"临时块目录 '{temp_chunk_dir.name}' 已删除")
