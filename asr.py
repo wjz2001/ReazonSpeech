@@ -1,7 +1,9 @@
 import argparse
 import copy
+import ctypes
 import math
 import os
+import threading
 import tempfile
 import sys
 import subprocess
@@ -9,11 +11,24 @@ import torch
 import json
 import time
 import numpy as np
+
 # ONNX VAD 依赖
 try:
     import onnxruntime
 except ImportError:
     onnxruntime = None
+
+# Unix 系统有，Windows 上可能 ImportError
+try:
+    import resource  
+except ImportError:
+    resource = None
+
+# 仅 Windows 使用 WinAPI
+if sys.platform == "win32":
+    from ctypes import wintypes, windll
+
+from collections import Counter
 from pathlib import Path
 from pydub import AudioSegment
 from omegaconf import open_dict
@@ -52,6 +67,125 @@ class Logger:
 
 # 初始化全局日志实例
 logger = Logger()
+
+# === 内存 / 显存监控 ===
+MEM_SAMPLES = {
+    "ram_gb": [],
+    "gpu_gb": [],
+}
+
+if sys.platform == "win32":
+    kernel32 = windll.kernel32
+    psapi = windll.psapi
+
+    # HANDLE GetCurrentProcess(void);
+    GetCurrentProcess = kernel32.GetCurrentProcess
+    GetCurrentProcess.restype = wintypes.HANDLE
+
+    class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+            ("PrivateUsage", ctypes.c_size_t),
+        ]
+
+    GetProcessMemoryInfo = psapi.GetProcessMemoryInfo
+    GetProcessMemoryInfo.restype = wintypes.BOOL
+    GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
+        wintypes.DWORD,
+    ]
+
+    def _get_ram_gb_sample():
+        """
+        Windows：通过 WinAPI 获取当前进程 Working Set，单位 GB
+        """
+        counters = PROCESS_MEMORY_COUNTERS_EX()
+        cb = ctypes.sizeof(counters)
+        counters.cb = cb
+
+        handle = GetCurrentProcess()
+        ok = GetProcessMemoryInfo(handle, ctypes.byref(counters), cb)
+        if not ok:
+            return None
+
+        # WorkingSetSize 是字节
+        return counters.WorkingSetSize / (1024 ** 3)
+
+else:
+    # ---- Linux / macOS / 其它 Unix ----
+    def _get_ram_gb_sample():
+        """
+        返回当前进程大致的 RAM 使用量（GB）。
+        - 在 Linux 上优先读 /proc/self/status 的 VmRSS（当前常驻内存）
+        - 其他系统退化为 resource.getrusage 的 ru_maxrss（进程历史峰值）
+        """
+        # Linux: 读 /proc/self/status 里的 VmRSS
+        if sys.platform.startswith("linux"):
+            try:
+                with open("/proc/self/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            # 例如: 'VmRSS:   123456 kB'
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                kb = int(parts[1])
+                                return kb / (1024 ** 2)  # GB
+            except FileNotFoundError:
+                pass  # 某些精简系统可能没有 /proc/self/status
+    
+        # 退化方案：用 resource 的 ru_maxrss（历史最大常驻集）
+        if resource is not None:
+            try:
+                usage = resource.getrusage(resource.RUSAGE_SELF)
+                maxrss = usage.ru_maxrss
+                # macOS 上 ru_maxrss 单位是 bytes；Linux 一般是 KB
+                if sys.platform == "darwin":
+                    return maxrss / (1024 ** 3)
+                else:
+                    return maxrss / (1024 ** 2)
+            except Exception:
+                pass
+
+        # 实在拿不到就返回 None
+        return None
+def _memory_monitor(stop_event, device, interval=0.5):
+    """
+    后台线程：周期性采样当前进程的 RAM 和 GPU 显存使用情况。
+    interval: 采样间隔（秒），表示每几秒采样一次，可按需要调大/调小
+    """
+    while not stop_event.is_set():
+        # 进程 RAM（GB）
+        MEM_SAMPLES["ram_gb"].append(_get_ram_gb_sample())
+
+        # 如果有 CUDA，就记录一次显存
+        if torch.cuda.is_available():
+            MEM_SAMPLES["gpu_gb"].append(torch.cuda.memory_allocated(device) / (1024 ** 3))
+
+        time.sleep(interval)
+
+def _calc_mode(samples, bin_size=0.048):
+    """
+    对连续型数据求“众数”的简单方法：
+    bin_size表示按 几GB 一档来求众数
+    先按 bin_size (GB) 做分箱，再统计出现次数最多的箱。
+    返回 (众数中心值, 该箱出现次数)
+    """
+    if not samples:
+        return None, 0
+    most_bin, freq = Counter([int(x // bin_size) * bin_size for x in samples]).most_common(1)[0]
+    # 返回区间中点更直观一点
+    return most_bin + bin_size / 2.0, freq
+# === 内存 / 显存监控结束 ===
 
 def calculate_frame_cost(frame_idx, speech_probs, energy_array, vad_threshold, zcr_threshold, zcr_array):
     """计算单帧作为切分点的代价（代价越低越适合切分）。
@@ -239,22 +373,21 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
     
             else:
                 # === 分支 B：含正文的片段 ===
-                
-                # 如果需要剔除句末标点
-                if not no_remove_punc:
-                    # 检查最后一个子词是否是标点
-                    if current_subwords[-1].token in TOKEN_PUNC:
-                        removed_punc = current_subwords.pop()
-    
-                        if logger.debug_mode:
-                            logger.debug(f"已剔除 {SRTWriter._format_time(removed_punc.seconds)} --> {SRTWriter._format_time(removed_punc.end_seconds)}：{removed_punc.token}")
-    
-                        # 因为不是全标点句，pop 后列表一定不为空
-                        # 填补时间空缺
-                        current_subwords[-1].end_seconds = removed_punc.end_seconds
-                
-                # 重新生成最终文本（可能已剔除标点）
-                text = "".join(s.token for s in current_subwords)
+                text = curr_text_raw
+                # 如果需要剔除句末标点，且最后一个子词是标点
+                if not no_remove_punc and current_subwords[-1].token in TOKEN_PUNC:
+                    removed_punc = current_subwords.pop()
+
+                    if logger.debug_mode:
+                        logger.debug(f"已剔除 {SRTWriter._format_time(removed_punc.seconds)} --> {SRTWriter._format_time(removed_punc.end_seconds)}：{removed_punc.token}")
+
+                    # 因为不是全标点句，pop 后列表一定不为空
+                    # 填补时间空缺
+                    current_subwords[-1].end_seconds = removed_punc.end_seconds
+            
+                    # 重新生成已剔除标点最终文本
+                    text = "".join(s.token for s in current_subwords)
+                        
                 
                 # 创建新片段
                 all_segments.append(PreciseSegment(
@@ -1076,7 +1209,14 @@ def main():
             if not (0.1 <= args.tail_zcr_high_ratio <= 0.5):
                 parser.error("tail_zcr_high_ratio 必须在（0.1-0.5）范围内，当前值错误")
 
-        
+    # 启动内存 / 显存监控线程
+    mem_stop_event = threading.Event()
+    mem_thread = threading.Thread(
+        target=_memory_monitor,
+        args=(mem_stop_event, torch.cuda.current_device() if torch.cuda.is_available() else 0), 
+        daemon=True,
+    )
+    mem_thread.start()
 
     # --- 准备路径和临时文件 ---
     input_path = Path(args.input_file)
@@ -1236,8 +1376,9 @@ def main():
                     # === 分支 B：长块，执行二次 VAD 拆分后再识别 ===
                     logger.info(" --> 长块，执行二次 VAD 拆分")
                     # 运行局部 VAD
+                    chunk_tensor = convert_audio_to_tensor(chunk)
                     sub_speeches, sub_speech_probs, sub_frame_duration_s = get_speech_timestamps_onnx(
-                        (chunk_tensor := convert_audio_to_tensor(chunk)), # 从内存 chunk 对象转换
+                        chunk_tensor, # 从内存 chunk 对象转换
                         onnx_session,
                         threshold=args.vad_threshold,
                         neg_threshold=args.vad_end_threshold,
@@ -1508,6 +1649,40 @@ def main():
         if original_decoding_cfg is not None:
             logger.info("正在恢复原始解码策略……")
             model.change_decoding_strategy(original_decoding_cfg)
+
+        # 先停止监控线程
+        try:
+            mem_stop_event.set()
+            mem_thread.join(timeout=1.0)
+        except Exception:
+            pass
+
+        # 计算并打印内存 / 显存统计
+        if MEM_SAMPLES["ram_gb"]:
+            max_ram = max(MEM_SAMPLES["ram_gb"])
+            ram_mode, freq = _calc_mode(MEM_SAMPLES["ram_gb"])
+            logger.info("=" * 70)
+            logger.info(f"【内存监控】内存常规用量：{ram_mode:.2f} GB，峰值：{max_ram:.2f} GB（出现 {freq} 次）")
+        else:
+            logger.info("【内存监控】未采集到内存占用数据")
+
+        # GPU 显存两套信息：采样众数 + PyTorch 精确峰值
+        if torch.cuda.is_available():
+            # 采样数据的统计
+            if MEM_SAMPLES["gpu_gb"]:
+                max_gpu_sample = max(MEM_SAMPLES["gpu_gb"])
+                gpu_mode, freq = _calc_mode(MEM_SAMPLES["gpu_gb"])
+                logger.info(f"【显存监控】显存常规用量：{gpu_mode:.2f} GB，峰值：{max_gpu_sample:.2f} GB（出现 {freq} 次）")
+
+            # PyTorch 记录的峰值（不依赖采样间隔）
+            try:
+                
+                if (peak_gpu_bytes := torch.cuda.max_memory_allocated()) > 0:
+                    logger.info(
+                        f"【显存监控】PyTorch 记录的显存占用峰值：{peak_gpu_bytes / (1024 ** 3):.2f} GB"
+                    )
+            except Exception:
+                pass
 
         logger.info("=" * 70)
         # 使用全局记录的加载耗时
