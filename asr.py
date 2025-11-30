@@ -18,15 +18,12 @@ try:
 except ImportError:
     onnxruntime = None
 
-# Unix 系统有，Windows 上可能 ImportError
-try:
-    import resource  
-except ImportError:
-    resource = None
-
+# Unix 系统有resource，Windows 上可能 ImportError
 # 仅 Windows 使用 WinAPI
 if sys.platform == "win32":
     from ctypes import wintypes, windll
+else:
+    import resource  
 
 from collections import Counter
 from pathlib import Path
@@ -240,17 +237,13 @@ def calibrate_zcr_threshold(speech_probs, zcr_array):
 def convert_audio_to_tensor(initial_audio):
     """
     将 Pydub AudioSegment 转换为 PyTorch Tensor (float32, [-1, 1])。
-    采用 np.frombuffer 实现零拷贝读取，大幅降低内存峰值。
+    使用 np.frombuffer 读 int16，再用 torch.tensor 拷贝到 GPU/CPU 张量
     """
-
-    # 零拷贝读取 (bytes -> numpy int16 view)
-    # 从 int16 到 float32，数据量翻倍
-    # initial_audio.raw_data 是 bytes，np.frombuffer 创建视图，不复制内存
-    # 由于已经强制转为 16-bit，这里固定用 int16
-    # 直接读取为 int16，转为 Tensor 后再除以 32768.0，减少一次 numpy 层的 float32 内存分配
-    # 32768.0 = 2^15
-    # 增加 batch 维度 [T] -> [1, T]
-    return torch.from_numpy(np.frombuffer(initial_audio.raw_data, dtype=np.int16)).float().div_(32768.0).unsqueeze(0)
+    # torch.tensor(...) 总是拷贝数据，不依赖 numpy 的可写性
+    # [T] float32
+    # 归一化到 [-1, 1]
+    # [1, T]
+    return torch.tensor(np.frombuffer(initial_audio.raw_data, dtype=np.int16), dtype=torch.float32).div_(32768.0).unsqueeze(0)                           
 
 def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, total_duration_s, no_remove_punc):
 
@@ -368,8 +361,6 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
                         prev_seg.subwords.extend(current_subwords)
                     else:
                         prev_seg.subwords[-1].end_seconds = curr_end
-                else:
-                    pass # 开头纯标点丢弃
     
             else:
                 # === 分支 B：含正文的片段 ===
@@ -397,6 +388,11 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
                     vad_limit=curr_limit,
                     subwords=current_subwords
                 ))
+
+                if len(text) > SUBWORDS_PER_SEGMENTS * 2:
+                    logger.warn(
+                        f"{SRTWriter._format_time(curr_start)} --> {SRTWriter._format_time(curr_end)} 段字数超过 {len(text)} "
+                    )
 
         # 更新外层循环游标
         start = end_idx + 1
@@ -508,7 +504,7 @@ def get_speech_timestamps_onnx(
     current_speech_start = None
     triggered = False
     temp_silence_start_frame = None
-    min_silence_frames = max(1, int(min_silence_duration_ms / (frame_duration_s * 1000.0)))
+    min_silence_frames = max(1, min_silence_duration_ms / (frame_duration_s * 1000.0))
 
     for i, prob in enumerate(speech_probs):
         # --- 语音开始逻辑（高阈值） ---
@@ -547,7 +543,7 @@ def get_speech_timestamps_onnx(
     # 完整的语音概率数组 speech_probs 和每一帧的持续时间 frame_duration_s
     return speeches, speech_probs, frame_duration_s
 
-def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_duration_s, max_duration_s, vad_threshold, use_zcr, zcr_threshold, zcr_array, overlap_s):
+def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_duration_s, max_duration_s, vad_threshold, zcr_threshold, zcr_array, overlap_s):
     """
     入口函数：分析一个长 VAD 段，返回切割好的子段列表。
     """
@@ -884,7 +880,7 @@ def refine_tail_end_timestamp(
     # 0.10 保证底噪容忍度，0.95 保证不会因为全 1.0 的概率导致无法切割
     dyn_tau = np.clip(float(np.percentile(p_smooth, percentile)) + offset, 0.10, 0.95)
 
-    min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
+    min_silence_frames = max(1, min_silence_duration_ms / 1000.0 / frame_duration_s)
     # 连续静音 + 滞回
     for i in range(0, len(p_smooth) - min_silence_frames):
         if np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
@@ -919,19 +915,43 @@ def refine_tail_end_timestamp(
     # 兜底：没找到稳定静音，保留原结束时间
     return min(rough_end_s, max_end_s)
 
-def transcribe_audio(model, audio_input):
+def slice_waveform_ms(waveform, start_ms, end_ms):
+    """
+    【新增】高效 Tensor 切片与 Padding
+    waveform: [1, T]
+    """
+    def ms_to_index(ms):
+        """【新增】毫秒 -> 采样点下标"""
+        return max(0, int(round(ms * SAMPLERATE / 1000.0)))
+
+    # 边界限制
+    start_idx = ms_to_index(start_ms)
+    end_idx = ms_to_index(end_ms)
+
+    # 切片 (View 操作，零内存拷贝)
+    # Padding (如果需要)
+    # F.pad: (padding_left, padding_right)
+    chunk = torch.nn.functional.pad(
+        waveform[:, start_idx:end_idx], (ms_to_index(int(PAD_SECONDS * 1000)), ms_to_index(int(PAD_SECONDS * 1000)))
+        )
+
+    return chunk
+
+def transcribe_waveform(model, waveform):
     """
     封装转录逻辑：调用模型 -> 解码 -> 返回子词列表。
     如果失败或无结果，返回空列表。
     """
-    if (hyp := model.transcribe(
-            # convert_audio_to_tensor 返回的是 [1, T] 的 Tensor
-            # NeMo 喜欢 1D 输入 [T]，所以要把 Batch 维度挤掉 (squeeze)
-            # 结果变成形状为 [T] 的 Tensor
-            audio=[convert_audio_to_tensor(audio_input).squeeze(0)],
-            return_hypotheses=True,
-            verbose=False,
-        )[0]) and hyp[0]:
+    with torch.inference_mode():
+        hyp = model.transcribe(
+                # convert_audio_to_tensor 返回的是 [1, T] 的 Tensor
+                # NeMo 喜欢 1D 输入 [T]，所以要把 Batch 维度挤掉 (squeeze)
+                # 结果变成形状为 [T] 的 Tensor
+                audio=[waveform.squeeze(0)],
+                return_hypotheses=True,
+                verbose=False,
+            )[0]
+    if hyp and hyp[0]:
         return decode_hypothesis(model, hyp[0]).subwords
     return []
 
@@ -993,14 +1013,14 @@ def main():
     )
     parser.add_argument(
         "--min_speech_duration_ms",
-        type=float,
+        type=int,
         default=100,
         help="【VAD】移除短于此时长（毫秒）的语音块",
     )
      # 静音最小时长，用于智能合并/分段
     parser.add_argument(
         "--min_silence_duration_ms",
-        type=float,
+        type=int,
         default=200,
         help="【VAD】短于此时长（毫秒）的语音块不被视为间隔",
     )
@@ -1210,13 +1230,14 @@ def main():
                 parser.error("tail_zcr_high_ratio 必须在（0.1-0.5）范围内，当前值错误")
 
     # 启动内存 / 显存监控线程
-    mem_stop_event = threading.Event()
-    mem_thread = threading.Thread(
-        target=_memory_monitor,
-        args=(mem_stop_event, torch.cuda.current_device() if torch.cuda.is_available() else 0), 
-        daemon=True,
-    )
-    mem_thread.start()
+    if args.debug:
+        mem_stop_event = threading.Event()
+        mem_thread = threading.Thread(
+            target=_memory_monitor,
+            args=(mem_stop_event, torch.cuda.current_device() if torch.cuda.is_available() else 0), 
+            daemon=True,
+        )
+        mem_thread.start()
 
     # --- 准备路径和临时文件 ---
     input_path = Path(args.input_file)
@@ -1234,7 +1255,17 @@ def main():
         logger.info(f"正在转换输入文件 '{input_path}'……")
         # 转换为单声道，16kHz采样率，16bit，这是ASR模型的标准格式
         audio = AudioSegment.from_file(input_path).set_channels(1).set_frame_rate(SAMPLERATE).set_sample_width(2)
+        total_audio_ms = len(audio)
+        waveform = convert_audio_to_tensor(audio)  # [1, T]
         logger.info("转换完成")
+
+        if args.debug:
+            # Debug 模式下保留 silence 用于导出
+            # 使用 pydub 创建静音段用于填充
+            # PAD_SECONDS 是以秒为单位，pydub 需要毫秒
+            silence_padding = AudioSegment.silent(duration=int(PAD_SECONDS * 1000), frame_rate=SAMPLERATE)
+        else:
+            del audio
 
         # 使用单例模式获取模型，避免重复加载
         model = get_asr_model()
@@ -1259,26 +1290,24 @@ def main():
         # --- 计时开始：核心识别流程 ---
         recognition_start_time = time.time()
 
-        # 使用 pydub 创建静音段用于填充
-        # PAD_SECONDS 是以秒为单位，pydub 需要毫秒
-        silence_padding = AudioSegment.silent(duration=PAD_SECONDS * 1000, frame_rate=SAMPLERATE)
-
         vad_chunk_end_times_s = []  # 用于存储VAD块的结束时间
         if args.no_chunk:
             # --- 不分块的逻辑 ---
-            # 准备完整的音频对象
-            full_audio = silence_padding + audio + silence_padding
-            
             # 仅在 debug 模式下保存文件
-            if args.debug:
+            if args.debug and audio:
+                # 准备完整的音频对象
                 # 分配临时文件名
                 fd, temp_full_wav_path = tempfile.mkstemp(suffix=".wav")
                 os.close(fd)# 关闭文件描述符，只保留路径
                 temp_full_wav_path = Path(temp_full_wav_path)
-                full_audio.export(temp_full_wav_path, format="wav")
+                (silence_padding + audio + silence_padding).export(temp_full_wav_path, format="wav")
 
             logger.info("未使用VAD，一次性处理整个文件……")
-            raw_subwords = transcribe_audio(model, full_audio)
+            raw_subwords = transcribe_waveform(
+                model,
+                # 纯 Tensor 操作：全长切片 + Padding
+                torch.nn.functional.pad(waveform, (int(PAD_SECONDS * SAMPLERATE), int(PAD_SECONDS * SAMPLERATE)))
+                )
 
         else:
             logger.info("【VAD】正在从本地路径加载 Pyannote-segmentation-3.0 模型……")
@@ -1293,12 +1322,12 @@ def main():
             # ==== 先做 VAD（双阈值 + 静音 + min_speech），不在此强制 30s ====
             # ==== 获取VAD分块，并缓存完整的语音概率 ====
             speeches, speech_probs, frame_duration_s = get_speech_timestamps_onnx(
-                (waveform := convert_audio_to_tensor(audio)), # waveform shape: [1, T]
+                waveform, # waveform shape: [1, T]
                 onnx_session,
                 threshold=args.vad_threshold,
                 neg_threshold=args.vad_end_threshold,
-                min_speech_duration_ms=int(args.min_speech_duration_ms),
-                min_silence_duration_ms=int(args.min_silence_duration_ms)
+                min_speech_duration_ms=args.min_speech_duration_ms,
+                min_silence_duration_ms=args.min_silence_duration_ms
             )
             logger.info("【VAD】侦测完成")
 
@@ -1338,19 +1367,20 @@ def main():
 
             chunk_results = []
 
-            if args.debug:
+            if args.debug and audio:
                 temp_chunk_dir = Path(tempfile.mkdtemp())
             for i, (unpadded_start_s, unpadded_end_s) in enumerate(merged_ranges_s):
                 # --- 准备一级语音块 ---
                 # 计算包含静音保护的起止时间
                 start_ms = max(0, int(unpadded_start_s * 1000) - args.keep_silence)
-                end_ms = min(len(audio), int(unpadded_end_s * 1000) + args.keep_silence)
-                # 先赋值给 chunk 变量，以便后续二次切分时使用，再导出文件
-                chunk = silence_padding + audio[start_ms:end_ms] + silence_padding
+                end_ms = min(total_audio_ms, int(unpadded_end_s * 1000) + args.keep_silence)
+                # 一级切分：使用 slice_waveform_ms
+                chunk = slice_waveform_ms(waveform, start_ms, end_ms)
                 # debug模式下为了检查才导出该块
-                if args.debug:
+                if args.debug and audio:
                     # 定义路径对象
-                    chunk.export(temp_chunk_dir / f"chunk_{i + 1}.wav", format="wav")
+                    chunk_audio = silence_padding + audio[start_ms:end_ms] + silence_padding
+                    chunk_audio.export(temp_chunk_dir / f"chunk_{i + 1}.wav", format="wav")
                 
                 logger.info(
                     f"【VAD】正在处理语音块 {i + 1}/{len(merged_ranges_s)} （该块起止时间：{SRTWriter._format_time(unpadded_start_s)} --> {SRTWriter._format_time(unpadded_end_s)}，时长：{(unpadded_end_s - unpadded_start_s):.2f} 秒）",
@@ -1369,32 +1399,30 @@ def main():
                     vad_chunk_end_times_s.append(unpadded_end_s)
 
                     # 坐标变换：全局时间 = 一级块偏移 + 相对时间
-                    for sub in transcribe_audio(model, chunk):
+                    for sub in transcribe_waveform(model, chunk):
                         sub.seconds += start_ms / 1000.0
                         final_subwords_in_this_chunk.append(sub)
                 else:
                     # === 分支 B：长块，执行二次 VAD 拆分后再识别 ===
                     logger.info(" --> 长块，执行二次 VAD 拆分")
                     # 运行局部 VAD
-                    chunk_tensor = convert_audio_to_tensor(chunk)
                     sub_speeches, sub_speech_probs, sub_frame_duration_s = get_speech_timestamps_onnx(
-                        chunk_tensor, # 从内存 chunk 对象转换
+                        chunk,
                         onnx_session,
                         threshold=args.vad_threshold,
                         neg_threshold=args.vad_end_threshold,
-                        min_speech_duration_ms=int(args.min_speech_duration_ms),
-                        min_silence_duration_ms=int(args.min_silence_duration_ms)
+                        min_speech_duration_ms=args.min_speech_duration_ms,
+                        min_silence_duration_ms=args.min_silence_duration_ms
                     )
                     
                     if not sub_speeches:
                         # 兜底策略：如果二次 VAD 没切出来（例如全是噪音），回退到整块识别
                         logger.warn("    【VAD】二次 VAD 未发现有效分割点，回退到整块识别")
                         # 构造一个覆盖整个 chunk 的虚拟 VAD 段
-                        # chunk 是 pydub 对象，len(chunk) 返回毫秒数，需转为秒
-                        sub_speeches = [[0.0, len(chunk) / 1000.0]]
+                        sub_speeches = [[0.0, chunk.shape[1] / SAMPLERATE]]
 
                     sub_speech_probs, sub_energy_array, sub_zcr_array = prepare_acoustic_features(
-                            chunk_tensor,
+                            chunk,
                             sub_speech_probs,
                             sub_frame_duration_s,
                             args.zcr
@@ -1415,7 +1443,6 @@ def main():
                                 sub_frame_duration_s,  # 局部帧长
                                 MAX_SPEECH_DURATION_S,
                                 args.vad_threshold,
-                                args.zcr,
                                 final_zcr_threshold,   # 复用全局计算出的最佳阈值
                                 sub_zcr_array,         # 局部 ZCR
                                 OVERLAP_S
@@ -1453,13 +1480,14 @@ def main():
                         
                     # 遍历二次拆分出的子块
                     for sub_idx, sub_seg in enumerate(refined_sub_speeches):
-                        # sub_seg[0] 是相对于 chunk_path (0s) 的时间
+                        # sub_seg 是相对于 chunk (已含Padding) 的秒数
                         # 提取子块音频并加上静音保护
-                        # 先在内存中切分好 sub_chunk
-                        sub_chunk = silence_padding + chunk[int(sub_seg[0] * 1000):int(sub_seg[1] * 1000)] + silence_padding
+                        sub_chunk = slice_waveform_ms(chunk, int(sub_seg[0] * 1000), int(sub_seg[1] * 1000))
                         # Debug 时导出临时子块文件
-                        if args.debug:
-                            sub_chunk.export((temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav"), format="wav")
+                        if args.debug and audio:
+                            (silence_padding + chunk_audio[int(sub_seg[0] * 1000):int(sub_seg[1] * 1000)] + silence_padding).export(
+                                (temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav"), format="wav"
+                                )
 
                         if len(refined_sub_speeches) != 1:
                             logger.info(f"第 {i + 1}-{sub_idx + 1} 段 {sub_seg[1] - sub_seg[0]:.2f} 秒：")
@@ -1468,7 +1496,7 @@ def main():
                         # 最终时间 = 一级块全局偏移 + 二级块在一级块内的偏移 + 识别出的相对时间
                         # 因为 sub_seg["start"] 是基于含填充的父chunk计算的，它包含了父chunk头部的 0.5s 静音，必须扣除
                         base_offset = start_ms / 1000.0 + sub_seg[0] - PAD_SECONDS
-                        for sub in transcribe_audio(model, sub_chunk):
+                        for sub in transcribe_waveform(model, sub_chunk):
                             sub.seconds += base_offset
                             final_subwords_in_this_chunk.append(sub)
 
@@ -1503,7 +1531,9 @@ def main():
         logger.info("=" * 70)
         logger.info("正在根据子词和VAD边界生成精确文本片段……")
 
-        all_segments, all_subwords = create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, len(audio) / 1000.0, no_remove_punc=args.no_remove_punc)
+        all_segments, all_subwords = create_precise_segments_from_subwords(
+            raw_subwords, vad_chunk_end_times_s, total_audio_ms / 1000.0, no_remove_punc=args.no_remove_punc
+            )
 
         logger.info("文本片段生成完成")
 
@@ -1518,7 +1548,7 @@ def main():
                     speech_probs,
                     frame_duration_s,
                     min(segment.vad_limit, all_segments[i + 1].start_seconds) if i < len(all_segments) - 1 else segment.vad_limit,
-                    int(args.min_silence_duration_ms),
+                    args.min_silence_duration_ms,
                     args.tail_lookahead_ms,
                     args.tail_safety_margin_ms,
                     args.tail_min_keep_ms,
@@ -1650,40 +1680,6 @@ def main():
             logger.info("正在恢复原始解码策略……")
             model.change_decoding_strategy(original_decoding_cfg)
 
-        # 先停止监控线程
-        try:
-            mem_stop_event.set()
-            mem_thread.join(timeout=1.0)
-        except Exception:
-            pass
-
-        # 计算并打印内存 / 显存统计
-        if MEM_SAMPLES["ram_gb"]:
-            max_ram = max(MEM_SAMPLES["ram_gb"])
-            ram_mode, freq = _calc_mode(MEM_SAMPLES["ram_gb"])
-            logger.info("=" * 70)
-            logger.info(f"【内存监控】内存常规用量：{ram_mode:.2f} GB，峰值：{max_ram:.2f} GB（出现 {freq} 次）")
-        else:
-            logger.info("【内存监控】未采集到内存占用数据")
-
-        # GPU 显存两套信息：采样众数 + PyTorch 精确峰值
-        if torch.cuda.is_available():
-            # 采样数据的统计
-            if MEM_SAMPLES["gpu_gb"]:
-                max_gpu_sample = max(MEM_SAMPLES["gpu_gb"])
-                gpu_mode, freq = _calc_mode(MEM_SAMPLES["gpu_gb"])
-                logger.info(f"【显存监控】显存常规用量：{gpu_mode:.2f} GB，峰值：{max_gpu_sample:.2f} GB（出现 {freq} 次）")
-
-            # PyTorch 记录的峰值（不依赖采样间隔）
-            try:
-                
-                if (peak_gpu_bytes := torch.cuda.max_memory_allocated()) > 0:
-                    logger.info(
-                        f"【显存监控】PyTorch 记录的显存占用峰值：{peak_gpu_bytes / (1024 ** 3):.2f} GB"
-                    )
-            except Exception:
-                pass
-
         logger.info("=" * 70)
         # 使用全局记录的加载耗时
         if _ASR_MODEL_LOAD_COST > 0:
@@ -1705,14 +1701,48 @@ def main():
                     f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time)}"
                 )
 
-        logger.info("=" * 70)
         if args.debug:
-            logger.info("调试模式已启用，保留临时文件和目录")
+            logger.debug("=" * 70)
+            # 先停止监控线程
+            try:
+                mem_stop_event.set()
+                mem_thread.join(timeout=1.0)
+            except Exception:
+                pass
+    
+            # 计算并打印内存 / 显存统计
+            if MEM_SAMPLES["ram_gb"]:
+                max_ram = max(MEM_SAMPLES["ram_gb"])
+                ram_mode, freq = _calc_mode(MEM_SAMPLES["ram_gb"])
+                logger.debug(f"【内存监控】内存常规用量：{ram_mode:.2f} GB，峰值：{max_ram:.2f} GB（出现 {freq} 次）")
+            else:
+                logger.debug("【内存监控】未采集到内存占用数据")
+    
+            # GPU 显存两套信息：采样众数 + PyTorch 精确峰值
+            if torch.cuda.is_available():
+                # 采样数据的统计
+                if MEM_SAMPLES["gpu_gb"]:
+                    max_gpu_sample = max(MEM_SAMPLES["gpu_gb"])
+                    gpu_mode, freq = _calc_mode(MEM_SAMPLES["gpu_gb"])
+                    logger.debug(f"【显存监控】显存常规用量：{gpu_mode:.2f} GB，峰值：{max_gpu_sample:.2f} GB（出现 {freq} 次）")
+    
+                # PyTorch 记录的峰值（不依赖采样间隔）
+                try:
+                    
+                    if (peak_gpu_bytes := torch.cuda.max_memory_allocated()) > 0:
+                        logger.debug(
+                            f"【显存监控】PyTorch 记录的显存占用峰值：{peak_gpu_bytes / (1024 ** 3):.2f} GB"
+                        )
+                except Exception:
+                    pass
+
+            logger.debug("=" * 70)
+            logger.debug("调试模式已启用，保留临时文件和目录")
             if temp_full_wav_path:
-                logger.info(f"临时 WAV 文件位于: {temp_full_wav_path}")
+                logger.debug(f"临时 WAV 文件位于: {temp_full_wav_path}")
                 open_folder(temp_full_wav_path)
             if temp_chunk_dir:
-                logger.info(f"临时分块目录位于: {temp_chunk_dir}")
+                logger.debug(f"临时分块目录位于: {temp_chunk_dir}")
                 open_folder(temp_chunk_dir) # 调用新函数打开文件夹
 
 if __name__ == "__main__":

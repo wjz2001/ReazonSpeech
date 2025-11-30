@@ -134,7 +134,7 @@ set "tailParams= --refine-tail"
 echo.
 choice /c YN /m "是否需要修改默认的段尾精修参数？"
 if %ERRORLEVEL% == 2 (
-    goto AskBeamParams
+    goto AskZCR
 )
 
 echo.
