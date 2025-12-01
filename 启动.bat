@@ -38,13 +38,14 @@ set "chunkParams="
 set "tailParams="
 set "zcrParams="
 set "beamParams="
+set "batchParams="
 set "puncOption="
 set "debugOption="
 set "outputOptions="
 REM 清空临时输入变量
 set "vadThresh=" & set "vadEndThresh=" & set "minSpeech=" & set "minSilence=" & set "keep="
 set "t_per=" & set "t_off=" & set "t_look=" & set "t_safe=" & set "t_keep=" & set "t_high="
-set "zcrTh=" & set "beamSize="
+set "zcrTh=" & set "beamSize=" & set "batchSize="
 
 
 echo ======================================================================
@@ -80,7 +81,7 @@ set "chunkOption="
 choice /c YN /m "是否使用智能语音分块？（Y=是，推荐使用；N=否，除非音频极短或为了测试，否则不推荐使用）"
 if %ERRORLEVEL% == 2 (
     set "chunkOption= --no-chunk"
-    goto AskBeamParams
+    goto AskAdvancedParams
 )
 
 REM --- (如果使用VAD) 询问是否修改VAD参数 ---
@@ -174,7 +175,7 @@ echo.
 choice /c YN /m "是否开启过零率（ZCR）检测？（保护清辅音不被切断）"
 
 if %ERRORLEVEL% == 2 (
-    goto AskBeamParams
+    goto AskAdvancedParams
 )
 
 set "zcrParams= --zcr"
@@ -197,7 +198,7 @@ echo 已设置 ZCR 参数
 echo.
 
 REM --- 询问高级识别参数 ---
-:AskBeamParams
+:AskAdvancedParams
 
 echo 文件: !inputFile!
 
@@ -206,6 +207,16 @@ echo ======================================================================
 echo.
 
 echo 请输入新数值，或直接按回车以使用默认值
+
+REM --- 新增：询问 Batch Size ---
+set "batchParams="
+set /p "batchSize=输入 batch_size（批量推理大小，默认：自动估算，范围：1~128（仅整数），超过16可能会增加延迟）："
+
+if NOT "!batchSize!"=="" (
+    set "batchParams= --batch-size !batchSize!"
+)
+
+echo.
 
 set "beamParams="  REM 首先确保变量为空
 
@@ -322,13 +333,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!beamParams!!puncOption!!debugOption!!outputOptions!
+echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!puncOption!!debugOption!!outputOptions!
 
 echo ======================================================================
 
 echo.
 
-python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!beamParams!!puncOption!!debugOption!!outputOptions!
+python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!puncOption!!debugOption!!outputOptions!
 
 echo.
 

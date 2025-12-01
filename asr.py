@@ -111,8 +111,7 @@ if sys.platform == "win32":
         counters.cb = cb
 
         handle = GetCurrentProcess()
-        ok = GetProcessMemoryInfo(handle, ctypes.byref(counters), cb)
-        if not ok:
+        if not GetProcessMemoryInfo(handle, ctypes.byref(counters), cb):
             return None
 
         # WorkingSetSize 是字节
@@ -184,6 +183,37 @@ def _calc_mode(samples, bin_size=0.048):
     return most_bin + bin_size / 2.0, freq
 # === 内存 / 显存监控结束 ===
 
+def auto_tune_batch_size(model, max_seg_sec):
+    """
+    根据显存自动估算 Batch Size。
+    自动计算的上限被固定为 16
+    """
+
+    if not torch.cuda.is_available():
+        return 1
+
+    device = torch.cuda.current_device()
+    torch.cuda.empty_cache()
+    baseline = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+
+    try:
+        with torch.inference_mode():
+            _ = model.transcribe(
+                # 构造 dummy 数据 (30s 空白音频)
+                audio=[torch.zeros(int(max_seg_sec * SAMPLERATE), dtype=torch.float32)],
+                batch_size=1, return_hypotheses=True, verbose=False
+                )
+    except RuntimeError:
+        return 1 # OOM 或其他错误，回退到 1
+
+    per_sample = max(torch.cuda.max_memory_allocated(device) - baseline, 1)
+    torch.cuda.empty_cache()
+    
+    
+    # 计算理论最大值，至少为 1，且不超过内部硬上限 16（经验值，再大可能会增加延迟），0.7是安全限制
+    return max(1, min(int(torch.cuda.mem_get_info(device)[0] * 0.7) // per_sample, 16))
+
 def calculate_frame_cost(frame_idx, speech_probs, energy_array, vad_threshold, zcr_threshold, zcr_array):
     """计算单帧作为切分点的代价（代价越低越适合切分）。
        ZCR 判定使用 max(|x1|, |x2|) > th。
@@ -243,7 +273,7 @@ def convert_audio_to_tensor(initial_audio):
     # [T] float32
     # 归一化到 [-1, 1]
     # [1, T]
-    return torch.tensor(np.frombuffer(initial_audio.raw_data, dtype=np.int16), dtype=torch.float32).div_(32768.0).unsqueeze(0)                           
+    return torch.tensor(np.frombuffer(initial_audio.raw_data, dtype=np.int16), dtype=torch.float32).div_(32768.0).unsqueeze(0)
 
 def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, total_duration_s, no_remove_punc):
 
@@ -297,13 +327,14 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
         current_limit = all_subwords[start].vad_limit
         # 现在我们可以直接在 all_subwords 中向后扫描，找到 vad_limit 变化的索引。
         next_group_start_idx = start
-        pause_split_indices = []
         while next_group_start_idx < len(all_subwords) and all_subwords[next_group_start_idx].vad_limit == current_limit:
             next_group_start_idx += 1
             
         # 确定当前 VAD 块内的搜索边界
+        end_idx = min(next_group_start_idx - 1, find_end_of_segment(all_subwords, start))
         # 基于语速/停顿的边界补充
-        if ((end_idx := min(next_group_start_idx - 1, find_end_of_segment(all_subwords, start))) - start + 1) > MIN_SAMPLES_FOR_THRESHOLD:
+        pause_split_indices = []
+        if (end_idx - start + 1) > MIN_SAMPLES_FOR_THRESHOLD:
             # 使用列表推导式直接筛选
             pause_split_indices = [
                 start + k for k, d in enumerate(durations[start:end_idx]) 
@@ -504,7 +535,7 @@ def get_speech_timestamps_onnx(
     current_speech_start = None
     triggered = False
     temp_silence_start_frame = None
-    min_silence_frames = max(1, min_silence_duration_ms / (frame_duration_s * 1000.0))
+    min_silence_frames = max(1, int(min_silence_duration_ms / (frame_duration_s * 1000.0)))
 
     for i, prob in enumerate(speech_probs):
         # --- 语音开始逻辑（高阈值） ---
@@ -880,7 +911,7 @@ def refine_tail_end_timestamp(
     # 0.10 保证底噪容忍度，0.95 保证不会因为全 1.0 的概率导致无法切割
     dyn_tau = np.clip(float(np.percentile(p_smooth, percentile)) + offset, 0.10, 0.95)
 
-    min_silence_frames = max(1, min_silence_duration_ms / 1000.0 / frame_duration_s)
+    min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
     # 连续静音 + 滞回
     for i in range(0, len(p_smooth) - min_silence_frames):
         if np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
@@ -937,24 +968,6 @@ def slice_waveform_ms(waveform, start_ms, end_ms):
 
     return chunk
 
-def transcribe_waveform(model, waveform):
-    """
-    封装转录逻辑：调用模型 -> 解码 -> 返回子词列表。
-    如果失败或无结果，返回空列表。
-    """
-    with torch.inference_mode():
-        hyp = model.transcribe(
-                # convert_audio_to_tensor 返回的是 [1, T] 的 Tensor
-                # NeMo 喜欢 1D 输入 [T]，所以要把 Batch 维度挤掉 (squeeze)
-                # 结果变成形状为 [T] 的 Tensor
-                audio=[waveform.squeeze(0)],
-                return_hypotheses=True,
-                verbose=False,
-            )[0]
-    if hyp and hyp[0]:
-        return decode_hypothesis(model, hyp[0]).subwords
-    return []
-
 def main():
     OVERLAP_S = 1.0  # 此处定义重叠时长
     # --- 设置命令行参数解析 ---
@@ -975,12 +988,20 @@ def main():
     )
 
     parser.add_argument(
-            "--beam",
-            type=int,
-            choices=range(4, 65), # range(4, 65) 包含 4 到 64，不包含 65
-            default=4,
-            metavar="[4-64]", # 设置这个参数，帮助信息里就会显示为 [4-64]，而不是列出几十个数字
-            help="设置集束搜索（Beam Search）宽度，范围为 4 到 64 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
+        "--batch-size",
+        type=int,
+        choices=range(1, 128),
+        default=None,
+        help="设置语音识别批量推理的大小，数字越大批量推理的速度越快，超过16可能会增加延迟，不填则自动根据显存估算（只使用 CPU 则默认为 1）",
+        )
+
+    parser.add_argument(
+        "--beam",
+        type=int,
+        choices=range(4, 65), # range(4, 65) 包含 4 到 64，不包含 65
+        default=4,
+        metavar="[4-64]", # 设置这个参数，帮助信息里就会显示为 [4-64]，而不是列出几十个数字
+        help="设置集束搜索（Beam Search）宽度，范围为 4 到 64 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
         )
 
     parser.add_argument(
@@ -1273,6 +1294,19 @@ def main():
         # 获取模型最大允许输入语音块长度
         MAX_SPEECH_DURATION_S = model.cfg.train_ds.max_duration
 
+        # 设定 Batch Size
+        if args.batch_size is None:
+            if torch.cuda.is_available():
+                logger.info(f"正在自动估算 Batch Size 的值……")
+                BATCH_SIZE = auto_tune_batch_size(model, MAX_SPEECH_DURATION_S)
+                logger.info(f"自动估算 Batch Size 值为 {BATCH_SIZE}")
+            else:
+                BATCH_SIZE = 1
+                logger.info("仅使用 CPU 时默认 Batch Size 为 1")
+        else:
+            BATCH_SIZE = args.batch_size
+            logger.info(f"使用用户指定 Batch Size: {BATCH_SIZE}")
+
         if args.beam != model.cfg.decoding.beam.beam_size:
             # 使用深拷贝来完全复制原始配置，确保它不受任何后续修改的影响
             original_decoding_cfg = copy.deepcopy(model.cfg.decoding)
@@ -1291,128 +1325,188 @@ def main():
         recognition_start_time = time.time()
 
         vad_chunk_end_times_s = []  # 用于存储VAD块的结束时间
+        chunk_results = [] # 最终结果容器
+        
+        # --- 批处理相关变量 ---
+        batch_audio = [] # 待处理的音频数据队列
+        batch_meta = [] # 存 {'index': chunk_index, 'offset': time_offset}
+        # 预先为所有可能的一级块分配结果列表，稍微多一点空间也没事，后续按 append 顺序对应
+        # 但由于我们不知道 no-chunk 时的情况，这里我们使用 chunk_subwords 列表的列表
+        # 在 VAD 循环中动态添加
+        all_chunk_subwords_collection = [] 
+
+        def flush_batch():
+            """内部闭包：执行批量推理并归位结果"""
+            if not batch_audio:
+                return
+
+            # 执行推理
+            with torch.inference_mode():
+                try:
+                    hyps = model.transcribe(
+                        audio=batch_audio,
+                        batch_size=len(batch_audio),
+                        return_hypotheses=True,
+                        verbose=False
+                    )[0] # 取元组第 0 个元素，即结果列表
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e):
+                        logger.warn("显存不足，当前批次回退为逐条推理……")
+                        # 清理一下碎片腾空间
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                        hyps = model.transcribe(
+                            audio=batch_audio,
+                            batch_size=1,
+                            return_hypotheses=True,
+                            verbose=False
+                        )[0] # 取元组第 0 个元素，即结果列表
+                    else:
+                        raise e
+
+            # 处理结果
+            for hyp, meta in zip(hyps, batch_meta):
+                if not hyp: continue
+                # 解码
+                decoded_subwords = decode_hypothesis(model, hyp).subwords
+                # 加上时间偏移
+                for sub in decoded_subwords:
+                    sub.seconds += meta['base_offset']
+                
+                # 放入对应的一级块结果桶中
+                all_chunk_subwords_collection[meta['chunk_index']].extend(decoded_subwords)
+
+            batch_audio.clear()
+            batch_meta.clear()
+
+        # --- 分支 A: 不分块 (No Chunk) ---
         if args.no_chunk:
-            # --- 不分块的逻辑 ---
-            # 仅在 debug 模式下保存文件
-            if args.debug and audio:
-                # 准备完整的音频对象
-                # 分配临时文件名
+            if args.debug:
                 fd, temp_full_wav_path = tempfile.mkstemp(suffix=".wav")
-                os.close(fd)# 关闭文件描述符，只保留路径
-                temp_full_wav_path = Path(temp_full_wav_path)
-                (silence_padding + audio + silence_padding).export(temp_full_wav_path, format="wav")
+                os.close(fd)
+                # 使用 pydub 导出
+                (silence_padding + audio + silence_padding).export(Path(temp_full_wav_path), format="wav")
 
             logger.info("未使用VAD，一次性处理整个文件……")
-            raw_subwords = transcribe_waveform(
-                model,
-                # 纯 Tensor 操作：全长切片 + Padding
-                torch.nn.functional.pad(waveform, (int(PAD_SECONDS * SAMPLERATE), int(PAD_SECONDS * SAMPLERATE)))
+            
+            # 同样走 batch 流程（虽然只有 1 个）
+            all_chunk_subwords_collection.append([]) # index 0
+            
+            batch_audio.append(
+                torch.nn.functional.pad(waveform, (int(PAD_SECONDS * SAMPLERATE), int(PAD_SECONDS * SAMPLERATE))).squeeze(0)
                 )
+            batch_meta.append({'chunk_index': 0, 'base_offset': 0.0})
+            flush_batch()
+            
+            if all_chunk_subwords_collection[0]:
+                chunk_results.append({
+                    "subwords": all_chunk_subwords_collection[0],
+                    "range": (0.0, total_audio_ms / 1000.0)
+                })
 
+        # --- 分支 B: 使用 VAD 分块 ---
         else:
             logger.info("【VAD】正在从本地路径加载 Pyannote-segmentation-3.0 模型……")
-            vad_model_load_start = time.time()  # <--- 计时开始
+            vad_model_load_start = time.time()
             onnx_session = onnxruntime.InferenceSession(
                 str(local_onnx_model_path), providers=["CPUExecutionProvider"]
             )
-            vad_model_load_end = time.time()  # <--- 计时结束
-            logger.info(f"【VAD】模型加载完成，将在 CPU 上运行")
-            logger.info("【VAD】正在使用 Pyannote-segmentation-3.0 侦测语音活动……")
+            vad_model_load_end = time.time()
+            logger.info(f"【VAD】模型加载完成")
 
-            # ==== 先做 VAD（双阈值 + 静音 + min_speech），不在此强制 30s ====
-            # ==== 获取VAD分块，并缓存完整的语音概率 ====
+            # 运行 VAD (代码逻辑保持不变)
             speeches, speech_probs, frame_duration_s = get_speech_timestamps_onnx(
-                waveform, # waveform shape: [1, T]
+                waveform,
                 onnx_session,
-                threshold=args.vad_threshold,
-                neg_threshold=args.vad_end_threshold,
-                min_speech_duration_ms=args.min_speech_duration_ms,
-                min_silence_duration_ms=args.min_silence_duration_ms
+                args.vad_threshold,
+                args.vad_end_threshold,
+                args.min_speech_duration_ms,
+                args.min_silence_duration_ms
             )
-            logger.info("【VAD】侦测完成")
 
             if not speeches:
                 logger.warn("【VAD】未侦测到语音活动")
-                return
+                return # 注意：这里如果在 try 块内 return，finally 块依然会执行
 
+            # 声学特征准备
             if args.auto_zcr or args.refine_tail:
-                speech_probs, _, zcr_array = prepare_acoustic_features(
-                    waveform, 
-                    speech_probs, 
-                    frame_duration_s, 
-                    args.zcr
-                )
+                speech_probs, _, zcr_array = prepare_acoustic_features(waveform, speech_probs, frame_duration_s, args.zcr)
 
+            # ZCR 阈值校准 
             # 确定最终使用的 ZCR 阈值
             final_zcr_threshold = args.zcr_threshold
+            # 只有开启了 ZCR 且开启了 Auto 才进行校准
             if args.auto_zcr:
-                # 只有开启了 ZCR 且开启了 Auto 才进行校准
-                if (calibrated_val := calibrate_zcr_threshold(
-                    speech_probs, zcr_array
-                )) is not None:
-                    final_zcr_threshold = calibrated_val
-                    logger.info(f"【ZCR】ZCR 自适应阈值已调整为：{final_zcr_threshold:.6f}")
-                else:
-                    logger.warn(f"【ZCR】自适应阈值校准失败，使用值 {final_zcr_threshold}")
+                if (calibrated := calibrate_zcr_threshold(speech_probs, zcr_array)) is not None:
+                    final_zcr_threshold = calibrated
 
-            # 合并所有重叠的 VAD 段
+            # 合并短块
             logger.debug("【VAD】正在合并短于1秒的语音块……")
-            if len(speeches) != len(merged_ranges_s := merge_short_segments_adaptive(
+            merged_ranges_s = merge_short_segments_adaptive(
                 speeches, 
                 MAX_SPEECH_DURATION_S
-            )):
+            )
+            if len(speeches) != len(merged_ranges_s):
                 logger.debug(f"【VAD】原 {len(speeches)} 个语音块已合并为 {len(merged_ranges_s)} 个语音块")
             else:
                 logger.debug(f"【VAD】没有需要合并的语音块")
+            
+            # 初始化结果收集器
+            all_chunk_subwords_collection = [[] for _ in range(len(merged_ranges_s))]
+            chunk_ranges_log = [] # 记录每一块的时间范围，用于最后的合并
 
-            chunk_results = []
-
-            if args.debug and audio:
+            if args.debug:
                 temp_chunk_dir = Path(tempfile.mkdtemp())
+
+            # 遍历一级块
             for i, (unpadded_start_s, unpadded_end_s) in enumerate(merged_ranges_s):
                 # --- 准备一级语音块 ---
                 # 计算包含静音保护的起止时间
                 start_ms = max(0, int(unpadded_start_s * 1000) - args.keep_silence)
                 end_ms = min(total_audio_ms, int(unpadded_end_s * 1000) + args.keep_silence)
-                # 一级切分：使用 slice_waveform_ms
+                
+                chunk_ranges_log.append((start_ms / 1000.0, end_ms / 1000.0))
+                
+                # 一级切片 (使用 Tensor 切片)
                 chunk = slice_waveform_ms(waveform, start_ms, end_ms)
+
                 # debug模式下为了检查才导出该块
-                if args.debug and audio:
+                if args.debug:
                     # 定义路径对象
                     chunk_audio = silence_padding + audio[start_ms:end_ms] + silence_padding
                     chunk_audio.export(temp_chunk_dir / f"chunk_{i + 1}.wav", format="wav")
-                
+
                 logger.info(
                     f"【VAD】正在处理语音块 {i + 1}/{len(merged_ranges_s)} （该块起止时间：{SRTWriter._format_time(unpadded_start_s)} --> {SRTWriter._format_time(unpadded_end_s)}，时长：{(unpadded_end_s - unpadded_start_s):.2f} 秒）",
                     end="", flush=True,
                     )
 
-                final_subwords_in_this_chunk = []
-
-                
-                # 设定阈值：如果块时长超过模型最大允许时长的 1/3，则视为“长块”，需要二次拆解
-                # 计算当前块的净时长
+                # 判断短块还是长块
                 if unpadded_end_s - unpadded_start_s <= MAX_SPEECH_DURATION_S / 3.0:
-                    # === 分支 A：短块，直接识别 ===
-                    logger.info(" --> 短块，直接识别")
+                    # === 短块 ===
+                    logger.info(" --> 短块，直接加入 Batch")
                     # 短块没有运行二次VAD，直接使用一级VAD的原始结束时间
                     vad_chunk_end_times_s.append(unpadded_end_s)
-
+                    
+                    # 加入 Batch
+                    batch_audio.append(chunk.squeeze(0))
                     # 坐标变换：全局时间 = 一级块偏移 + 相对时间
-                    for sub in transcribe_waveform(model, chunk):
-                        sub.seconds += start_ms / 1000.0
-                        final_subwords_in_this_chunk.append(sub)
+                    batch_meta.append({
+                        'chunk_index': i,
+                        'base_offset': start_ms / 1000.0
+                    })
+                
                 else:
-                    # === 分支 B：长块，执行二次 VAD 拆分后再识别 ===
-                    logger.info(" --> 长块，执行二次 VAD 拆分")
+                    # === 长块 (二次切分) ===
                     # 运行局部 VAD
                     sub_speeches, sub_speech_probs, sub_frame_duration_s = get_speech_timestamps_onnx(
                         chunk,
                         onnx_session,
-                        threshold=args.vad_threshold,
-                        neg_threshold=args.vad_end_threshold,
-                        min_speech_duration_ms=args.min_speech_duration_ms,
-                        min_silence_duration_ms=args.min_silence_duration_ms
+                        args.vad_threshold,
+                        args.vad_end_threshold,
+                        args.min_speech_duration_ms,
+                        args.min_silence_duration_ms
                     )
                     
                     if not sub_speeches:
@@ -1421,13 +1515,12 @@ def main():
                         # 构造一个覆盖整个 chunk 的虚拟 VAD 段
                         sub_speeches = [[0.0, chunk.shape[1] / SAMPLERATE]]
 
+                    # 局部特征计算
                     sub_speech_probs, sub_energy_array, sub_zcr_array = prepare_acoustic_features(
-                            chunk,
-                            sub_speech_probs,
-                            sub_frame_duration_s,
-                            args.zcr
-                        )
-
+                            chunk, sub_speech_probs, sub_frame_duration_s, args.zcr
+                    )
+                    
+                    # 智能切分 (Global Smart Segmenter)
                     nonsilent_ranges_s = [] 
                     for seg in sub_speeches:
                         # seg 是列表 [start, end]
@@ -1451,6 +1544,7 @@ def main():
                             f"【VAD】侦测到 {len(sub_speeches)} 个子语音块，保守拆分超过 {MAX_SPEECH_DURATION_S} 秒的部分"
                         )
 
+                    # 再次合并子块
                     refined_sub_speeches = []
                     for seg in merge_short_segments_adaptive(
                             nonsilent_ranges_s, 
@@ -1476,37 +1570,51 @@ def main():
                                 curr = next_cut - OVERLAP_S
 
                     if len(refined_sub_speeches) > 1:
-                        logger.info(f"    --> 需要识别 {len(refined_sub_speeches)} 个子片段")
-                        
-                    # 遍历二次拆分出的子块
+                        logger.info(f"    --> Batch 中加入 {len(refined_sub_speeches)} 个子片段：")
+
+                    # 遍历子块加入 Batch
                     for sub_idx, sub_seg in enumerate(refined_sub_speeches):
                         # sub_seg 是相对于 chunk (已含Padding) 的秒数
                         # 提取子块音频并加上静音保护
                         sub_chunk = slice_waveform_ms(chunk, int(sub_seg[0] * 1000), int(sub_seg[1] * 1000))
+                        
                         # Debug 时导出临时子块文件
-                        if args.debug and audio:
+                        if args.debug:
                             (silence_padding + chunk_audio[int(sub_seg[0] * 1000):int(sub_seg[1] * 1000)] + silence_padding).export(
                                 (temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav"), format="wav"
                                 )
 
                         if len(refined_sub_speeches) != 1:
-                            logger.info(f"第 {i + 1}-{sub_idx + 1} 段 {sub_seg[1] - sub_seg[0]:.2f} 秒：")
+                            logger.info(f"第 {i + 1}-{sub_idx + 1} 段 {SRTWriter._format_time(sub_seg[0])} --> {SRTWriter._format_time(sub_seg[1])}，时长：{sub_seg[1] - sub_seg[0]:.2f} 秒")
                         
-                        # 识别子块内容
-                        # 最终时间 = 一级块全局偏移 + 二级块在一级块内的偏移 + 识别出的相对时间
-                        # 因为 sub_seg["start"] 是基于含填充的父chunk计算的，它包含了父chunk头部的 0.5s 静音，必须扣除
-                        base_offset = start_ms / 1000.0 + sub_seg[0] - PAD_SECONDS
-                        for sub in transcribe_waveform(model, sub_chunk):
-                            sub.seconds += base_offset
-                            final_subwords_in_this_chunk.append(sub)
+                        batch_audio.append(sub_chunk.squeeze(0))
+                        batch_meta.append({
+                            'chunk_index': i,
+                            # 最终时间 = 一级块全局偏移 + 二级块在一级块内的偏移 + 识别出的相对时间
+                            # 因为 sub_seg["start"] 是基于含填充的父chunk计算的，它包含了父chunk头部的 0.5s 静音，必须扣除
+                            'base_offset': (start_ms / 1000.0 + sub_seg[0] - PAD_SECONDS)
+                        })
+                        
+                        # 如果 batch 满了，立即执行
+                        if len(batch_audio) >= BATCH_SIZE:
+                            flush_batch()
 
-                # --- 结果收集 ---
-                if final_subwords_in_this_chunk:
+                # 每一级块循环末尾，检查 batch 是否满了
+                if len(batch_audio) >= BATCH_SIZE:
+                    flush_batch()
+
+            # 循环结束后，处理剩余的 batch
+            flush_batch()
+
+            # 整理结果结构 (Chunk Results)
+            for i, subwords in enumerate(all_chunk_subwords_collection):
+                if subwords:
                     chunk_results.append({
-                        "subwords": final_subwords_in_this_chunk,
-                        "range": (start_ms / 1000.0, end_ms / 1000.0)
+                        "subwords": subwords,
+                        "range": chunk_ranges_log[i]
                     })
-
+            
+            # 去重
             if chunk_results:
                 # 所有块处理完后，再执行一次合并，如果只有一个块，无需合并
                 logger.debug("【VAD】所有语音块处理完毕，正在去重……")
