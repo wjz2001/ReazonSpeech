@@ -391,7 +391,7 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
 
                 if len(text) > SUBWORDS_PER_SEGMENTS * 2:
                     logger.warn(
-                        f"{SRTWriter._format_time(curr_start)} --> {SRTWriter._format_time(curr_end)} 段字数超过 {len(text)} "
+                        f"{SRTWriter._format_time(curr_start)} --> {SRTWriter._format_time(curr_end)} 段字数超过 {SUBWORDS_PER_SEGMENTS * 2}，制作字幕时有可能溢出屏幕 "
                     )
 
         # 更新外层循环游标
