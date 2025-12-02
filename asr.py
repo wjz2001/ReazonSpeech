@@ -211,8 +211,8 @@ def auto_tune_batch_size(model, max_seg_sec):
     torch.cuda.empty_cache()
     
     
-    # 计算理论最大值，至少为 1，且不超过内部硬上限 16（经验值，再大可能会增加延迟），0.7是安全限制
-    return max(1, min(int(torch.cuda.mem_get_info(device)[0] * 0.7) // per_sample, 16))
+    # 计算理论最大值，至少为 1，且不超过内部硬上限 16（经验值，再大可能会增加延迟），0.7和2是安全限制
+    return max(1, min(int(torch.cuda.mem_get_info(device)[0] * 0.7) // per_sample // 2, 16))
 
 def calculate_frame_cost(frame_idx, speech_probs, energy_array, vad_threshold, zcr_threshold, zcr_array):
     """计算单帧作为切分点的代价（代价越低越适合切分）。
@@ -1302,10 +1302,10 @@ def main():
                 logger.info(f"自动估算 Batch Size 值为 {BATCH_SIZE}")
             else:
                 BATCH_SIZE = 1
-                logger.info("仅使用 CPU 时默认 Batch Size 为 1")
+                logger.info("仅使用 CPU 时默认 Batch Size 值为 1")
         else:
             BATCH_SIZE = args.batch_size
-            logger.info(f"使用用户指定 Batch Size: {BATCH_SIZE}")
+            logger.info(f"用户指定 Batch Size 值为 {BATCH_SIZE}")
 
         if args.beam != model.cfg.decoding.beam.beam_size:
             # 使用深拷贝来完全复制原始配置，确保它不受任何后续修改的影响
