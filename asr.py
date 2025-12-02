@@ -998,7 +998,7 @@ def main():
         type=int,
         choices=range(4, 257), # range(4, 257) 包含 4 到 256，不包含 257
         default=4,
-        metavar="[4-64]", # 设置这个参数，帮助信息里就会显示为 [4-64]，而不是列出几十个数字
+        metavar="[4-256]", # 设置这个参数，帮助信息里就会显示为 [4-256]，而不是列出几十个数字
         help="设置集束搜索（Beam Search）宽度，范围为 4 到 257 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
         )
 
@@ -1348,7 +1348,7 @@ def main():
                         verbose=False
                     )[0] # 取元组第 0 个元素，即结果列表
                 except RuntimeError as e:
-                    if isinstance(e, torch.cuda.OutOfMemoryError) in str(e):
+                    if isinstance(e, torch.cuda.OutOfMemoryError):
                         logger.warn("显存不足，当前批次回退为逐条推理……")
                         # 清理一下碎片腾空间
                         if torch.cuda.is_available():
