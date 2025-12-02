@@ -220,7 +220,7 @@ echo.
 
 set "beamParams="  REM 首先确保变量为空
 
-set /p "beamSize=输入 beam_size（集束搜索宽度，默认：4，范围：4~64（仅整数），更大的值可能更准确但更慢）："
+set /p "beamSize=输入 beam_size（集束搜索宽度，默认：4，范围：4~256（仅整数），更大的值可能更准确但更慢）："
 
 if NOT "!beamSize!"=="" (
     set "beamParams= --beam !beamSize!"

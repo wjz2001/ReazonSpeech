@@ -313,13 +313,6 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
             vad_limit=current_vad_limit
         ))
 
-    # --- 动态计算停顿阈值 ---
-    pause_threshold = float("inf") # 默认阈值为无穷大，即默认禁用此功能
-    # 只有当有足够多的数据点（例如超过20个子词间隔）时，才计算并启用阈值
-    MIN_SAMPLES_FOR_THRESHOLD = SUBWORDS_PER_SEGMENTS * 2
-    if len(durations) > MIN_SAMPLES_FOR_THRESHOLD:
-        pause_threshold = np.percentile(durations, 95) 
-
     all_segments = []
     start = 0
 
@@ -332,14 +325,18 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
             
         # 确定当前 VAD 块内的搜索边界
         end_idx = min(next_group_start_idx - 1, find_end_of_segment(all_subwords, start))
-        # 基于语速/停顿的边界补充
+        # --- 动态计算停顿阈值 ---
         pause_split_indices = []
-        if (end_idx - start + 1) > MIN_SAMPLES_FOR_THRESHOLD:
-            # 使用列表推导式直接筛选
-            pause_split_indices = [
-                start + k for k, d in enumerate(durations[start:end_idx]) 
-                if d > pause_threshold
-            ]
+        # 只有当有足够多的数据点（例如超过20个子词间隔）时，才计算并启用阈值
+        if len(durations[start:end_idx]) > SUBWORDS_PER_SEGMENTS * 1.5:
+            # 基于语速/停顿的边界补充
+            if (end_idx - start + 1) > SUBWORDS_PER_SEGMENTS * 1.5:
+                pause_threshold = np.percentile(durations[start:end_idx], 90)
+                # 使用列表推导式直接筛选
+                pause_split_indices = [
+                    start + k for k, d in enumerate(durations[start:end_idx]) 
+                    if d > pause_threshold
+                ]
 
         # 调试日志逻辑
         if logger.debug_mode and pause_split_indices:
@@ -990,18 +987,19 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        choices=range(1, 128),
+        choices=range(1, 129),
         default=None,
+        metavar="[1-128]",
         help="设置语音识别批量推理的大小，数字越大批量推理的速度越快，超过16可能会增加延迟，不填则自动根据显存估算（只使用 CPU 则默认为 1）",
         )
 
     parser.add_argument(
         "--beam",
         type=int,
-        choices=range(4, 65), # range(4, 65) 包含 4 到 64，不包含 65
+        choices=range(4, 257), # range(4, 257) 包含 4 到 256，不包含 257
         default=4,
         metavar="[4-64]", # 设置这个参数，帮助信息里就会显示为 [4-64]，而不是列出几十个数字
-        help="设置集束搜索（Beam Search）宽度，范围为 4 到 64 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
+        help="设置集束搜索（Beam Search）宽度，范围为 4 到 257 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
         )
 
     parser.add_argument(
@@ -1350,7 +1348,7 @@ def main():
                         verbose=False
                     )[0] # 取元组第 0 个元素，即结果列表
                 except RuntimeError as e:
-                    if "CUDA out of memory" in str(e):
+                    if isinstance(e, torch.cuda.OutOfMemoryError) in str(e):
                         logger.warn("显存不足，当前批次回退为逐条推理……")
                         # 清理一下碎片腾空间
                         if torch.cuda.is_available():
