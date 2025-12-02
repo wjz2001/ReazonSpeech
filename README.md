@@ -84,7 +84,7 @@ python asr.py 文件路径
 | 参数 | 作用 | 默认值 |
 |-----------|:-------------:|:---------:|
 | `--no-chunk` | 禁止使用VAD | `无` |
-| `--vad_threshold` | VAD判断为语音的置信度阈值（0-1） | `0.4` |
+| `--vad_threshold` | VAD判断为语音的置信度阈值（0.05-1） | `0.4` |
 | `--vad_end_threshold` | VAD判断为语音结束后静音的置信度阈值（0.05-1） | `vad_threshold的值减去0.15` |
 | `--min_speech_duration_ms` | 移除短于此时长（毫秒）的语音块 | `100` |
 | `--min_silence_duration_ms` | 短于此时长（毫秒）的语音块不被视为间隔 | `200` |

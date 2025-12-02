@@ -97,7 +97,7 @@ echo.
 
 echo 请输入新数值，或直接按回车以使用默认值
 
-set /p "vadThresh=输入 vad_threshold（语音置信度，默认：0.4，范围：0~1）："
+set /p "vadThresh=输入 vad_threshold（语音置信度，默认：0.4，范围：0.05~1）："
 if defined vadThresh set "chunkParams=!chunkParams! --vad_threshold !vadThresh!"
 
 set /p "vadEndThresh=输入 vad_end_threshold（语音是否结束置信度，默认：智能，范围：0.05~1）："
@@ -210,7 +210,7 @@ echo 请输入新数值，或直接按回车以使用默认值
 
 REM --- 新增：询问 Batch Size ---
 set "batchParams="
-set /p "batchSize=输入 batch_size（批量推理大小，默认：自动估算，范围：1~128（仅整数），超过16可能会增加延迟）："
+set /p "batchSize=输入 batch_size（批量推理大小，默认：自动估算，范围：1~1280（仅整数），超过16可能会增加延迟）："
 
 if NOT "!batchSize!"=="" (
     set "batchParams= --batch-size !batchSize!"
