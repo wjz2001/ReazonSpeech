@@ -1,7 +1,6 @@
 import argparse
 import copy
 import ctypes
-import math
 import os
 import threading
 import tempfile
@@ -25,7 +24,7 @@ if sys.platform == "win32":
 else:
     import resource  
 
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 from pydub import AudioSegment
 from omegaconf import open_dict
@@ -66,9 +65,18 @@ class Logger:
 logger = Logger()
 
 # === 内存 / 显存监控 ===
+# 设定最大保留样本数。假设 interval=0.5s，保留 14400 个样本相当于保留最近 2 小时的数据
+# 超过这个时间的数据会被丢弃，避免内存无限增长
 MEM_SAMPLES = {
-    "ram_gb": [],
-    "gpu_gb": [],
+    "ram_gb": deque(maxlen=14400),
+    "gpu_gb": deque(maxlen=14400),
+}
+
+# 额外增加一个字典，用于单独记录“全过程历史峰值”
+# 因为 deque 会丢弃旧数据，如果峰值发生在很久以前，deque 里就找不到了
+MEM_PEAKS = {
+    "ram_gb": 0.0,
+    "gpu_gb": 0.0,
 }
 
 if sys.platform == "win32":
@@ -135,7 +143,7 @@ else:
                                 return kb / (1024 ** 2)  # GB
             except FileNotFoundError:
                 pass  # 某些精简系统可能没有 /proc/self/status
-    
+
         # 退化方案：用 resource 的 ru_maxrss（历史最大常驻集）
         if resource is not None:
             try:
@@ -151,18 +159,28 @@ else:
 
         # 实在拿不到就返回 None
         return None
+
 def _memory_monitor(stop_event, device, interval=0.5):
     """
-    后台线程：周期性采样当前进程的 RAM 和 GPU 显存使用情况。
+    后台线程：周期性采样当前进程的 RAM 和 GPU 显存使用情况
     interval: 采样间隔（秒），表示每几秒采样一次，可按需要调大/调小
     """
     while not stop_event.is_set():
-        # 进程 RAM（GB）
-        MEM_SAMPLES["ram_gb"].append(_get_ram_gb_sample())
+        # --- 获取 RAM ---
+        if _get_ram_gb_sample() is not None:
+            MEM_SAMPLES["ram_gb"].append(_get_ram_gb_sample())
+            # 更新历史最大值
+            if _get_ram_gb_sample() > MEM_PEAKS["ram_gb"]:
+                MEM_PEAKS["ram_gb"] = _get_ram_gb_sample()
 
+        # --- 获取 GPU ---
         # 如果有 CUDA，就记录一次显存
         if torch.cuda.is_available():
+            # torch.cuda.memory_allocated 返回的是字节 
             MEM_SAMPLES["gpu_gb"].append(torch.cuda.memory_allocated(device) / (1024 ** 3))
+            # 更新历史最大值
+            if torch.cuda.memory_allocated(device) / (1024 ** 3) > MEM_PEAKS["gpu_gb"]:
+                MEM_PEAKS["gpu_gb"] = torch.cuda.memory_allocated(device) / (1024 ** 3)
 
         time.sleep(interval)
 
@@ -176,12 +194,17 @@ def _calc_mode(samples):
     bin_size = 0.05
     if not samples:
         return None, 0
-    most_bin, freq = Counter([int(x // bin_size) * bin_size for x in samples]).most_common(1)[0]
+    most_bin, freq = Counter([int(x // bin_size) * bin_size for x in list(samples)]).most_common(1)[0]
     # 返回区间中点更直观一点
     return most_bin + bin_size / 2.0, freq
 # === 内存 / 显存监控结束 ===
 
-def auto_tune_batch_size(model, max_seg_sec):
+OVERLAP_S = 1.0  # 此处定义重叠时长
+# 全局变量：用于缓存加载好的模型
+_ASR_MODEL = None
+_ASR_MODEL_LOAD_COST = 0.0
+
+def auto_tune_batch_size(model, max_duration_s):
     """
     根据显存自动估算 Batch Size
     """
@@ -196,11 +219,9 @@ def auto_tune_batch_size(model, max_seg_sec):
 
     try:
         with torch.inference_mode():
-            _ = model.transcribe(
-                # 构造 dummy 数据 (30s 空白音频)
-                audio=[torch.zeros(int(max_seg_sec * SAMPLERATE), dtype=torch.float32)],
-                batch_size=1, return_hypotheses=True, verbose=False
-                )
+            # 构造 dummy 数据 (30s 空白音频)
+            _ = transcribe_audio(model, [torch.zeros(int(max_duration_s * SAMPLERATE), dtype=torch.float32)])
+
     except RuntimeError:
         return 1 # OOM 或其他错误，回退到 1
 
@@ -210,27 +231,6 @@ def auto_tune_batch_size(model, max_seg_sec):
     
     # 计算理论最大值，至少为 1，0.7和2是安全限制
     return max(1, int(torch.cuda.mem_get_info(device)[0] * 0.7) // per_sample // 2)
-
-def calculate_frame_cost(frame_idx, speech_probs, energy_array, vad_threshold, zcr_threshold, zcr_array):
-    """计算单帧作为切分点的代价（代价越低越适合切分）。
-       ZCR 判定使用 max(|x1|, |x2|) > th。
-    """
-    # 基础 VAD 概率成本
-    if speech_probs[frame_idx] > vad_threshold:
-        return 100.0 # 惩罚高概率点，强硬约束,确信是语音的地方绝不切
-
-    # --- 动态抗噪过零率 (Robust ZCR) ---
-    # 逻辑：(过零) AND (穿越点的幅度足够大，不仅是微小抖动)
-    # 标准做法：check max(abs(x[n]), abs(x[n+1])) > th
-    zcr_cost = 0.0
-    if zcr_array is not None:
-        if zcr_array[frame_idx] > zcr_threshold: 
-            zcr_cost = zcr_array[frame_idx] * 50.0 
-
-    # 局部平滑度 (斜率)
-    slope_cost = abs(speech_probs[frame_idx + 1] - speech_probs[frame_idx - 1]) * 2.0
-
-    return speech_probs[frame_idx] + min(energy_array[frame_idx], 0.5) * 10.0 + slope_cost + zcr_cost
 
 def calibrate_zcr_threshold(speech_probs, zcr_array):
     """
@@ -261,7 +261,7 @@ def calibrate_zcr_threshold(speech_probs, zcr_array):
     logger.debug(f"【ZCR】浊音 P90 = {tau_v:.6f}，非语音 P10 = {tau_u:.6f}，计算阈值 = {adaptive_th:.6f}")
     return adaptive_th
 
-def convert_audio_to_tensor(initial_audio):
+def convert_audio_to_tensor(audio_segment):
     """
     将 Pydub AudioSegment 转换为 PyTorch Tensor (float32, [-1, 1])。
     使用 np.frombuffer 读 int16，再用 torch.tensor 拷贝到 GPU/CPU 张量
@@ -270,7 +270,7 @@ def convert_audio_to_tensor(initial_audio):
     # [T] float32
     # 归一化到 [-1, 1]
     # 升维 [1, T]
-    return torch.tensor(np.frombuffer(initial_audio.raw_data, dtype=np.int16), dtype=torch.float32).div_(32768.0).unsqueeze(0)
+    return torch.tensor(np.frombuffer(audio_segment.raw_data, dtype=np.int16), dtype=torch.float32).div_(32768.0).unsqueeze(0)
 
 def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, total_duration_s, no_remove_punc):
 
@@ -287,7 +287,7 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
         # 利用短路逻辑：如果 vad_chunk_end_times_s 为空，循环不会执行
         while vad_cursor < len(vad_chunk_end_times_s) and sub.seconds > vad_chunk_end_times_s[vad_cursor]:
             vad_cursor += 1
-        # 最后一段没有vad边界，用整个音频的总时长作为边界
+        # 最后一段没有vad边界，或者 no_chunk 模式下 vad_chunk_end_times_s 列表为空，用整个音频的总时长作为边界
         current_vad_limit = vad_chunk_end_times_s[vad_cursor] if vad_cursor < len(vad_chunk_end_times_s) else total_duration_s
 
         # 计算最终结束时间逻辑：取 (开始+step) 和 (min(下一个开始, VAD限制)) 中的较大者
@@ -421,42 +421,6 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
 
     return all_segments, all_subwords
 
-def find_optimal_splits_dp_strict(candidates, num_cuts, start_frame, end_frame, frame_duration_s, max_duration_s):
-    """严格硬约束的动态规划算法。"""
-    max_frames = int(max_duration_s / frame_duration_s)
-    min_frames = int(1.0 / frame_duration_s) 
-    
-    dp = [[(float("inf"), []) for _ in range(len(candidates))] for _ in range(num_cuts + 1)]
-
-    # 第一刀
-    for j in range(len(candidates)):
-        if min_frames <= (cut_frame := candidates[j]["frame"]) - start_frame <= max_frames:
-            dp[1][j] = (candidates[j]["cost"], [cut_frame])
-
-    # 后续每一刀
-    for i in range(2, num_cuts + 1):
-        for j in range(i - 1, len(candidates)):
-            curr_frame = candidates[j]["frame"]
-            for k in range(i - 2, j):
-                if min_frames <= curr_frame - candidates[k]["frame"] <= max_frames:
-                    prev_cost, prev_path = dp[i-1][k]
-                    if prev_cost != float("inf"):
-                        new_total_cost = prev_cost + candidates[j]["cost"]
-                        if new_total_cost < dp[i][j][0]:
-                            dp[i][j] = (new_total_cost, prev_path + [curr_frame])
-
-    # 最终检查
-    final_best_cost = float("inf")
-    final_best_path = []
-    for j in range(num_cuts - 1, len(candidates)):
-        if min_frames <= end_frame - candidates[j]["frame"] <= max_frames:
-            cost, path = dp[num_cuts][j]
-            if cost < final_best_cost:  # ✅ 比较成本
-                final_best_cost = cost
-                final_best_path = path
-
-    return final_best_path
-
 def format_duration(seconds):
     """将秒数格式化为 'X时Y分Z.ZZ秒' 的形式"""
     hours, remainder = divmod(seconds, 3600)
@@ -473,9 +437,6 @@ def format_duration(seconds):
 
     return "".join(parts)
 
-# 全局变量：用于缓存加载好的模型
-_ASR_MODEL = None
-_ASR_MODEL_LOAD_COST = 0.0
 def get_asr_model():
     """
     获取 Reazonspeech 模型的单例
@@ -564,23 +525,63 @@ def get_speech_timestamps_onnx(
     # 完整的语音概率数组 speech_probs 和每一帧的持续时间 frame_duration_s
     return speeches, speech_probs, frame_duration_s
 
-def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_duration_s, max_duration_s, vad_threshold, zcr_threshold, zcr_array, overlap_s):
+def global_smart_segmenter(
+    start_s, end_s, speech_probs,
+    energy_array, frame_duration_s, max_duration_s,
+    vad_threshold, zcr_threshold, zcr_array):
     """
-    入口函数：分析一个长 VAD 段，返回切割好的子段列表。
+    入口函数：分析一个长 VAD 段，返回切割好的子段列表
+    - 如果 > max_duration_s：
+        * 在低 VAD 概率的局部极小值处生成候选点，并计算 cost
+        * 从左到右贪心切分
+        * 每个切出来的片段（除了特别短的整段）时长 > OVERLAP_S
+        * 相邻片段之间有 OVERLAP_S 的重叠
     """
+    def _frame_cost(frame_idx):
+        """计算单帧作为切分点的代价（代价越低越适合切分）。
+           ZCR 判定使用 max(|x1|, |x2|) > th。
+        """
+        # 基础 VAD 概率成本
+        if speech_probs[frame_idx] > vad_threshold:
+            return 100.0 # 惩罚高概率点，强硬约束,确信是语音的地方绝不切
+    
+        # --- 动态抗噪过零率 (Robust ZCR) ---
+        # 逻辑：(过零) AND (穿越点的幅度足够大，不仅是微小抖动)
+        # 标准做法：check max(abs(x[n]), abs(x[n+1])) > th
+        zcr_cost = 0.0
+        if zcr_array is not None:
+            if zcr_array[frame_idx] > zcr_threshold: 
+                zcr_cost = zcr_array[frame_idx] * 50.0 
+    
+        # 局部平滑度 (斜率)
+        slope_cost = abs(speech_probs[frame_idx + 1] - speech_probs[frame_idx - 1]) * 2.0
+    
+        return speech_probs[frame_idx] + min(energy_array[frame_idx], 0.5) * 10.0 + slope_cost + zcr_cost
 
-    # 计算必须切几刀
-    if (num_cuts := max(0, math.ceil((end_s - start_s) / (max_duration_s - overlap_s)) - 1)) == 0:
+    def _hard_split(start_s, end_s):
+        """
+        只按 max_duration_s 做硬切分，段与段之间保留 OVERLAP_S 重叠
+        """
+        segments = []
+        curr = start_s
+        while curr < end_s:
+            next_cut = curr + max_duration_s
+            if next_cut >= end_s:
+                segments.append([curr, end_s])
+                break
+            segments.append([curr, next_cut])
+            curr = next_cut - OVERLAP_S
+        return segments
+
+    # 时长不超长直接返回
+    if end_s - start_s <= max_duration_s:
         return [[start_s, end_s]]
 
-    start_frame = int(start_s / frame_duration_s)
-    end_frame = int(end_s / frame_duration_s)
-
-    # 生成候选点 (筛选 VAD 概率 < max(0.15, vad_threshold - 0.1) 的局部低点)
+    # 生成候选点 (筛选 VAD 概率 < max(0.15, vad_threshold - 0.15) 的局部低点)
     candidates = []
-    # 边界保护
-    search_start = start_frame + int(1.0 / frame_duration_s)
-    search_end = min(len(speech_probs), end_frame - int(1.0 / frame_duration_s))
+    # 边界保护，至少预留 1 秒的缓冲，避免切在段首/段尾靠得太近的地方
+    search_start = int(start_s / frame_duration_s) + int(OVERLAP_S / frame_duration_s)
+    search_end = min(len(speech_probs), int(end_s / frame_duration_s) - int(OVERLAP_S / frame_duration_s))
 
     # 提取搜索区间的概率
     # search_end > search_start + 2 是为了确保区间内至少有 3 帧数据
@@ -588,42 +589,66 @@ def global_smart_segmenter(start_s, end_s, speech_probs, energy_array, frame_dur
     # 这对应了下方的切片逻辑：[1:-1] (curr), [:-2] (prev), [2:] (next)
     # 如果总帧数少于 3 (即 end - start <= 2)，切片后的维度将无法对齐或为空，因此跳过
     if search_end > search_start + 2:
-        # 利用 numpy 寻找局部极小值且概率 < max(0.15, vad_threshold - 0.1) 的点
-        # 逻辑：当前点 <= 前一点 AND 当前点 <= 后一点 AND 当前点 < max(0.15, vad_threshold - 0.1)
+        # 利用 numpy 寻找局部极小值且概率 < max(0.15, vad_threshold - 0.15) 的点
+        # 逻辑：当前点 <= 前一点 AND 当前点 <= 后一点 AND 当前点 < max(0.15, vad_threshold - 0.15)
         p_curr = speech_probs[search_start+1:search_end-1] # 对应原数组的索引 i
         p_prev = speech_probs[search_start:search_end-2] # 对应 i-1
         p_next = speech_probs[search_start+2:search_end] # 对应 i+1
 
         # 生成布尔掩码
-        mask = (p_curr < max(0.15, vad_threshold - 0.1)) & (p_curr <= p_prev) & (p_curr <= p_next)
+        mask = (p_curr < max(0.15, vad_threshold - 0.15)) & (p_curr <= p_prev) & (p_curr <= p_next)
         
         # 获取满足条件的相对索引
         # 还原绝对索引：+1 是因为 p_curr 从切片的第1个元素开始，+search_start 是切片偏移
         # 遍历筛选出的索引计算成本
         for idx in (np.where(mask)[0] + 1 + search_start):
-            cost = calculate_frame_cost(idx, speech_probs, energy_array, vad_threshold, zcr_threshold, zcr_array)
-            candidates.append({"frame": idx, "cost": cost})
-    
-    # 执行 DP
-    best_cuts_frames = []
-    if len(candidates) >= num_cuts:
-        best_cuts_frames = find_optimal_splits_dp_strict(
-            candidates, num_cuts, start_frame, end_frame, frame_duration_s, (max_duration_s - overlap_s)
-        )
-    
-    # 构建结果
-    if not best_cuts_frames:
-        # 如果找不到最佳切点，直接返回原始的长段落，把切分决策交给后续流程
-        return [[start_s, end_s]]
-        
-    final_segments = []
-    segment_start_s = start_s
-    for cut_frame in best_cuts_frames:
-        final_segments.append([segment_start_s, (split_s := cut_frame * frame_duration_s)])
-        segment_start_s = split_s - overlap_s
-    final_segments.append([segment_start_s, end_s])
+            candidates.append({"frame": idx, "time": idx * frame_duration_s, "cost": _frame_cost(idx)})
 
-    return final_segments
+    # 一个候选点都没有：退化为纯时间硬切分
+    if not candidates:
+        return _hard_split(start_s, end_s)
+    
+    segments = []
+    curr_start = start_s
+
+    # 初始化索引指针，指向 candidates 列表的开头
+    cand_idx = 0 
+    while True:
+        # 剩余长度已经不超过上限，直接收尾
+        if end_s - curr_start <= max_duration_s:
+            segments.append([curr_start, end_s])
+            break
+
+        # 向前移动指针：跳过那些已经“掉出”窗口左侧的旧候选点
+        # 要找 c["time"] > curr_start + OVERLAP_S
+        while cand_idx < len(candidates) and candidates[cand_idx]["time"] <= curr_start + OVERLAP_S:
+            cand_idx += 1
+
+        # 收集当前窗口内的候选点
+        cands = []
+        # 使用一个临时游标 temp_idx 向后扫描，直到超出窗口右侧
+        # 不修改 cand_idx，因为下一个窗口可能还会用到当前的起始点，如果有重叠或回退逻辑
+        temp_idx = cand_idx
+        while temp_idx < len(candidates):
+            c = candidates[temp_idx]
+            if c["time"] > curr_start + max_duration_s:
+                # 因为列表是有序的，一旦超过右边界，后面的都不用看了
+                break 
+            cands.append(c)
+            temp_idx += 1
+
+        if cands:
+            # 直接选 cost 最小的那个
+            cut_t = min(cands, key=lambda c: c["cost"])["time"]
+        else:
+            # 当前窗口里没有任何合适候选，只能在 max_duration_s 位置硬切
+            cut_t = curr_start + max_duration_s
+
+        segments.append([curr_start, cut_t])
+        # 下一段从 cut_t - OVERLAP_S 开始
+        curr_start = cut_t - OVERLAP_S
+
+    return segments
 
 def merge_overlap_dedup(chunk_results):
     """重叠区域：文本相同则去重，否则保留双方并打印提示"""
@@ -633,10 +658,8 @@ def merge_overlap_dedup(chunk_results):
     
     def _is_essentially_empty(chars):
         """判断 chars 列表是否实质上为空（即为空列表，或仅包含TOKEN_PUNC）"""
-        # 将所有 chars 拼接后检查，如果只有空格或空字符串，视为空
-        text = "".join(chars).strip()
-        # 检查是否所有字符都在TOKEN_PUNC集合中
-        return not text or all(char in TOKEN_PUNC for char in text)
+        # 如果是空列表，或者所有元素都是空字符或标点
+        return not chars or all(not c.strip() or c in TOKEN_PUNC for c in chars)
 
     merged = list(chunk_results[0]["subwords"])
 
@@ -709,7 +732,7 @@ def merge_short_segments_adaptive(segments, max_duration):
     while i < len(working_segments):
         seg = working_segments[i]
 
-        if (seg_duration := seg[1] - seg[0]) <= 1: # 短于 1 才合并
+        if (seg_duration := seg[1] - seg[0]) <= 1: # 不大于 1 秒才合并
             # 获取前后邻居
             prev_seg = result[-1] if result else None
             next_seg = working_segments[i + 1] if i + 1 < len(working_segments) else None
@@ -784,7 +807,7 @@ def prepare_acoustic_features(waveform, speech_probs, frame_duration_s, use_zcr)
     """计算并对齐声学特征（能量、ZCR），供智能切分使用"""
 
     # 计算帧长
-    frame_length = int(round(frame_duration_s * SAMPLERATE))
+    frame_length = round(frame_duration_s * SAMPLERATE)
     
     # 计算能量 (Standard Deviation)
     # 逻辑：Var = E[x^2] - (E[x])^2，等同于对每一帧执行 torch.std(chunk, unbiased=False)
@@ -840,7 +863,7 @@ def prepare_acoustic_features(waveform, speech_probs, frame_duration_s, use_zcr)
         
         # 向量化计算过零
         # 逻辑：(过零) AND (至少一边是大音量)
-        zcr_tensor = torch.nn.functional.avg_pool1d(
+        zcr_array = torch.nn.functional.avg_pool1d(
             # 向量化计算所有采样点的过零情况 (1, T-1)
             # 等价于 chunk[:-1] * chunk[1:]
             # 逻辑或: 左边响 OR 右边响
@@ -849,9 +872,7 @@ def prepare_acoustic_features(waveform, speech_probs, frame_duration_s, use_zcr)
             kernel_size=frame_length,
             stride=frame_length,
             ceil_mode=True # 保证处理尾部
-        ).view(-1) # 使用 .view(-1) 将输出展平为一维向量
-        
-        zcr_array = zcr_tensor.numpy()
+        ).view(-1).numpy() # 使用 .view(-1) 将输出展平为一维向量
 
     # 对齐长度
     # 防止 pooling 的 ceil_mode 导致多出一帧，或者 VAD 模型输出少一帧的情况
@@ -939,25 +960,21 @@ def slice_waveform_ms(waveform, start_ms, end_ms):
     高效 Tensor 切片与 Padding
     waveform: [1, T]
     """
-    def ms_to_index(ms):
-        """【新增】毫秒 -> 采样点下标"""
-        return max(0, int(round(ms * SAMPLERATE / 1000.0)))
-
-    # 边界限制
-    start_idx = ms_to_index(start_ms)
-    end_idx = ms_to_index(end_ms)
-
-    # 切片 (View 操作，零内存拷贝)
-    # Padding (如果需要)
-    # F.pad: (padding_left, padding_right)
-    chunk = torch.nn.functional.pad(
-        waveform[:, start_idx:end_idx], (ms_to_index(int(PAD_SECONDS * 1000)), ms_to_index(int(PAD_SECONDS * 1000)))
+    # 边界限制并切片 (View 操作，零内存拷贝)
+    # F.pad: (padding_left, padding_right)，pad 操作会产生副本
+    return torch.nn.functional.pad(
+        waveform[:, max(0, round(start_ms * SAMPLERATE / 1000.0)):round(end_ms * SAMPLERATE / 1000.0)],
+        (round(PAD_SECONDS * SAMPLERATE), round(PAD_SECONDS * SAMPLERATE))
         )
 
-    return chunk
+def transcribe_audio(model, audio, batch_size=1):
+    """
+    封装转录逻辑：调用模型 -> 解码 -> 返回子词列表。
+    如果失败或无结果，返回空列表。
+    """
+    return model.transcribe(audio=audio, batch_size=batch_size, return_hypotheses=True, verbose=False)
 
 def main():
-    OVERLAP_S = 1.0  # 此处定义重叠时长
     # --- 设置命令行参数解析 ---
     parser = argparse.ArgumentParser(
         description="使用 ReazonSpeech 模型识别语音，并按指定格式输出结果。基于静音的智能分块方式识别长音频，以保证准确率并解决显存问题"
@@ -1340,12 +1357,8 @@ def main():
             # ---- 第一次尝试：用当前 batch_size 一次性跑完 ----
             try:
                 with torch.inference_mode():
-                    hyps = model.transcribe(
-                        audio=batch_audio,
-                        batch_size=len(batch_audio),
-                        return_hypotheses=True,
-                        verbose=False,
-                    )[0]  # 取元组第 0 个元素，即结果列表
+                    hyps = transcribe_audio(model, batch_audio, len(batch_audio))[0]  # 取元组第 0 个元素，即结果列表
+    
             except RuntimeError as e:
                 if _is_oom_error(e):
                     hit_oom = True
@@ -1366,12 +1379,7 @@ def main():
         
                 with torch.inference_mode():
                     # 回退为逐条推理（内部会顺序处理整个 batch_audio 列表）
-                    hyps = model.transcribe(
-                        audio=batch_audio,
-                        batch_size=1,
-                        return_hypotheses=True,
-                        verbose=False,
-                    )[0]
+                    hyps = transcribe_audio(model, batch_audio)[0]
 
             # 处理结果
             for hyp, meta in zip(hyps, batch_meta):
@@ -1401,9 +1409,7 @@ def main():
             # 同样走 batch 流程（虽然只有 1 个）
             all_chunk_subwords_collection.append([]) # index 0
             
-            batch_audio.append(
-                torch.nn.functional.pad(waveform, (int(PAD_SECONDS * SAMPLERATE), int(PAD_SECONDS * SAMPLERATE))).squeeze(0)
-                )
+            batch_audio.append(slice_waveform_ms(waveform, 0, total_audio_ms).squeeze(0))
             batch_meta.append({'chunk_index': 0, 'base_offset': 0.0})
             flush_batch()
             
@@ -1545,37 +1551,14 @@ def main():
                                 MAX_SPEECH_DURATION_S,
                                 args.vad_threshold,
                                 final_zcr_threshold,   # 复用全局计算出的最佳阈值
-                                sub_zcr_array,         # 局部 ZCR
-                                OVERLAP_S
+                                sub_zcr_array         # 局部 ZCR
                             ))
                     logger.debug(
-                            f"【VAD】侦测到 {len(sub_speeches)} 个子语音块，保守拆分超过 {MAX_SPEECH_DURATION_S} 秒的部分"
+                            f"【VAD】侦测到 {len(nonsilent_ranges_s)} 个子语音块"
                         )
 
                     # 再次合并子块
-                    refined_sub_speeches = []
-                    for seg in merge_short_segments_adaptive(
-                            nonsilent_ranges_s, 
-                            MAX_SPEECH_DURATION_S
-                        ):
-                        if (seg[1] - seg[0]) <= MAX_SPEECH_DURATION_S:
-                            # 长度正常，直接加入
-                            refined_sub_speeches.append(seg)
-                        else:
-                            # 长度依然超标，执行带重叠的强制硬切分
-                            curr = seg[0]
-                            while curr < seg[1]:
-                                # 计算这一刀的结束点
-                                # 如果这一刀切到了末尾之后，就直接用末尾
-                                if (next_cut := curr + MAX_SPEECH_DURATION_S) >= seg[1]:
-                                    refined_sub_speeches.append([curr, seg[1]])
-                                    break
-                                
-                                # 加入当前硬切分段
-                                refined_sub_speeches.append([curr, next_cut])
-                                
-                                # 移动游标，回退 overlap_s 以形成重叠
-                                curr = next_cut - OVERLAP_S
+                    refined_sub_speeches = merge_short_segments_adaptive(nonsilent_ranges_s, MAX_SPEECH_DURATION_S)
 
                     if len(refined_sub_speeches) > 1:
                         logger.info(f"    --> Batch 中加入 {len(refined_sub_speeches)} 个子片段：")
@@ -1826,9 +1809,8 @@ def main():
     
             # 计算并打印内存 / 显存统计
             if MEM_SAMPLES["ram_gb"]:
-                max_ram = max(MEM_SAMPLES["ram_gb"])
                 ram_mode, freq = _calc_mode(MEM_SAMPLES["ram_gb"])
-                logger.debug(f"【内存监控】内存常规用量：{ram_mode:.2f} GB，峰值：{max_ram:.2f} GB（出现 {freq} 次）")
+                logger.debug(f"【内存监控】内存常规用量：{ram_mode:.2f} GB，峰值：{MEM_PEAKS['ram_gb']:.2f} GB（出现 {freq} 次）")
             else:
                 logger.debug("【内存监控】未采集到内存占用数据")
     
@@ -1836,9 +1818,8 @@ def main():
             if torch.cuda.is_available():
                 # 采样数据的统计
                 if MEM_SAMPLES["gpu_gb"]:
-                    max_gpu_sample = max(MEM_SAMPLES["gpu_gb"])
                     gpu_mode, freq = _calc_mode(MEM_SAMPLES["gpu_gb"])
-                    logger.debug(f"【显存监控】显存常规用量：{gpu_mode:.2f} GB，峰值：{max_gpu_sample:.2f} GB（出现 {freq} 次）")
+                    logger.debug(f"【显存监控】显存常规用量：{gpu_mode:.2f} GB，峰值：{MEM_PEAKS['gpu_gb']:.2f} GB（出现 {freq} 次）")
     
                 # PyTorch 记录的峰值（不依赖采样间隔）
                 try:
