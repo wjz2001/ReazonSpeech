@@ -44,7 +44,7 @@ set "debugOption="
 set "outputOptions="
 REM 清空临时输入变量
 set "vadThresh=" & set "vadEndThresh=" & set "minSpeech=" & set "minSilence=" & set "keep="
-set "t_per=" & set "t_off=" & set "t_look=" & set "t_safe=" & set "t_keep=" & set "t_high="
+set "t_per=" & set "t_off=" & set "t_e_per=" & set "t_e_off=" & set "t_look=" & set "t_safe=" & set "t_keep=" & set "t_high="
 set "zcrTh=" & set "beamSize=" & set "batchSize="
 
 
@@ -147,6 +147,12 @@ if defined t_per set "tailParams=!tailParams! --tail_percentile !t_per!"
 
 set /p "t_off=输入 tail_offset（阈值偏移量，默认：0.05，值越大越容易判为静音）："
 if defined t_off set "tailParams=!tailParams! --tail_offset !t_off!"
+
+set /p "t_e_per=输入 tail_energy_percentile（自适应能量阈值，默认：30，范围：0~100，低于此值则判定为静音）："
+if defined t_e_per set "tailParams=!tailParams! --tail_energy_percentile !t_e_per!"
+
+set /p "t_e_off=输入 tail_energy_offset（能量阈值偏移量，默认：0.0）："
+if defined t_e_off set "tailParams=!tailParams! --tail_energy_offset !t_e_off!"
 
 set /p "t_look=输入 tail_lookahead_ms（滞回检查时长（毫秒），默认：80）："
 if defined t_look set "tailParams=!tailParams! --tail_lookahead_ms !t_look!"

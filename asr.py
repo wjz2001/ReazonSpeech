@@ -10,12 +10,7 @@ import torch
 import json
 import time
 import numpy as np
-
-# ONNX VAD 依赖
-try:
-    import onnxruntime
-except ImportError:
-    onnxruntime = None
+import onnxruntime
 
 # Unix 系统有resource，Windows 上可能 ImportError
 # 仅 Windows 使用 WinAPI
@@ -198,7 +193,7 @@ def _calc_mode(samples):
     bin_size = 0.05
     if not samples:
         return None, 0
-    most_bin, freq = Counter([int(x // bin_size) * bin_size for x in list(samples)]).most_common(1)[0]
+    most_bin, freq = Counter([int(x // bin_size) * bin_size for x in samples]).most_common(1)[0]
     # 返回区间中点更直观一点
     return most_bin + bin_size / 2.0, freq
 # === 内存 / 显存监控结束 ===
@@ -358,11 +353,11 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
             curr_start = current_subwords[0].seconds
             curr_end = current_subwords[-1].end_seconds
             curr_limit = current_subwords[0].vad_limit
-            curr_text_raw = "".join(s.token for s in current_subwords) # 原始文本
     
             # 判断是否为纯标点/空格片段
             if all((s.token in TOKEN_PUNC or not s.token.strip()) for s in current_subwords):
                 # === 分支 A：纯标点片段 ===
+                curr_text_raw = "".join(s.token for s in current_subwords) # 原始文本
                 if all_segments:
                     prev_seg = all_segments[-1]
                     
@@ -390,7 +385,6 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
     
             else:
                 # === 分支 B：含正文的片段 ===
-                text = curr_text_raw
                 # 如果需要剔除句末标点，且最后一个子词是标点
                 if not no_remove_punc and current_subwords[-1].token in TOKEN_PUNC:
                     removed_punc = current_subwords.pop()
@@ -401,11 +395,9 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, t
                     # 因为不是全标点句，pop 后列表一定不为空
                     # 填补时间空缺
                     current_subwords[-1].end_seconds = removed_punc.end_seconds
-            
-                    # 重新生成已剔除标点最终文本
-                    text = "".join(s.token for s in current_subwords)
-                        
                 
+                text = "".join(s.token for s in current_subwords)
+
                 # 创建新片段
                 all_segments.append(PreciseSegment(
                     start_seconds=curr_start,
@@ -904,51 +896,67 @@ def refine_tail_end_timestamp(
     min_tail_keep_ms,     # 至少保留最后 token 后的这点时长，避免切得太硬
     percentile,           # 自适应阈值，值越大，越容易将高概率有语音区域判为静音
     offset,               # 在自适应阈值的基础上增加的固定偏移量，值越大，越容易将高概率区域有语音区域判为静音
+    energy_array,
+    energy_percentile,
+    energy_offset,
     use_zcr,
     zcr_threshold,
     zcr_array,
-    tail_zcr_high_ratio        # 高ZCR帧的占比阈值
+    zcr_high_ratio,  # 高ZCR帧的占比阈值
+    kernel=np.ones(5, dtype=np.float32) / 5.0 # 短窗平滑，5 是窗口大小
 ):
     # 仅在“最后子词之后”的尾窗内搜索
     start_idx = int(last_token_start_s / frame_duration_s)
-    end_idx = min(len(speech_probs), int(np.ceil(max_end_s / frame_duration_s)))
+    end_idx = int(np.ceil(max_end_s / frame_duration_s))
     # 至少要有 4 帧才能进行有效的统计学分析
     if start_idx >= len(speech_probs) or end_idx - start_idx <= 4:
         return min(rough_end_s, max_end_s)
 
-    # 短窗平滑，5 是窗口大小
-    p_smooth = np.convolve(speech_probs[start_idx:end_idx], np.ones(5, dtype=np.float32) / 5.0, mode="same")
+    p_smooth = np.convolve(speech_probs[start_idx:end_idx], kernel, mode="same")
+    e_smooth = np.convolve(energy_array[start_idx:end_idx], kernel, mode="same")
 
     # 局部自适应阈值percentile + offset
     # 限制阈值范围，防止极端情况导致逻辑失效
     # 0.10 保证底噪容忍度，0.95 保证不会因为全 1.0 的概率导致无法切割
     dyn_tau = np.clip(float(np.percentile(p_smooth, percentile)) + offset, 0.10, 0.95)
 
+    # 取尾段能量的低分位数，找“相对安静”的能量水平
+    dyn_e_tau = max(float(np.percentile(e_smooth, energy_percentile)) + energy_offset, 1e-4)
+
     min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
     # 连续静音 + 滞回
     for i in range(0, len(p_smooth) - min_silence_frames):
-        if np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
-            # --- ZCR 校验 ---
-            if use_zcr:
-                z_start = start_idx + i
-                z_end = z_start + min_silence_frames
-                
-                # 获取窗口内的 ZCR 数据
-                # 计算窗口内超过 ZCR 阈值的帧的比例
-                # np.mean(布尔数组) 相当于计算 True 的百分比
-                high_zcr_ratio = np.mean(zcr_array[z_start : z_end] > zcr_threshold)
-                
-                # 只有当高 ZCR 帧的比例超过设定值（如 0.3）时，才触发保护
-                if high_zcr_ratio > tail_zcr_high_ratio:
-                    if logger.debug_mode:
-                        logger.debug(f"【ZCR】疑似静音段 {SRTWriter._format_time(z_start * frame_duration_s)} --> {SRTWriter._format_time(z_end * frame_duration_s)} 内高频帧占比 {high_zcr_ratio:.2f} > {tail_zcr_high_ratio}，视为清辅音，跳过切分")
-                    continue 
+        # 概率是否持续低于自适应阈值
+        if not np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
+            continue
 
-            if not np.any(p_smooth[
-                i + min_silence_frames : 
-                min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / 1000.0 / frame_duration_s))
-                ] >= min(0.98, dyn_tau + 0.05) ):  # 滞回
-                return min(
+        # 能量是否也处于本段“相对静音”区间
+        if not (np.mean(e_smooth[i : i + min_silence_frames]) < dyn_e_tau):
+            continue
+
+        # ZCR 保护
+        if use_zcr:
+            z_start = start_idx + i
+            z_end = z_start + min_silence_frames
+
+            # 获取窗口内的 ZCR 数据
+            # 计算窗口内超过 ZCR 阈值的帧的比例
+            # np.mean(布尔数组) 相当于计算 True 的百分比
+            high_zcr_ratio = np.mean(zcr_array[z_start : z_end] > zcr_threshold)
+            # 只有当高 ZCR 帧的比例超过设定值（如 0.3）时，才触发保护
+            if high_zcr_ratio > zcr_high_ratio:
+                if logger.debug_mode:
+                        logger.debug(f"【ZCR】疑似静音段 {SRTWriter._format_time(z_start * frame_duration_s)} --> {SRTWriter._format_time(z_end * frame_duration_s)} 内高频帧占比 {high_zcr_ratio:.2f} > {zcr_high_ratio}，视为清辅音，跳过切分")
+                continue
+
+        # 滞回检查 —— 确认后面不会马上回到高概率语音
+        if i + min_silence_frames < min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / 1000.0 / frame_duration_s)):
+            if np.any(p_smooth[i + min_silence_frames:min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / 1000.0 / frame_duration_s))] >= min(0.98, dyn_tau + 0.05)):
+                # 后面很快又高概率说话了，不当静音切点
+                continue
+
+        # 保证至少保留最后一个 token 之后的一小段，不超过该段 VAD 块硬上限
+        return min(
                     max(
                         (start_idx + i) * frame_duration_s + safety_margin_ms / 1000.0,
                         last_token_start_s + min_tail_keep_ms / 1000.0,
@@ -1095,7 +1103,20 @@ def main():
         "--tail_offset",
         type=float,
         default=0.05,
-        help="【精修】在自适应阈值的基础上增加的固定偏移量。值越大，越容易将高概率区域语音区域判为静音",
+        help="【精修】在自适应阈值的基础上增加的固定偏移量，值越大越容易将高概率区域语音区域判为静音",
+    )
+    parser.add_argument(
+        "--tail_energy_percentile",
+        type=float,
+        default=30,
+        metavar="[0-100]",
+        help="【精修】自适应能量阈值，通常取 20~40，低于此值则判定为静音",
+    )
+    parser.add_argument(
+        "--tail_energy_offset",
+        type=float,
+        default=0.0,
+        help="【精修】在自适应能量阈值基础上增加的固定偏移量，一般保持为 0 即可，值越大判定标准越宽松",
     )
     parser.add_argument(
         "--tail_lookahead_ms",
@@ -1219,6 +1240,8 @@ def main():
         for p in [
             "tail_percentile",
             "tail_offset",
+            "tail_energy_percentile",
+            "tail_energy_offset",
             "tail_lookahead_ms",
             "tail_safety_margin_ms",
             "tail_min_keep_ms",
@@ -1254,6 +1277,8 @@ def main():
         if args.refine_tail:
             if not (0.0 <= args.tail_percentile <= 100.0):
                 parser.error(f"tail_percentile 必须在（0-100）范围内，当前值错误")
+            if not (0.0 <= args.tail_energy_percentile <= 100.0):
+                parser.error("tail_energy_percentile 必须在（0-100）范围内，当前值错误")
             if not (0.1 <= args.tail_zcr_high_ratio <= 0.5):
                 parser.error("tail_zcr_high_ratio 必须在（0.1-0.5）范围内，当前值错误")
 
@@ -1446,7 +1471,7 @@ def main():
 
             # 声学特征准备
             if args.auto_zcr or args.refine_tail:
-                speech_probs, _, zcr_array = prepare_acoustic_features(waveform, speech_probs, frame_duration_s, args.zcr)
+                speech_probs, energy_array, zcr_array = prepare_acoustic_features(waveform, speech_probs, frame_duration_s, args.zcr)
 
             # ZCR 阈值校准 
             # 确定最终使用的 ZCR 阈值
@@ -1606,17 +1631,17 @@ def main():
                         "range": chunk_ranges_log[i]
                     })
             
-            # 去重
-            if chunk_results:
-                # 所有块处理完后，执行去重，如果只有一个块，无需合并
-                logger.debug("【VAD】所有语音块处理完毕，正在去重……")
-                if len(chunk_results) > 1:
-                    raw_subwords = merge_overlap_dedup(chunk_results)
-                else:
-                    raw_subwords = chunk_results[0]["subwords"]
-                logger.debug(f"【VAD】语音块去重完毕")
+        # 去重
+        if chunk_results:
+            # 所有块处理完后，执行去重，如果只有一个块，无需合并
+            logger.debug("【VAD】所有语音块处理完毕，正在去重……")
+            if len(chunk_results) > 1:
+                raw_subwords = merge_overlap_dedup(chunk_results)
             else:
-                raw_subwords = []
+                raw_subwords = chunk_results[0]["subwords"]
+            logger.debug(f"【VAD】语音块去重完毕")
+        else:
+            raw_subwords = []
 
         # --- 计时结束：核心识别流程 ---
         recognition_end_time = time.time()
@@ -1653,6 +1678,9 @@ def main():
                     args.tail_min_keep_ms,
                     args.tail_percentile,
                     args.tail_offset,
+                    energy_array,
+                    args.tail_energy_percentile,
+                    args.tail_energy_offset,
                     args.zcr,
                     final_zcr_threshold,
                     zcr_array,
