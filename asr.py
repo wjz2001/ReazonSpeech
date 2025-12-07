@@ -167,20 +167,24 @@ def _memory_monitor(stop_event, device, interval=0.5):
     """
     while not stop_event.is_set():
         # --- 获取 RAM ---
-        if _get_ram_gb_sample() is not None:
-            MEM_SAMPLES["ram_gb"].append(_get_ram_gb_sample())
+        # 缓存采样结果，避免多次调用系统 API
+        ram_sample = _get_ram_gb_sample()
+
+        if ram_sample is not None:
+            MEM_SAMPLES["ram_gb"].append(ram_sample)
             # 更新历史最大值
-            if _get_ram_gb_sample() > MEM_PEAKS["ram_gb"]:
-                MEM_PEAKS["ram_gb"] = _get_ram_gb_sample()
+            if ram_sample > MEM_PEAKS["ram_gb"]:
+                MEM_PEAKS["ram_gb"] = ram_sample
 
         # --- 获取 GPU ---
         # 如果有 CUDA，就记录一次显存
         if torch.cuda.is_available():
-            # torch.cuda.memory_allocated 返回的是字节 
-            MEM_SAMPLES["gpu_gb"].append(torch.cuda.memory_allocated(device) / (1024 ** 3))
+            # torch.cuda.memory_allocated 返回的是字节，缓存结果
+            gpu_sample = torch.cuda.memory_allocated(device) / (1024 ** 3)
+            MEM_SAMPLES["gpu_gb"].append(gpu_sample)
             # 更新历史最大值
-            if torch.cuda.memory_allocated(device) / (1024 ** 3) > MEM_PEAKS["gpu_gb"]:
-                MEM_PEAKS["gpu_gb"] = torch.cuda.memory_allocated(device) / (1024 ** 3)
+            if gpu_sample > MEM_PEAKS["gpu_gb"]:
+                MEM_PEAKS["gpu_gb"] = gpu_sample
 
         time.sleep(interval)
 
@@ -581,7 +585,7 @@ def global_smart_segmenter(
     candidates = []
     # 边界保护，至少预留 1 秒的缓冲，避免切在段首/段尾靠得太近的地方
     search_start = int(start_s / frame_duration_s) + int(OVERLAP_S / frame_duration_s)
-    search_end = min(len(speech_probs), int(end_s / frame_duration_s) - int(OVERLAP_S / frame_duration_s))
+    search_end = int(end_s / frame_duration_s) - int(OVERLAP_S / frame_duration_s)
 
     # 提取搜索区间的概率
     # search_end > search_start + 2 是为了确保区间内至少有 3 帧数据
@@ -968,10 +972,7 @@ def slice_waveform_ms(waveform, start_ms, end_ms):
         )
 
 def transcribe_audio(model, audio, batch_size=1):
-    """
-    封装转录逻辑：调用模型 -> 解码 -> 返回子词列表。
-    如果失败或无结果，返回空列表。
-    """
+    """封装转录逻辑：调用模型 -> 解码 -> 返回子词列表"""
     return model.transcribe(audio=audio, batch_size=batch_size, return_hypotheses=True, verbose=False)
 
 def main():
