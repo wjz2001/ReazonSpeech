@@ -339,13 +339,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令: python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!puncOption!!debugOption!!outputOptions!
+echo 最终执行的命令: reazonspeech "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!puncOption!!debugOption!!outputOptions!
 
 echo ======================================================================
 
 echo.
 
-python asr.py "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!puncOption!!debugOption!!outputOptions!
+reazonspeech "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!puncOption!!debugOption!!outputOptions!
 
 echo.
 

@@ -67,7 +67,7 @@ python -m venv venv
 ## 用法
 
 ```bash
-python asr.py 文件路径
+reazonspeech 文件路径
 ```
 
 ### 其他参数

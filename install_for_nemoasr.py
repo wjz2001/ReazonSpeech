@@ -142,6 +142,9 @@ def main():
     # 步骤 5: 以可编辑模式安装本地的 ReazonSpeech ASR 包
     reazonspeech_install_command = ['pip', 'install', '-e', './pkg/nemo-asr']
     run_command(reazonspeech_install_command)
+
+    # 步骤 6: 以可编辑模式安装当前根目录项目
+    run_command(['pip', 'install', '-e', '.'])
     
     print("\n--- 安装流程执行完毕！ ---")
 

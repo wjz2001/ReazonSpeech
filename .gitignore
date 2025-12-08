@@ -10,6 +10,7 @@ __pycache__
 *.egg-info
 *.zip
 /venv/
+/ReazonSpeech.egg-info/
 /.ssh/
 /pkg/k2-asr/build/
 /pkg/nemo-asr/build/
