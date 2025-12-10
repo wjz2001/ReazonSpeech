@@ -11,6 +11,7 @@ import json
 import time
 import numpy as np
 import onnxruntime
+import wave
 
 # Unix 系统有resource，Windows 上可能 ImportError
 # 仅 Windows 使用 WinAPI
@@ -21,7 +22,6 @@ else:
 
 from collections import Counter, deque
 from pathlib import Path
-from pydub import AudioSegment
 from omegaconf import open_dict
 from reazonspeech.nemo.asr import load_model
 from reazonspeech.nemo.asr.audio import SAMPLERATE
@@ -258,17 +258,6 @@ def calibrate_zcr_threshold(speech_probs, zcr_array):
     logger.debug(f"【ZCR】浊音 P90 = {tau_v:.6f}，非语音 P10 = {tau_u:.6f}，计算阈值 = {adaptive_th:.6f}")
     return adaptive_th
 
-def convert_audio_to_tensor(audio_segment):
-    """
-    将 Pydub AudioSegment 转换为 PyTorch Tensor (float32, [-1, 1])。
-    使用 np.frombuffer 读 int16，再用 torch.tensor 拷贝到 GPU/CPU 张量
-    """
-    # torch.tensor(...) 总是拷贝数据，不依赖 numpy 的可写性
-    # [T] float32
-    # 归一化到 [-1, 1]
-    # 升维 [1, T]
-    return torch.tensor(np.frombuffer(audio_segment.raw_data, dtype=np.int16), dtype=torch.float32).div_(32768.0).unsqueeze(0)
-
 def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_times_s, total_duration_s, no_remove_punc):
 
     all_subwords = []
@@ -497,7 +486,7 @@ def get_speech_timestamps_onnx(
 
     # 统一按「整段时长 / 帧数」来近似每帧对应的时间长度
     # segmentation-3.0 实际上是 10ms 一帧，这个计算方式在任意长度下都一致
-    frame_duration_s = total_duration_s / float(num_frames)
+    frame_duration_s = total_duration_s / num_frames
 
     # 双阈值 + 填平短静音 + 丢弃短语音 + 直接生成秒级区间
     # 最小语音段帧数（小于这个长度的语音段会被丢弃）
@@ -526,7 +515,7 @@ def get_speech_timestamps_onnx(
                 # 连续低于 neg_threshold 的帧数达到 min_silence_frames 才真正结束一段
                 if (i - silence_start_f) >= min_silence_frames:
                     seg_end_f = silence_start_f
-                    # 大于 min_speech_frames 才是真正的语音块
+                    # 大于等于 min_speech_frames 才是真正的语音块
                     if (seg_end_f - seg_start_f) >= min_speech_frames:
                         start_s = seg_start_f * frame_duration_s
                         end_s = seg_end_f * frame_duration_s
@@ -674,6 +663,45 @@ def global_smart_segmenter(
         curr_start = cut_t - OVERLAP_S
 
     return segments
+
+def load_audio_ffmpeg(file):
+    """
+    使用 ffmpeg 将任何输入格式转为:
+      - 单声道
+      - 采样率 SAMPLERATE
+      - 16-bit 有符号小端整数 PCM (s16le)
+    然后转为 PyTorch Tensor 和总时长（毫秒）
+    """
+    p = subprocess.run(
+        [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",   # 不要 banner
+        "-i", str(file),
+        "-vn",                   # 不要视频
+        "-sn",                   # 不要字幕
+        "-dn",                   # 不要 data stream
+        "-map", "0:a:0",         # 明确选第一条音频流
+        "-ac", "1",
+        "-ar", str(SAMPLERATE),
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "-"                      # 输出到 stdout
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+    if not p.stdout:
+        raise RuntimeError(f"ffmpeg 解码失败，输出为空: {file}\nstderr={p.stderr.decode('utf-8', 'ignore')}")
+
+    # s16le → int16 → float32 [-1, 1]
+    audio_np = np.frombuffer(p.stdout, dtype=np.int16)
+    total_audio_ms = audio_np.size / SAMPLERATE * 1000.0
+
+    return torch.from_numpy(audio_np.astype(np.float32) / 32768.0).unsqueeze(0), total_audio_ms # [1, T]
 
 def merge_overlap_dedup(chunk_results):
     """重叠区域：文本相同则去重，否则保留双方并打印提示"""
@@ -931,7 +959,8 @@ def refine_tail_end_timestamp(
     use_zcr,
     zcr_threshold,
     zcr_array,
-    zcr_high_ratio  # 高ZCR帧的占比阈值
+    zcr_high_ratio,  # 高ZCR帧的占比阈值
+    kernel
 ):
     """
     在 [last_token_start_s, max_end_s] 范围内做所有自适应统计（percentile 等），
@@ -939,8 +968,6 @@ def refine_tail_end_timestamp(
     如果在这段内出现 “概率突然掉、但能量或 ZCR 仍然偏高” 的可疑静音，
     则允许在额外的 1 秒尾巴内继续按同一阈值寻找真正静音切点
     """
-    # 短窗平滑，5 是窗口大小
-    kernel = np.ones(5, dtype=np.float32) / 5.0
     # 仅在“最后子词之后”的尾窗内搜索
     start_idx = int(last_token_start_s / frame_duration_s)
     end_idx = int(np.ceil(max_end_s / frame_duration_s))
@@ -959,10 +986,10 @@ def refine_tail_end_timestamp(
     # 局部自适应阈值percentile + offset
     # 限制阈值范围，防止极端情况导致逻辑失效
     # 0.10 保证底噪容忍度，0.95 保证不会因为全 1.0 的概率导致无法切割
-    dyn_tau = np.clip(float(np.percentile(p_smooth, percentile)) + offset, 0.10, 0.95)
+    dyn_tau = np.clip(np.percentile(p_smooth, percentile) + offset, 0.10, 0.95)
 
     # 取尾段能量的低分位数，找“相对安静”的能量水平
-    dyn_e_tau = max(float(np.percentile(e_smooth, energy_percentile)) + energy_offset, 1e-4)
+    dyn_e_tau = max(np.percentile(e_smooth, energy_percentile) + energy_offset, 1e-4)
 
     min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
 
@@ -987,9 +1014,9 @@ def refine_tail_end_timestamp(
             return False
 
         # 获取“当前点之前”的一小段的最大概率
-        prev_max_p = float(p_smooth[prev_start:prev_end].max())
+        prev_max_p = p_smooth[prev_start:prev_end].max()
         # 获取“当前点之后”的一小段（静音窗口）的平均概率
-        curr_mean_p = float(p_smooth[i : i + min_silence_frames].mean())
+        curr_mean_p = p_smooth[i : i + min_silence_frames].mean()
 
         # 确保·前面是高置信度语音（显著高于静音阈值），再抬一点，防止把低置信噪声也当作“突降前的语音”
         if prev_max_p < dyn_tau + offset:
@@ -1090,8 +1117,8 @@ def refine_tail_end_timestamp(
         return min(rough_end_s, max_end_s + OVERLAP_S)
 
     # 只对额外 1s 做平滑，仍然使用之前在 [last_token_start_s, max_end_s] 内得到的 dyn_tau / dyn_e_tau。
-    extra_p_smooth = np.convolve(np.asarray(speech_probs[end_idx:search_end_idx], dtype=np.float32), kernel, mode="same")
-    extra_e_smooth = np.convolve(np.asarray(energy_array[end_idx:search_end_idx], dtype=np.float32), kernel, mode="same")
+    extra_p_smooth = np.convolve(speech_probs[end_idx:search_end_idx], kernel, mode="same")
+    extra_e_smooth = np.convolve(energy_array[end_idx:search_end_idx], kernel, mode="same")
 
     for j in range(len(extra_p_smooth) - min_silence_frames):
         if _is_stable_silence(j, extra_p_smooth, extra_e_smooth, end_idx):
@@ -1101,13 +1128,21 @@ def refine_tail_end_timestamp(
     # 兜底：没找到稳定静音，保留原结束时间
     return min(rough_end_s, max_end_s)
 
+def save_tensor_as_wav(path, waveform):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLERATE)
+        wf.writeframes((np.clip(waveform.squeeze(0).detach().cpu().numpy(), -1.0, 1.0) * 32768.0).astype('<i2').tobytes())
+
 def slice_waveform_ms(waveform, start_ms, end_ms):
     """
     高效 Tensor 切片与 Padding
     waveform: [1, T]
     """
-    # 边界限制并切片 (View 操作，零内存拷贝)
-    # F.pad: (padding_left, padding_right)，pad 操作会产生副本
+    # 边界限制并切片，F.pad: (padding_left, padding_right)，pad 操作会产生副本
     return torch.nn.functional.pad(
         waveform[:, max(0, round(start_ms * SAMPLERATE / 1000.0)):round(end_ms * SAMPLERATE / 1000.0)],
         (round(PAD_SECONDS * SAMPLERATE), round(PAD_SECONDS * SAMPLERATE))
@@ -1440,19 +1475,8 @@ def main():
     try:
         # --- ffmpeg 预处理：将输入文件转换为标准 WAV ---
         logger.info(f"正在转换输入文件 '{input_path}'……")
-        # 转换为单声道，16kHz采样率，16bit，这是ASR模型的标准格式
-        audio = AudioSegment.from_file(input_path).set_channels(1).set_frame_rate(SAMPLERATE).set_sample_width(2)
-        total_audio_ms = len(audio)
-        waveform = convert_audio_to_tensor(audio)  # [1, T]
+        waveform, total_audio_ms = load_audio_ffmpeg(input_path)
         logger.info("转换完成")
-
-        if args.debug:
-            # Debug 模式下保留 silence 用于导出
-            # 使用 pydub 创建静音段用于填充
-            # PAD_SECONDS 是以秒为单位，pydub 需要毫秒
-            silence_padding = AudioSegment.silent(duration=int(PAD_SECONDS * 1000), frame_rate=SAMPLERATE)
-        else:
-            del audio
 
         # 使用单例模式获取模型，避免重复加载
         model = get_asr_model()
@@ -1561,8 +1585,7 @@ def main():
             if args.debug:
                 fd, temp_full_wav_path = tempfile.mkstemp(suffix=".wav")
                 os.close(fd)
-                # 使用 pydub 导出
-                (silence_padding + audio + silence_padding).export(Path(temp_full_wav_path), format="wav")
+                save_tensor_as_wav(temp_full_wav_path, slice_waveform_ms(waveform, 0, total_audio_ms))
 
             logger.info("未使用VAD，一次性处理整个文件……")
             
@@ -1602,6 +1625,8 @@ def main():
             if not speeches:
                 logger.warn("【VAD】未侦测到语音活动")
                 return # 这里如果在 try 块内 return，finally 块依然会执行
+
+            vad_chunk_end_times_s.extend([seg[1] for seg in speeches])
 
             # 声学特征准备
             if args.auto_zcr or args.refine_tail:
@@ -1647,9 +1672,7 @@ def main():
 
                 # debug模式下为了检查才导出该块
                 if args.debug:
-                    # 定义路径对象
-                    chunk_audio = silence_padding + audio[start_ms:end_ms] + silence_padding
-                    chunk_audio.export(temp_chunk_dir / f"chunk_{i + 1}.wav", format="wav")
+                    save_tensor_as_wav(temp_chunk_dir / f"chunk_{i + 1}.wav", chunk)
 
                 logger.info(
                     f"【VAD】正在处理语音块 {i + 1}/{len(merged_ranges_s)} （该块起止时间：{SRTWriter._format_time(unpadded_start_s)} --> {SRTWriter._format_time(unpadded_end_s)}，时长：{(unpadded_end_s - unpadded_start_s):.2f} 秒）",
@@ -1660,8 +1683,6 @@ def main():
                 if unpadded_end_s - unpadded_start_s <= MAX_SPEECH_DURATION_S / 3.0:
                     # === 短块 ===
                     logger.info(" --> 短块，直接加入 Batch")
-                    # 短块没有运行二次VAD，直接使用一级VAD的原始结束时间
-                    vad_chunk_end_times_s.append(unpadded_end_s)
                     
                     # 加入 Batch
                     batch_audio.append(chunk.squeeze(0))
@@ -1731,9 +1752,7 @@ def main():
                         
                         # Debug 时导出临时子块文件
                         if args.debug:
-                            (silence_padding + chunk_audio[int(sub_seg[0] * 1000):int(sub_seg[1] * 1000)] + silence_padding).export(
-                                (temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav"), format="wav"
-                                )
+                            save_tensor_as_wav(temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav", sub_chunk)
 
                         if len(refined_sub_speeches) != 1:
                             logger.info(f"第 {i + 1}-{sub_idx + 1} 段 {SRTWriter._format_time(sub_seg[0])} --> {SRTWriter._format_time(sub_seg[1])}，时长：{sub_seg[1] - sub_seg[0]:.2f} 秒")
@@ -1790,7 +1809,7 @@ def main():
         logger.info("正在根据子词和VAD边界生成精确文本片段……")
 
         all_segments, all_subwords = create_precise_segments_from_subwords(
-            raw_subwords, vad_chunk_end_times_s, total_audio_ms / 1000.0, no_remove_punc=args.no_remove_punc
+            raw_subwords, sorted(set(vad_chunk_end_times_s)), total_audio_ms / 1000.0, no_remove_punc=args.no_remove_punc
             )
 
         logger.info("文本片段生成完成")
@@ -1798,6 +1817,8 @@ def main():
         if args.refine_tail: # 只在启用精修且map存在时精修
             logger.info("【精修】正在修除每段的尾部静音……")
 
+            # 短窗平滑，5 是窗口大小
+            kernel = np.ones(5, dtype=np.float32) / 5.0
             for i, segment in enumerate(all_segments):
                 # 遍历map，所以需要通过索引i来更新原始的all_segments列表
                 segment.end_seconds = refine_tail_end_timestamp(
@@ -1818,7 +1839,8 @@ def main():
                     args.zcr,
                     final_zcr_threshold,
                     zcr_array,
-                    args.tail_zcr_high_ratio
+                    args.tail_zcr_high_ratio,
+                    kernel
                 )
 
             # 邻段防重叠微调
