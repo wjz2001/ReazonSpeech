@@ -455,65 +455,97 @@ def get_speech_timestamps_onnx(
     min_speech_duration_ms, #最小语音段时长
     min_silence_duration_ms #多长静音视为真正间隔
 ):
-    """使用 ONNX 模型和后处理来获取语音时间戳"""
-    # ONNX 模型需要特定的输入形状
-    # 运行 ONNX 模型
-    #  ONNX 输出 (batch, T, classes)，取 [0] 变成 (T, classes)，再取[0]
-    logits = torch.from_numpy(
-        onnx_session.run(
-            None,
-            {"input_values": waveform.unsqueeze(0).numpy()}
-        )[0]
-        )[0]
-    # 聚合语音组能量 (Index 1-6)
-    # torch.logsumexp 默认 keepdim=False，输入 (T,6) -> 输出 (T)
-    # 获取静音能量 (Index 0) -> (T)
-    # 竞争: 语音 - 静音，再Sigmoid
-    # 转回 Numpy 以便进入 Python 循环
-    # logits[:, 0] > 静音维度，logits[:,1:] > 语音维度
-    speech_probs = torch.sigmoid(torch.logsumexp(logits[:,1:], dim=1) - logits[:, 0]).numpy()
+    """
+    使用 segmentation-3.0 ONNX + ≤10 秒滑窗 + 双阈值后处理，
+    将一段 waveform 转换为若干语音时间段
+    """
+    # 通过 ≤10 秒滑窗，拼出整段 speech_probs
+    total_duration_s = waveform.shape[1] / SAMPLERATE
 
-    frame_duration_s = (waveform.shape[1] / SAMPLERATE) / logits.shape[0]
+    all_probs = []
+    start_sample = 0
+    while start_sample < waveform.shape[1]:
+        end_sample = min(start_sample + int(10.0 * SAMPLERATE), waveform.shape[1])
+        # [1, T_chunk]
+        chunk = waveform[:, start_sample:end_sample]
 
-    speeches = []
-    current_speech_start = None
-    triggered = False
-    temp_silence_start_frame = None
-    min_silence_frames = max(1, int(min_silence_duration_ms / (frame_duration_s * 1000.0)))
+        #  ONNX 输出 (batch, T, classes)，取 [0] 变成 (T, classes)，再取[0]
+        logits = torch.from_numpy(
+            onnx_session.run(
+                None,
+                {"input_values": chunk.unsqueeze(0).numpy()}
+            )[0]
+            )[0]
 
-    for i, prob in enumerate(speech_probs):
-        # --- 语音开始逻辑（高阈值） ---
-        if not triggered:
-            if prob >= threshold:
-                triggered = True
-                current_speech_start = i * frame_duration_s
-            continue
+        # 聚合语音组能量 (Index 1-6)
+        # torch.logsumexp 默认 keepdim=False，输入 (T,6) -> 输出 (T)
+        # 获取静音能量 (Index 0) -> (T)
+        # 竞争: 语音 - 静音，再Sigmoid
+        # 转回 Numpy 以便进入 Python 循环
+        # logits[:, 0] > 静音维度，logits[:,1:] > 语音维度
+        probs = torch.sigmoid(torch.logsumexp(logits[:,1:], dim=1) - logits[:, 0]).numpy()
 
-        # --- 处于语音段中时，跟踪静音区域 ---
-        if prob < neg_threshold:
-            # 低于结束阈值，可能是静音的开始
-            if temp_silence_start_frame is None:
-                temp_silence_start_frame = i
+        all_probs.append(probs)
+        start_sample = end_sample
+
+    if len(all_probs) == 1:
+        speech_probs = all_probs[0]
+    else:
+        speech_probs = np.concatenate(all_probs, axis=0)
+
+    num_frames = speech_probs.shape[0]
+
+    # 统一按「整段时长 / 帧数」来近似每帧对应的时间长度
+    # segmentation-3.0 实际上是 10ms 一帧，这个计算方式在任意长度下都一致
+    frame_duration_s = total_duration_s / float(num_frames)
+
+    # 双阈值 + 填平短静音 + 丢弃短语音 + 直接生成秒级区间
+    # 最小语音段帧数（小于这个长度的语音段会被丢弃）
+    min_speech_frames = max(1, int(min_speech_duration_ms / 1000.0 / frame_duration_s))
+    # 最小静音段帧数（短于这个长度的静音视为“短静音”，会被填平）
+    min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
+
+    speeches = []           # 直接存秒级结果 [[start_s, end_s], ...]
+    in_speech = False       # 当前是否处于语音段中
+    seg_start_f = 0         # 当前语音段起点（帧）
+    silence_start_f = None  # 语音段内部，疑似静音开始帧
+
+    for i, p in enumerate(speech_probs):
+        if not in_speech:
+            # 还在「非语音」状态，只有超过高阈值 threshold 才进入语音段
+            if p >= threshold:
+                in_speech = True
+                seg_start_f = i
+                silence_start_f = None
         else:
-            # 回到语音，清掉静音起点
-            temp_silence_start_frame = None
+            # 已在语音段中
+            if p < neg_threshold:
+                # 掉到结束阈值以下，可能开始进入静音
+                if silence_start_f is None:
+                    silence_start_f = i
+                # 连续低于 neg_threshold 的帧数达到 min_silence_frames 才真正结束一段
+                if (i - silence_start_f) >= min_silence_frames:
+                    seg_end_f = silence_start_f
+                    # 大于 min_speech_frames 才是真正的语音块
+                    if (seg_end_f - seg_start_f) >= min_speech_frames:
+                        start_s = seg_start_f * frame_duration_s
+                        end_s = seg_end_f * frame_duration_s
+                        speeches.append([start_s, end_s])
+                    # 重置状态，等待下一段
+                    in_speech = False
+                    seg_start_f = 0
+                    silence_start_f = None
+            else:
+                # 概率又回到了 neg_threshold 以上，静音计数作废
+                silence_start_f = None
 
-        # --- 按静音长度结束当前段 ---
-        if temp_silence_start_frame is not None:
-            # ==== 将 ms/s 转为帧数 ====
-            if (i - temp_silence_start_frame) >= min_silence_frames:
-                # 访问列表索引 0 即start
-                if ((end_time := temp_silence_start_frame * frame_duration_s) - current_speech_start) * 1000.0 >= min_speech_duration_ms:
-                    speeches.append([current_speech_start, end_time])
-                    # 收尾并准备下一段
-                triggered = False
-                current_speech_start = None
-                temp_silence_start_frame = None
-
-    # --- 处理结尾残留的语音段 ---
-    if triggered and current_speech_start is not None:
-        if ((end_time := len(speech_probs) * frame_duration_s) - current_speech_start) * 1000.0 >= min_speech_duration_ms:
-            speeches.append([current_speech_start, end_time])
+    # 处理结尾残留：文件结束时仍在语音段中
+    if in_speech:
+        seg_end_f = num_frames
+        if (seg_end_f - seg_start_f) >= min_speech_frames:
+            start_s = seg_start_f * frame_duration_s
+            end_s = seg_end_f * frame_duration_s
+            speeches.append([start_s, end_s])
 
     # 完整的语音概率数组 speech_probs 和每一帧的持续时间 frame_duration_s
     return speeches, speech_probs, frame_duration_s
