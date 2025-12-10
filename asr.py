@@ -225,8 +225,6 @@ def auto_tune_batch_size(model, max_duration_s):
         return 1 # OOM 或其他错误，回退到 1
 
     per_sample = max(torch.cuda.max_memory_allocated(device) - baseline, 1)
-    torch.cuda.empty_cache()
-    
     
     # 计算理论最大值，至少为 1，0.7和2是安全限制
     return max(1, int(torch.cuda.mem_get_info(device)[0] * 0.7) // per_sample // 2)
@@ -449,7 +447,6 @@ def get_asr_model():
         _ASR_MODEL_LOAD_COST = asr_model_load_end - asr_model_load_start
     return _ASR_MODEL
 
-# --- ONNX VAD 辅助函数 ---
 def get_speech_timestamps_onnx(
     waveform,
     onnx_session,
@@ -902,16 +899,28 @@ def refine_tail_end_timestamp(
     use_zcr,
     zcr_threshold,
     zcr_array,
-    zcr_high_ratio,  # 高ZCR帧的占比阈值
-    kernel=np.ones(5, dtype=np.float32) / 5.0 # 短窗平滑，5 是窗口大小
+    zcr_high_ratio  # 高ZCR帧的占比阈值
 ):
+    """
+    在 [last_token_start_s, max_end_s] 范围内做所有自适应统计（percentile 等），
+    正常情况下只在这个范围内找切点
+    如果在这段内出现 “概率突然掉、但能量或 ZCR 仍然偏高” 的可疑静音，
+    则允许在额外的 1 秒尾巴内继续按同一阈值寻找真正静音切点
+    """
+    # 短窗平滑，5 是窗口大小
+    kernel = np.ones(5, dtype=np.float32) / 5.0
     # 仅在“最后子词之后”的尾窗内搜索
     start_idx = int(last_token_start_s / frame_duration_s)
     end_idx = int(np.ceil(max_end_s / frame_duration_s))
+
+    # 允许在 [max_end_s, max_end_s + 1] 内额外搜索，但不用于统计阈值
+    search_end_idx = int(np.ceil(max_end_s + OVERLAP_S / frame_duration_s))
+
     # 至少要有 4 帧才能进行有效的统计学分析
     if start_idx >= len(speech_probs) or end_idx - start_idx <= 4:
         return min(rough_end_s, max_end_s)
 
+    # 只在 [last_token_start_s, max_end_s] 这一截上做平滑和统计
     p_smooth = np.convolve(speech_probs[start_idx:end_idx], kernel, mode="same")
     e_smooth = np.convolve(energy_array[start_idx:end_idx], kernel, mode="same")
 
@@ -924,45 +933,138 @@ def refine_tail_end_timestamp(
     dyn_e_tau = max(float(np.percentile(e_smooth, energy_percentile)) + energy_offset, 1e-4)
 
     min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
-    # 连续静音 + 滞回
-    for i in range(0, len(p_smooth) - min_silence_frames):
-        # 概率是否持续低于自适应阈值
-        if not np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
-            continue
 
-        # 能量是否也处于本段“相对静音”区间
-        if not (np.mean(e_smooth[i : i + min_silence_frames]) < dyn_e_tau):
-            continue
+    def _is_sudden_drop_with_high_acoustic(i):
+        """
+        判定当前以 i 为起点、长度为 min_silence_frames 的窗口是否属于：
+        “概率突然掉，但能量/ZCR 仍然偏高”的可疑静音
+        只基于 [last_token_start_s, max_end_s] 内的数据进行判断
+        """
+        # 检测“概率突降 + 能量/ZCR 仍偏高”的窗口时，回看多长时间（秒 -> 帧）
+        sudden_window_frames = max(4,
+            int(min(0.25,
+                    max(
+                        0.08,
+                        0.5 * (min_silence_duration_ms / 1000.0)
+                    )) / frame_duration_s),)
 
-        # ZCR 保护
+        prev_end = i
+        prev_start = max(0, prev_end - sudden_window_frames)
+        # 如果切片为空（例如 i=0 时），说明没有“之前”的数据可供比较，直接返回 False
+        if prev_end <= prev_start:
+            return False
+
+        # 获取“当前点之前”的一小段的最大概率
+        prev_max_p = float(p_smooth[prev_start:prev_end].max())
+        # 获取“当前点之后”的一小段（静音窗口）的平均概率
+        curr_mean_p = float(p_smooth[i : i + min_silence_frames].mean())
+
+        # 确保·前面是高置信度语音（显著高于静音阈值），再抬一点，防止把低置信噪声也当作“突降前的语音”
+        if prev_max_p < dyn_tau + offset:
+            return False
+
+        # 确保当前窗口的概率相对前面明显“突降”
+        if prev_max_p - curr_mean_p < 0.35:
+            return False
+
+        # 能量或 ZCR 仍然偏高，说明声学上还很“活跃”，不像真正静音
+        high_energy = (
+            np.mean(e_smooth[prev_start:prev_end]) > dyn_e_tau
+            or np.mean(e_smooth[i : i + min_silence_frames]) > dyn_e_tau
+        )
+
+        high_zcr = False
         if use_zcr:
             z_start = start_idx + i
             z_end = z_start + min_silence_frames
+            high_zcr = (
+                np.mean(zcr_array[z_start:z_end] > zcr_threshold)
+                > zcr_high_ratio
+            )
 
+        return high_energy or high_zcr
+
+    def _is_stable_silence(i, p_smooth, e_smooth, global_base_idx):
+        """
+        判断当前片段是否为合格的静音切点
+        i: 在当前片段 p_smooth 中的相对索引
+        p_smooth: 当前分析的概率片段 (p_smooth 或 extra_p_smooth)
+        e_smooth: 当前分析的能量片段
+        global_base_idx: p_smooth 开头对应在原始大数组中的绝对索引 (用于取 ZCR)
+        """
+        # 概率是否持续低于自适应阈值
+        if not np.all(p_smooth[i : i + min_silence_frames] < dyn_tau):
+            return False
+
+        # 能量是否也处于本段“相对静音”区间
+        if not (np.mean(e_smooth[i : i + min_silence_frames]) < dyn_e_tau):
+            return False
+
+        # 3. ZCR 保护 (检测清辅音)
+        if use_zcr:
+            z_start = global_base_idx + i
+            z_end = z_start + min_silence_frames
             # 获取窗口内的 ZCR 数据
             # 计算窗口内超过 ZCR 阈值的帧的比例
             # np.mean(布尔数组) 相当于计算 True 的百分比
-            high_zcr_ratio = np.mean(zcr_array[z_start : z_end] > zcr_threshold)
+            high_zcr_ratio = np.mean(zcr_array[z_start:z_end] > zcr_threshold)
             # 只有当高 ZCR 帧的比例超过设定值（如 0.3）时，才触发保护
             if high_zcr_ratio > zcr_high_ratio:
                 if logger.debug_mode:
                         logger.debug(f"【ZCR】疑似静音段 {SRTWriter._format_time(z_start * frame_duration_s)} --> {SRTWriter._format_time(z_end * frame_duration_s)} 内高频帧占比 {high_zcr_ratio:.2f} > {zcr_high_ratio}，视为清辅音，跳过切分")
-                continue
+                return False
 
         # 滞回检查 —— 确认后面不会马上回到高概率语音
         if i + min_silence_frames < min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / 1000.0 / frame_duration_s)):
-            if np.any(p_smooth[i + min_silence_frames:min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / 1000.0 / frame_duration_s))] >= min(0.98, dyn_tau + 0.05)):
+            if np.any(p_smooth[i + min_silence_frames:min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / 1000.0 / frame_duration_s))] >= min(0.98, dyn_tau + offset)):
                 # 后面很快又高概率说话了，不当静音切点
-                continue
+                return False
 
-        # 保证至少保留最后一个 token 之后的一小段，不超过该段 VAD 块硬上限
+        return True
+
+    def _calc_refined_time(idx_offset, limit_s):
+        """计算最终时间戳，应用安全边距和最大限制"""
         return min(
-                    max(
-                        (start_idx + i) * frame_duration_s + safety_margin_ms / 1000.0,
-                        last_token_start_s + min_tail_keep_ms / 1000.0,
-                    ),
-                    max_end_s
-                )
+            max(
+                idx_offset * frame_duration_s + safety_margin_ms / 1000.0,
+                last_token_start_s + min_tail_keep_ms / 1000.0,
+            ),
+            limit_s,
+        )
+
+    # 标记：是否在分析区间内遇到过“概率突降 + 高能量/ZCR”的可疑静音
+    allow_use_extra_tail = False
+
+    # === 只在 [last_token_start_s, max_end_s] 内做切分 ===
+    for i in range(len(p_smooth) - min_silence_frames):
+        # 检查这段是否属于「概率突降 + 高能量/ZCR」的可疑静音
+        if _is_sudden_drop_with_high_acoustic(i):
+            allow_use_extra_tail = True
+            # 这类可疑静音本身不作为切点
+            continue
+
+        # 通用检查：是否稳定静音
+        if _is_stable_silence(i, p_smooth, e_smooth, start_idx):
+            return _calc_refined_time(start_idx + i, max_end_s)
+
+    # === 第二阶段：是否允许在 [max_end_s, max_end_s + 1] 内继续找切点 ===
+    if not allow_use_extra_tail:
+        # 没有出现“可疑静音”，严格限制在 max_end_s 以内
+        return min(rough_end_s, max_end_s)
+
+    # 有可疑静音，可以利用已有阈值在多出的 1 秒内继续搜索
+    if search_end_idx - end_idx <= min_silence_frames + OVERLAP_S:
+        # 额外尾巴太短，不够分析
+        return min(rough_end_s, max_end_s + OVERLAP_S)
+
+    # 只对额外 1s 做平滑，仍然使用之前在 [last_token_start_s, max_end_s] 内得到的 dyn_tau / dyn_e_tau。
+    extra_p_smooth = np.convolve(np.asarray(speech_probs[end_idx:search_end_idx], dtype=np.float32), kernel, mode="same")
+    extra_e_smooth = np.convolve(np.asarray(energy_array[end_idx:search_end_idx], dtype=np.float32), kernel, mode="same")
+
+    for j in range(len(extra_p_smooth) - min_silence_frames):
+        if _is_stable_silence(j, extra_p_smooth, extra_e_smooth, end_idx):
+            # 上限放宽到 max_end_s + OVERLAP_S
+            return _calc_refined_time(end_idx + j, max_end_s + OVERLAP_S)
 
     # 兜底：没找到稳定静音，保留原结束时间
     return min(rough_end_s, max_end_s)
