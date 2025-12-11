@@ -39,13 +39,14 @@ set "tailParams="
 set "zcrParams="
 set "beamParams="
 set "batchParams="
+set "audioFilterOption="
 set "puncOption="
 set "debugOption="
 set "outputOptions="
 REM 清空临时输入变量
 set "vadThresh=" & set "vadEndThresh=" & set "minSpeech=" & set "minSilence=" & set "keep="
 set "t_per=" & set "t_off=" & set "t_e_per=" & set "t_e_off=" & set "t_look=" & set "t_safe=" & set "t_keep=" & set "t_high="
-set "zcrTh=" & set "beamSize=" & set "batchSize="
+set "zcrTh=" & set "beamSize=" & set "batchSize=" & set "userFilter="
 
 
 echo ======================================================================
@@ -214,7 +215,7 @@ echo.
 
 echo 请输入新数值，或直接按回车以使用默认值
 
-REM --- 新增：询问 Batch Size ---
+REM --- 询问 Batch Size ---
 set "batchParams="
 set /p "batchSize=输入 batch_size（批量推理大小，默认：自动估算，范围：1~1280（仅整数），超过16可能会增加延迟）："
 
@@ -232,11 +233,40 @@ if NOT "!beamSize!"=="" (
     set "beamParams= --beam !beamSize!"
 )
 
+echo.
+
+REM --- 询问 Audio Filter ---
+set "audioFilterOption="
+set "userFilter="
+
+choice /c YN /m "是否使用 FFmpeg 音频滤镜？（Y=是；N=否）"
+
+if %ERRORLEVEL% == 2 (
+
+    echo 已设置高级识别参数
+
+    goto AskPunctuation
+)
+
+echo.
+
+echo 请输入滤镜链参数，或直接按回车以使用默认值（highpass=f=60,lowpass=f=8000）
+
+set /p "userFilter=滤镜链参数："
+
+if "!userFilter!"=="" (
+    REM 用户回车，使用默认标志
+    set "audioFilterOption= --audio-filter"
+) else (
+    REM 用户输入了内容，加上引号以防空格截断
+    set "audioFilterOption= --audio-filter \"!userFilter!\""
+)
+
 echo 已设置高级识别参数
 
 echo.
 
-REM --- 新增：询问是否保留句末标点 ---
+REM --- 询问是否保留句末标点 ---
 :AskPunctuation
 
 set "puncOption="

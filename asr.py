@@ -22,7 +22,6 @@ else:
 
 from collections import Counter, deque
 from pathlib import Path
-from omegaconf import open_dict
 from reazonspeech.nemo.asr import load_model
 from reazonspeech.nemo.asr.audio import SAMPLERATE
 from reazonspeech.nemo.asr.decode import find_end_of_segment, decode_hypothesis, PAD_SECONDS, SECONDS_PER_STEP, SUBWORDS_PER_SEGMENTS, TOKEN_PUNC
@@ -664,16 +663,25 @@ def global_smart_segmenter(
 
     return segments
 
-def load_audio_ffmpeg(file):
+def load_audio_ffmpeg(file, audio_filter):
     """
     使用 ffmpeg 将任何输入格式转为:
       - 单声道
       - 采样率 SAMPLERATE
       - 16-bit 有符号小端整数 PCM (s16le)
+      根据 audio_filter 决定是否附加 -af 滤镜链
     然后转为 PyTorch Tensor 和总时长（毫秒）
     """
-    p = subprocess.run(
-        [
+    # 解析 audio_filter
+    if audio_filter is None:
+        # 用户没写 --audio_filter：不加任何 -af
+        filter_str = None
+    else:
+        # 用户传了自定义滤镜字符串或使用预设默认滤镜：原样透传给 -af
+        filter_str = audio_filter
+
+    # 2) 拼 ffmpeg 命令
+    cmd = [
         "ffmpeg",
         "-nostdin",
         "-hide_banner",
@@ -685,16 +693,41 @@ def load_audio_ffmpeg(file):
         "-map", "0:a:0",         # 明确选第一条音频流
         "-ac", "1",
         "-ar", str(SAMPLERATE),
-        "-f", "s16le",
         "-acodec", "pcm_s16le",
-        "-"                      # 输出到 stdout
-        ],
+        ]
+
+    if filter_str:
+        cmd += ["-af", filter_str]
+
+    cmd += ["-f", "s16le", "-"]
+
+    p = subprocess.run(
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=True,
     )
 
     if not p.stdout:
+        stderr_text = p.stderr.decode("utf-8", "ignore")
+        if "No such filter:" in stderr_text:
+            # 从报错中提取滤镜名
+            # 典型行: [AVFilterGraph @ ...] No such filter: 'adeclip'
+            missing = []
+            for line in stderr_text.splitlines():
+                if "No such filter:" in line:
+                    # 简单提取 'xxx' 中的名
+                    missing.append(line[line.find("No such filter:") + len("No such filter:"):].strip().strip("'\""))
+            if missing:
+                raise RuntimeError(
+                    "ffmpeg 报错：缺少以下滤镜："
+                    + ", ".join(missing)
+                    + "\n"
+                    "请尝试：\n"
+                    "  1. 升级系统中的 ffmpeg 至较新版本；\n"
+                    "  2. 或者修改/移除 --audio_filter 参数\n"
+                    f"完整错误信息：\n{stderr_text}"
+                )
         raise RuntimeError(f"ffmpeg 解码失败，输出为空: {file}\nstderr={p.stderr.decode('utf-8', 'ignore')}")
 
     # s16le → int16 → float32 [-1, 1]
@@ -1189,6 +1222,19 @@ def main():
         )
 
     parser.add_argument(
+        "--audio-filter",
+        nargs="?",                 # 0 或 1 个参数
+        default=None,
+        const="highpass=f=60,lowpass=f=8000,afftdn=nf=-25",  # 只写 --audio-filter 时取这个值
+        help=(
+            "给 ffmpeg 解码阶段增加音频滤镜链（传给 -af）\n"
+            "  不写              -> 不开启滤镜；\n"
+            "  --audio-filter    -> 使用内置默认滤镜；\n"
+            "  --audio-filter \"highpass=f=60,lowpass=f=8000\" -> 使用自定义滤镜链"
+        ),
+    )
+
+    parser.add_argument(
         "--no-remove-punc",
         action="store_true",
         help="禁止自动剔除句末标点，保留原始识别结果",
@@ -1475,7 +1521,7 @@ def main():
     try:
         # --- ffmpeg 预处理：将输入文件转换为标准 WAV ---
         logger.info(f"正在转换输入文件 '{input_path}'……")
-        waveform, total_audio_ms = load_audio_ffmpeg(input_path)
+        waveform, total_audio_ms = load_audio_ffmpeg(input_path, args.audio_filter)
         logger.info("转换完成")
 
         # 使用单例模式获取模型，避免重复加载
@@ -1503,8 +1549,7 @@ def main():
             
             # 同样使用深拷贝创建新配置，确保它与原始配置完全独立
             new_decoding_cfg = copy.deepcopy(model.cfg.decoding)
-            with open_dict(new_decoding_cfg): # 使用 open_dict 使配置可修改
-                new_decoding_cfg.beam.beam_size = args.beam
+            new_decoding_cfg.beam.beam_size = args.beam
             
             # 在所有识别任务开始前，应用这个新的解码策略
             logger.info(f"正在应用新的解码策略：集束搜索宽度为 {args.beam} ……")
