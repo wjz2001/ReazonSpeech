@@ -7,6 +7,7 @@ import tempfile
 import sys
 import subprocess
 import torch
+import io
 import json
 import time
 import numpy as np
@@ -201,6 +202,229 @@ OVERLAP_S = 1.0  # 此处定义重叠时长
 # 全局变量：用于缓存加载好的模型
 _ASR_MODEL = None
 _ASR_MODEL_LOAD_COST = 0.0
+
+def arg_parser():
+    # --- 设置命令行参数解析 ---
+    parser = argparse.ArgumentParser(
+        description="使用 ReazonSpeech 模型识别语音，并按指定格式输出结果。基于静音的智能分块方式识别长音频，以保证准确率并解决显存问题"
+    )
+
+    # 音频/视频文件路径
+    parser.add_argument(
+        "input_file",
+        nargs="?",                 # 0 或 1 个参数
+        help="需要识别语音的音频/视频文件路径",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="启用调试模式，处理结束后不删除临时文件，并自动打开临时分块目录",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        choices=range(1, 1281),
+        default=None,
+        metavar="[1-1280]",
+        help="设置语音识别批量推理的大小，数字越大批量推理的速度越快，超过16可能会增加延迟，不填则自动根据显存估算（只使用 CPU 则默认为 1）",
+        )
+
+    parser.add_argument(
+        "--beam",
+        type=int,
+        choices=range(4, 257), # range(4, 257) 包含 4 到 256，不包含 257
+        default=4,
+        metavar="[4-256]", # 设置这个参数，帮助信息里就会显示为 [4-256]，而不是列出几十个数字
+        help="设置集束搜索（Beam Search）宽度，范围为 4 到 257 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
+        )
+
+    parser.add_argument(
+        "--audio-filter",
+        nargs="?",                 # 0 或 1 个参数
+        default=None,
+        const="highpass=f=60,lowpass=f=8000,afftdn=nf=-25",  # 只写 --audio-filter 时取这个值
+        help=(
+            "给 ffmpeg 解码阶段增加音频滤镜链（传给 -af）\n"
+            "  不写              -> 不开启滤镜；\n"
+            "  --audio-filter    -> 使用内置默认滤镜；\n"
+            "  --audio-filter \"highpass=f=60,lowpass=f=8000\" -> 使用自定义滤镜链"
+        ),
+    )
+
+    parser.add_argument(
+        "--no-remove-punc",
+        action="store_true",
+        help="禁止自动剔除句末标点，保留原始识别结果",
+    )
+
+    # --- VAD核心参数 ---
+    parser.add_argument(
+        "--no-chunk",
+        action="store_true",
+        help="禁用智能分块功能，一次性处理整个音频文件",
+    )
+
+    parser.add_argument(
+        "--vad_threshold",
+        type=float,
+        default=0.4,
+        metavar="[0.05-1]",
+        help="【VAD】判断为语音的置信度阈值",
+    )
+    # VAD 结束阈值（双阈值滞回）
+    parser.add_argument(
+        "--vad_end_threshold",
+        type=float,
+        default=None,
+        metavar="[0.05-1]",
+        help="【VAD】判断为语音结束后静音的置信度阈值，默认值是vad_threshold的值减去0.15",
+    )
+    parser.add_argument(
+        "--min_speech_duration_ms",
+        type=int,
+        default=100,
+        help="【VAD】移除短于此时长（毫秒）的语音块",
+    )
+     # 静音最小时长，用于智能合并/分段
+    parser.add_argument(
+        "--min_silence_duration_ms",
+        type=int,
+        default=200,
+        help="【VAD】短于此时长（毫秒）的语音块不被视为间隔",
+    )
+    parser.add_argument(
+        "--keep_silence",
+        type=int,
+        default=300,
+        help="【VAD】在语音块前后扩展时长（毫秒）",
+    )
+
+    # --- ZCR 参数 ---
+    parser.add_argument(
+        "--zcr",
+        action="store_true",
+        help="开启过零率检测，防止切断清辅音",
+    )
+    parser.add_argument(
+        "--zcr_threshold",
+        type=float,
+        default=0.15,
+        help="【ZCR】手动设置 ZCR 阈值",
+    )
+    parser.add_argument(
+        "--auto_zcr",
+        action="store_true",
+        help="【ZCR】开启自适应 ZCR 阈值计算，zcr_threshold作为兜底",
+    )
+
+    # --- 段尾精修参数（必须先使用VAD） ---
+    parser.add_argument(
+        "--refine-tail",
+        action="store_true",
+        help="使用段尾精修",
+    )
+
+    parser.add_argument(
+        "--tail_percentile",
+        type=float,
+        default=20,
+        metavar="[0-100]",
+        help="【精修】自适应阈值，值越大，越容易将高概率语音区域判为静音",
+    )
+    parser.add_argument(
+        "--tail_offset",
+        type=float,
+        default=0.05,
+        help="【精修】在自适应阈值的基础上增加的固定偏移量，值越大越容易将高概率区域语音区域判为静音",
+    )
+    parser.add_argument(
+        "--tail_energy_percentile",
+        type=float,
+        default=30,
+        metavar="[0-100]",
+        help="【精修】自适应能量阈值，通常取 20~40，低于此值则判定为静音",
+    )
+    parser.add_argument(
+        "--tail_energy_offset",
+        type=float,
+        default=0.0,
+        help="【精修】在自适应能量阈值基础上增加的固定偏移量，一般保持为 0 即可，值越大判定标准越宽松",
+    )
+    parser.add_argument(
+        "--tail_lookahead_ms",
+        type=int,
+        default=80,
+        help="【精修】滞回检查向前看的时长（毫秒），用于确认静音的稳定性，不会马上又回到语音",
+    )
+    parser.add_argument(
+        "--tail_safety_margin_ms",
+        type=int,
+        default=30,
+        help="【精修】在找到的切点后增加的安全边距（毫秒），避免切得太生硬",
+    )
+    parser.add_argument(
+        "--tail_min_keep_ms",
+        type=int,
+        default=30,
+        help="【精修】强制保留在段尾的最小时长（毫秒），保证听感自然",
+    )
+    parser.add_argument(
+        "--tail_zcr_high_ratio",
+        type=float,
+        default=0.3, 
+        metavar="[0.1-0.5]",
+        help="【精修】ZCR保护触发比例：在疑似静音窗口内，高于 ZCR 阈值的帧超过此比例时，才会判定为清音",
+    )
+
+    # 输出格式参数
+    parser.add_argument(
+        "-text",
+        action="store_true",
+        help="仅输出完整的识别文本并保存为 .txt 文件",
+    )
+    parser.add_argument(
+        "-segment",
+        action="store_true",
+        help="输出带时间戳的文本片段（Segment）并保存为 .segments.txt 文件",
+    )
+    parser.add_argument(
+        "-segment2srt",
+        action="store_true",
+        help="输出带时间戳的文本片段（Segment）并转换为 .srt 字幕文件",
+    )
+    parser.add_argument(
+        "-segment2vtt",
+        action="store_true",
+        help="输出带时间戳的文本片段（Segment）并转换为 .vtt 字幕文件",
+    )
+    parser.add_argument(
+        "-segment2tsv",
+        action="store_true",
+        help="输出带时间戳的文本片段（Segment）并转换为由制表符分隔的 .tsv 文件",
+    )
+    parser.add_argument(
+        "-subword",
+        action="store_true",
+        help="输出带时间戳的所有子词（Subword）并保存为 .subwords.txt 文件",
+    )
+    parser.add_argument(
+        "-subword2srt",
+        action="store_true",
+        help="输出带时间戳的所有子词（Subword）并转换为 .subwords.srt 字幕文件",
+    )
+    parser.add_argument(
+        "-subword2json",
+        action="store_true",
+        help="输出带时间戳的所有子词（Subword）并转换为 .subwords.json 文件",
+    )
+    parser.add_argument(
+        "-kass",
+        action="store_true",
+        help="生成逐字计时的卡拉OK式 .ass 字幕文件",
+    )
+    return parser
 
 def auto_tune_batch_size(model, max_duration_s):
     """
@@ -672,14 +896,6 @@ def load_audio_ffmpeg(file, audio_filter):
       根据 audio_filter 决定是否附加 -af 滤镜链
     然后转为 PyTorch Tensor 和总时长（毫秒）
     """
-    # 解析 audio_filter
-    if audio_filter is None:
-        # 用户没写 --audio_filter：不加任何 -af
-        filter_str = None
-    else:
-        # 用户传了自定义滤镜字符串或使用预设默认滤镜：原样透传给 -af
-        filter_str = audio_filter
-
     # 2) 拼 ffmpeg 命令
     cmd = [
         "ffmpeg",
@@ -696,8 +912,8 @@ def load_audio_ffmpeg(file, audio_filter):
         "-acodec", "pcm_s16le",
         ]
 
-    if filter_str:
-        cmd += ["-af", filter_str]
+    if audio_filter:
+        cmd += ["-af", audio_filter]
 
     cmd += ["-f", "s16le", "-"]
 
@@ -1185,231 +1401,28 @@ def transcribe_audio(model, audio, batch_size=1):
     """封装转录逻辑：调用模型 -> 解码 -> 返回子词列表"""
     return model.transcribe(audio=audio, batch_size=batch_size, return_hypotheses=True, verbose=False)
 
-def main():
-    # --- 设置命令行参数解析 ---
-    parser = argparse.ArgumentParser(
-        description="使用 ReazonSpeech 模型识别语音，并按指定格式输出结果。基于静音的智能分块方式识别长音频，以保证准确率并解决显存问题"
-    )
+def main(argv=None):
+    parser = arg_parser()
 
-    # 音频/视频文件路径
-    parser.add_argument(
-        "input_file",
-        help="需要识别语音的音频/视频文件路径",
-    )
+    # CLI 模式：argv=None，使用真实命令行参数；API 模式：argv 由 server.py 传入
+    if argv is None:
+        args = parser.parse_args()
+        api_mode = False
+    else:
+        args = parser.parse_args(argv)
+        api_mode = True
 
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="启用调试模式，处理结束后不删除临时文件，并自动打开临时分块目录",
-    )
+    # API 模式：在内存里累积输出；CLI 模式：写文件
+    api_result = {} if api_mode else None
 
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        choices=range(1, 1281),
-        default=None,
-        metavar="[1-1280]",
-        help="设置语音识别批量推理的大小，数字越大批量推理的速度越快，超过16可能会增加延迟，不填则自动根据显存估算（只使用 CPU 则默认为 1）",
-        )
-
-    parser.add_argument(
-        "--beam",
-        type=int,
-        choices=range(4, 257), # range(4, 257) 包含 4 到 256，不包含 257
-        default=4,
-        metavar="[4-256]", # 设置这个参数，帮助信息里就会显示为 [4-256]，而不是列出几十个数字
-        help="设置集束搜索（Beam Search）宽度，范围为 4 到 257 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
-        )
-
-    parser.add_argument(
-        "--audio-filter",
-        nargs="?",                 # 0 或 1 个参数
-        default=None,
-        const="highpass=f=60,lowpass=f=8000,afftdn=nf=-25",  # 只写 --audio-filter 时取这个值
-        help=(
-            "给 ffmpeg 解码阶段增加音频滤镜链（传给 -af）\n"
-            "  不写              -> 不开启滤镜；\n"
-            "  --audio-filter    -> 使用内置默认滤镜；\n"
-            "  --audio-filter \"highpass=f=60,lowpass=f=8000\" -> 使用自定义滤镜链"
-        ),
-    )
-
-    parser.add_argument(
-        "--no-remove-punc",
-        action="store_true",
-        help="禁止自动剔除句末标点，保留原始识别结果",
-    )
-
-    # --- VAD核心参数 ---
-    parser.add_argument(
-        "--no-chunk",
-        action="store_true",
-        help="禁用智能分块功能，一次性处理整个音频文件",
-    )
-
-    parser.add_argument(
-        "--vad_threshold",
-        type=float,
-        default=0.4,
-        metavar="[0.05-1]",
-        help="【VAD】判断为语音的置信度阈值",
-    )
-    # VAD 结束阈值（双阈值滞回）
-    parser.add_argument(
-        "--vad_end_threshold",
-        type=float,
-        default=None,
-        metavar="[0.05-1]",
-        help="【VAD】判断为语音结束后静音的置信度阈值，默认值是vad_threshold的值减去0.15",
-    )
-    parser.add_argument(
-        "--min_speech_duration_ms",
-        type=int,
-        default=100,
-        help="【VAD】移除短于此时长（毫秒）的语音块",
-    )
-     # 静音最小时长，用于智能合并/分段
-    parser.add_argument(
-        "--min_silence_duration_ms",
-        type=int,
-        default=200,
-        help="【VAD】短于此时长（毫秒）的语音块不被视为间隔",
-    )
-    parser.add_argument(
-        "--keep_silence",
-        type=int,
-        default=300,
-        help="【VAD】在语音块前后扩展时长（毫秒）",
-    )
-
-    # --- ZCR 参数 ---
-    parser.add_argument(
-        "--zcr",
-        action="store_true",
-        help="开启过零率检测，防止切断清辅音",
-    )
-    parser.add_argument(
-        "--zcr_threshold",
-        type=float,
-        default=0.15,
-        help="【ZCR】手动设置 ZCR 阈值",
-    )
-    parser.add_argument(
-        "--auto_zcr",
-        action="store_true",
-        help="【ZCR】开启自适应 ZCR 阈值计算，zcr_threshold作为兜底",
-    )
-
-    # --- 段尾精修参数（必须先使用VAD） ---
-    parser.add_argument(
-        "--refine-tail",
-        action="store_true",
-        help="使用段尾精修",
-    )
-
-    parser.add_argument(
-        "--tail_percentile",
-        type=float,
-        default=20,
-        metavar="[0-100]",
-        help="【精修】自适应阈值，值越大，越容易将高概率语音区域判为静音",
-    )
-    parser.add_argument(
-        "--tail_offset",
-        type=float,
-        default=0.05,
-        help="【精修】在自适应阈值的基础上增加的固定偏移量，值越大越容易将高概率区域语音区域判为静音",
-    )
-    parser.add_argument(
-        "--tail_energy_percentile",
-        type=float,
-        default=30,
-        metavar="[0-100]",
-        help="【精修】自适应能量阈值，通常取 20~40，低于此值则判定为静音",
-    )
-    parser.add_argument(
-        "--tail_energy_offset",
-        type=float,
-        default=0.0,
-        help="【精修】在自适应能量阈值基础上增加的固定偏移量，一般保持为 0 即可，值越大判定标准越宽松",
-    )
-    parser.add_argument(
-        "--tail_lookahead_ms",
-        type=int,
-        default=80,
-        help="【精修】滞回检查向前看的时长（毫秒），用于确认静音的稳定性，不会马上又回到语音",
-    )
-    parser.add_argument(
-        "--tail_safety_margin_ms",
-        type=int,
-        default=30,
-        help="【精修】在找到的切点后增加的安全边距（毫秒），避免切得太生硬",
-    )
-    parser.add_argument(
-        "--tail_min_keep_ms",
-        type=int,
-        default=30,
-        help="【精修】强制保留在段尾的最小时长（毫秒），保证听感自然",
-    )
-    parser.add_argument(
-        "--tail_zcr_high_ratio",
-        type=float,
-        default=0.3, 
-        metavar="[0.1-0.5]",
-        help="【精修】ZCR保护触发比例：在疑似静音窗口内，高于 ZCR 阈值的帧超过此比例时，才会判定为清音",
-    )
-
-    # 输出格式参数
-    parser.add_argument(
-        "-text",
-        action="store_true",
-        help="仅输出完整的识别文本并保存为 .txt 文件",
-    )
-    parser.add_argument(
-        "-segment",
-        action="store_true",
-        help="输出带时间戳的文本片段（Segment）并保存为 .segments.txt 文件",
-    )
-    parser.add_argument(
-        "-segment2srt",
-        action="store_true",
-        help="输出带时间戳的文本片段（Segment）并转换为 .srt 字幕文件",
-    )
-    parser.add_argument(
-        "-segment2vtt",
-        action="store_true",
-        help="输出带时间戳的文本片段（Segment）并转换为 .vtt 字幕文件",
-    )
-    parser.add_argument(
-        "-segment2tsv",
-        action="store_true",
-        help="输出带时间戳的文本片段（Segment）并转换为由制表符分隔的 .tsv 文件",
-    )
-    parser.add_argument(
-        "-subword",
-        action="store_true",
-        help="输出带时间戳的所有子词（Subword）并保存为 .subwords.txt 文件",
-    )
-    parser.add_argument(
-        "-subword2srt",
-        action="store_true",
-        help="输出带时间戳的所有子词（Subword）并转换为 .subwords.srt 字幕文件",
-    )
-    parser.add_argument(
-        "-subword2json",
-        action="store_true",
-        help="输出带时间戳的所有子词（Subword）并转换为 .subwords.json 文件",
-    )
-    parser.add_argument(
-        "-kass",
-        action="store_true",
-        help="生成逐字计时的卡拉OK式 .ass 字幕文件",
-    )
-
-    args = parser.parse_args()
+    if args.input_file is None:
+        # CLI 模式没传参数，自动转为启动 Server
+            import server 
+            server.main()
+            return  # 启动服务后直接结束 main 函数，防止往下执行报错
 
     # 配置全局日志等级
-    logger.set_debug(args.debug)
+    logger.set_debug(args.debug and not api_mode)
 
     # 校验 --no-chunk 和 VAD 参数的冲突
     if args.no_chunk:
@@ -1468,6 +1481,15 @@ def main():
     if not args.no_chunk:
         if onnxruntime is None:
             logger.warn("缺少 onnxruntime，请运行 'pip install onnxruntime'")
+            if api_mode:
+                return {
+                    "error": {
+                        "message": "缺少 onnxruntime，请运行 'pip install onnxruntime'",
+                        "type": "server_error",         # 服务端环境问题
+                        "param": None,
+                        "code": "onnxruntime_missing",
+                    }
+                }
             return
 
         if not (local_onnx_model_path := Path(__file__).resolve().parent / "models" / "model_quantized.onnx").exists():
@@ -1475,6 +1497,15 @@ def main():
                 f"未在 '{local_onnx_model_path}' 中找到 Pyannote-segmentation-3.0 模型"
             )
             logger.warn("请下载 model_quantized.onnx 并放入 models 文件夹")
+            if api_mode:
+                return {
+                    "error": {
+                        "message": "未找到 Pyannote-segmentation-3.0 模型，请下载 model_quantized.onnx 并放入 models 文件夹",
+                        "type": "server_error",
+                        "param": None,
+                        "code": "pyannote_model_missing",
+                    }
+                }
             return
 
         # ==== VAD 阈值参数校验和默认 ====
@@ -1498,7 +1529,7 @@ def main():
                 parser.error("tail_zcr_high_ratio 必须在（0.1-0.5）范围内，当前值错误")
 
     # 启动内存 / 显存监控线程
-    if args.debug:
+    if args.debug and not api_mode:
         mem_stop_event = threading.Event()
         mem_thread = threading.Thread(
             target=_memory_monitor,
@@ -1610,6 +1641,12 @@ def main():
                     # 回退为逐条推理（内部会顺序处理整个 batch_audio 列表）
                     hyps = transcribe_audio(model, batch_audio)[0]
 
+            # === 修改开始：插入调试打印 ===
+            if logger.debug_mode:
+                for idx, h in enumerate(hyps):
+                    print(f"【DEBUG探针】块索引: {batch_meta[idx]['chunk_index']}, 识别文本: [{decode_hypothesis(model, h).text}]")
+            # === 修改结束 ===
+
             # 处理结果
             for hyp, meta in zip(hyps, batch_meta):
                 if not hyp: continue
@@ -1627,7 +1664,7 @@ def main():
 
         # --- 分支 A: 不分块 (No Chunk) ---
         if args.no_chunk:
-            if args.debug:
+            if args.debug and not api_mode:
                 fd, temp_full_wav_path = tempfile.mkstemp(suffix=".wav")
                 os.close(fd)
                 save_tensor_as_wav(temp_full_wav_path, slice_waveform_ms(waveform, 0, total_audio_ms))
@@ -1669,7 +1706,16 @@ def main():
 
             if not speeches:
                 logger.warn("【VAD】未侦测到语音活动")
-                return # 这里如果在 try 块内 return，finally 块依然会执行
+                if api_mode:
+                    return {
+                        "error": {
+                            "message": "VAD 未侦测到语音活动",
+                            "type": "invalid_request_error",
+                            "param": "file",
+                            "code": "no_speech",
+                        }
+                    }
+                return
 
             vad_chunk_end_times_s.extend([seg[1] for seg in speeches])
 
@@ -1700,7 +1746,7 @@ def main():
             all_chunk_subwords_collection = [[] for _ in range(len(merged_ranges_s))]
             chunk_ranges_log = [] # 记录每一块的时间范围，用于最后的合并
 
-            if args.debug:
+            if args.debug and not api_mode:
                 temp_chunk_dir = Path(tempfile.mkdtemp())
 
             # 遍历一级块
@@ -1716,7 +1762,7 @@ def main():
                 chunk = slice_waveform_ms(waveform, start_ms, end_ms)
 
                 # debug模式下为了检查才导出该块
-                if args.debug:
+                if args.debug and not api_mode:
                     save_tensor_as_wav(temp_chunk_dir / f"chunk_{i + 1}.wav", chunk)
 
                 logger.info(
@@ -1796,7 +1842,7 @@ def main():
                         sub_chunk = slice_waveform_ms(chunk, int(sub_seg[0] * 1000), int(sub_seg[1] * 1000))
                         
                         # Debug 时导出临时子块文件
-                        if args.debug:
+                        if args.debug and not api_mode:
                             save_tensor_as_wav(temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav", sub_chunk)
 
                         if len(refined_sub_speeches) != 1:
@@ -1848,6 +1894,15 @@ def main():
         if not raw_subwords:
             logger.info("=" * 70)
             logger.info("未识别到任何有效的语音内容")
+            if api_mode:
+                return {
+                    "error": {
+                        "message": "未识别到任何有效语音内容",
+                        "type": "invalid_request_error",
+                        "param": "file",
+                        "code": "empty_result",
+                    }
+                }
             return
 
         logger.info("=" * 70)
@@ -1918,7 +1973,7 @@ def main():
                     full_text = " ".join(segment.text for segment in all_segments)
 
         # 只有在用户完全没有指定任何输出参数时，才在控制台打印
-        if not file_output_requested:
+        if not file_output_requested and not api_mode:
             logger.info("\n识别结果（完整文本）：")
             logger.info(full_text)
             logger.info("=" * 70)
@@ -1926,69 +1981,123 @@ def main():
             logger.info("请使用 -text，-segment2srt，-kass 等参数将结果保存为文件")
 
         if args.text:
-            # Path 对象自带 open 方法
-            with (output_path := output_dir / f"{base_name}.txt").open("w", encoding="utf-8") as f: 
-                f.write(full_text)
-            logger.info(f"完整的识别文本已保存为：{output_path}")
+            if api_mode:
+                api_result["text"] = full_text
+            else:
+                with (output_path := output_dir / f"{base_name}.txt").open("w", encoding="utf-8") as f: 
+                    f.write(full_text)
+                logger.info(f"完整的识别文本已保存为：{output_path}")
 
         if args.segment:
-            with (output_path := output_dir / f"{base_name}.segments.txt").open("w", encoding="utf-8") as f:
-                writer = TextWriter(f)
-                for segment in all_segments:
-                    writer.write(segment)
-            logger.info(f"带时间戳的文本片段已保存为：{output_path}")
+            if api_mode:
+                api_result["segment"] = [
+                    {
+                        "start": segment.start_seconds,
+                        "end": segment.end_seconds,
+                        "tokens_id": [sw.token_id for sw in segment.subwords],
+                        "text": segment.text,
+                    }
+                    for segment in all_segments
+                ]
+            else:
+                with (output_path := output_dir / f"{base_name}.segments.txt").open("w", encoding="utf-8") as f:
+                    writer = TextWriter(f)
+                    for segment in all_segments:
+                        writer.write(segment)
+                logger.info(f"带时间戳的文本片段已保存为：{output_path}")
 
         if args.segment2srt:
-            with (output_path := output_dir / f"{base_name}.srt").open("w", encoding="utf-8") as f:
+            def _write_segment2srt(f):
                 writer = SRTWriter(f)
                 for segment in all_segments:
                     writer.write(segment)
-            logger.info(f"文本片段 SRT 字幕文件已保存为：{output_path}")
+            if api_mode:
+                buf = io.StringIO()
+                _write_segment2srt(buf)
+                api_result["segment2srt"] = buf.getvalue()
+            else:
+                with (output_path := output_dir / f"{base_name}.srt").open("w", encoding="utf-8") as f:
+                    _write_segment2srt(f)
+                logger.info(f"文本片段 SRT 字幕文件已保存为：{output_path}")
 
         if args.segment2vtt:
-            with (output_path := output_dir / f"{base_name}.vtt").open("w", encoding="utf-8") as f:
+            def _write_segment2vtt(f):
                 writer = VTTWriter(f)
                 writer.write_header()
                 for segment in all_segments:
                     writer.write(segment)
-            logger.info(f"文本片段 WebVTT 字幕文件已保存为：{output_path}")
+            if api_mode:
+                buf = io.StringIO()
+                _write_segment2vtt(buf)
+                api_result["segment2vtt"] = buf.getvalue()
+            else:
+                with (output_path := output_dir / f"{base_name}.vtt").open("w", encoding="utf-8") as f:
+                    _write_segment2vtt(f)
+                logger.info(f"文本片段 WebVTT 字幕文件已保存为：{output_path}")
 
         if args.segment2tsv:
-            with (output_path := output_dir / f"{base_name}.tsv").open("w", encoding="utf-8") as f:
+            def _write_segment2tsv(f):
                 writer = TSVWriter(f)
                 writer.write_header()
                 for segment in all_segments:
                     writer.write(segment)
-            logger.info(f"文本片段 TSV 文件已保存为：{output_path}")
+            if api_mode:
+                buf = io.StringIO()
+                _write_segment2tsv(buf)
+                api_result["segment2tsv"] = buf.getvalue()
+            else:
+                with (output_path := output_dir / f"{base_name}.tsv").open("w", encoding="utf-8") as f:
+                    _write_segment2tsv(f)
+                logger.info(f"文本片段 TSV 文件已保存为：{output_path}")
 
         if args.subword:
-            with (output_path := output_dir / f"{base_name}.subwords.txt").open("w", encoding="utf-8") as f:
-                for sub in all_subwords:
-                    f.write(
-                        f"[{SRTWriter._format_time(sub.seconds)}] {sub.token.replace(' ', '')}\n"
-                    )
-            logger.info(f"带时间戳的所有子词信息已保存为：{output_path}")
+            if api_mode:
+                api_result["subword"] = [
+                    {
+                        "start": sub.seconds,
+                        "end": sub.end_seconds,
+                        "token": sub.token.replace(" ", ""),
+                    }
+                    for sub in all_subwords
+                ]
+            else:
+                with (output_path := output_dir / f"{base_name}.subwords.txt").open("w", encoding="utf-8") as f:
+                    for sub in all_subwords:
+                        f.write(
+                            f"[{SRTWriter._format_time(sub.seconds)}] {sub.token.replace(' ', '')}\n"
+                        )
+                logger.info(f"带时间戳的所有子词信息已保存为：{output_path}")
 
         if args.subword2srt:
-            with (output_path := output_dir / f"{base_name}.subwords.srt").open("w", encoding="utf-8") as f:
+            def _write_subword2srt(f):
                 for i, sub in enumerate(all_subwords):
                     f.write(f"{i + 1}\n")
                     f.write(f"{SRTWriter._format_time(sub.seconds)} --> {SRTWriter._format_time(sub.end_seconds)}\n")
                     f.write(f"{sub.token}\n\n")
-
-            logger.info(f"所有子词信息的 SRT 文件已保存为：{output_path}")
+            if api_mode:
+                buf = io.StringIO()
+                _write_subword2srt(buf)
+                api_result["subword2srt"] = buf.getvalue()
+            else:
+                with (output_path := output_dir / f"{base_name}.subwords.srt").open("w", encoding="utf-8") as f:
+                    _write_subword2srt(f)
+                logger.info(f"所有子词信息的 SRT 文件已保存为：{output_path}")
 
         if args.subword2json:
-            with (output_path := output_dir / f"{base_name}.subwords.json").open("w", encoding="utf-8") as f:
-                json.dump(
-                    [{"token": sub.token, "timestamp": sub.seconds} for sub in all_subwords],
-                    f, ensure_ascii=False, indent=4
-                )
-            logger.info(f"所有子词信息的 JSON 文件已保存为：{output_path}")
+            def _write_subword2json():
+                return [
+                    {"token": sub.token, "timestamp": sub.seconds}
+                    for sub in all_subwords
+                ]
+            if api_mode:
+                api_result["subword2json"] = _write_subword2json()
+            else:
+                with (output_path := output_dir / f"{base_name}.subwords.json").open("w", encoding="utf-8") as f:
+                    json.dump(_write_subword2json(), f, ensure_ascii=False, indent=4)
+                logger.info(f"所有子词信息的 JSON 文件已保存为：{output_path}")
 
         if args.kass:
-            with (output_path := output_dir / f"{base_name}.ass").open("w", encoding="utf-8-sig") as f:
-
+            def _write_kass(f):
                 # 使用 writer 生成标准文件头
                 writer = ASSWriter(f)
                 writer.write_header()
@@ -1998,8 +2107,14 @@ def main():
                     for sub in segment.subwords:
                         karaoke_text += f"{{\\k{max(1, round((sub.end_seconds - sub.seconds) * 100))}}}{sub.token}"
                     f.write(f"Dialogue: 0,{ASSWriter._format_time(segment.start_seconds)},{ASSWriter._format_time(segment.end_seconds)},Default,,0,0,0,,{karaoke_text}\n")
-
-            logger.info(f"卡拉OK式 ASS 字幕已保存为：{output_path}")
+            if api_mode:
+                buf = io.StringIO()
+                _write_kass(buf)
+                api_result["kass"] = buf.getvalue()
+            else:
+                with (output_path := output_dir / f"{base_name}.ass").open("w", encoding="utf-8-sig") as f:
+                    _write_kass(f)
+                logger.info(f"卡拉OK式 ASS 字幕已保存为：{output_path}")
 
     finally:
         # 恢复原始解码策略，以防后续有其他操作
@@ -2028,7 +2143,7 @@ def main():
                     f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time)}"
                 )
 
-        if args.debug:
+        if args.debug and not api_mode:
             logger.debug("=" * 70)
             # 先停止监控线程
             try:
@@ -2069,6 +2184,10 @@ def main():
             if temp_chunk_dir:
                 logger.debug(f"临时分块目录位于: {temp_chunk_dir}")
                 open_folder(temp_chunk_dir) # 调用新函数打开文件夹
+
+    if api_mode:
+        api_result["duration"] = total_audio_ms / 1000.0
+        return api_result            
 
 if __name__ == "__main__":
     main()

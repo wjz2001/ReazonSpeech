@@ -150,6 +150,120 @@ reazonspeech 文件路径
 | `-subword2json` | 输出带时间戳的所有子词（Subword）并转换为 .subwords.json 文件 |
 | `-kass` | 生成逐字计时的卡拉OK式 .ass 字幕文件 |
 
+这是为您整理的 `README.md` 新增内容。
+
+这段内容展示了如何启动服务，并提供了一个包含**所有关键参数类型**（包括 OpenAI 标准参数、ReazonSpeech 核心配置、VAD、ZCR、精修参数）的“全家桶”示例。
+
+***
+
+## API 服务部署
+
+### 启动服务
+
+在终端直接运行命令（不带任何参数）：
+
+```bash
+reazonspeech
+```
+
+启动成功后，服务默认监听端口 **8888**（如被占用会自动寻找空闲端口）
+- API 地址：`http://127.0.0.1:8888/v1/audio/transcriptions`
+
+### 接口参数
+
+| 参数名 | 必填 | 说明 |
+| :--- | :---: | :--- |
+| **file** | 是 | 音频文件或视频文件 |
+| **response_format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`<br>2. **ReazonSpeech 专用格式**：如 `kass`，`segment2tsv` 等（即上面的输出参数去除开头短横线，多个参数用逗号分隔） |
+| **prompt** | 否 | **配置除输出参数和debug参数外所有参数**：<br>在此处传入所有支持除输出参数和debug参数外所有的配置参数 |
+| **timestamp_granularities[]** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
+
+### 调用示例
+
+#### cURL 示例
+
+- json风格参数必须包裹在大括号内，在 curl 中建议用单引号包裹，防止 shell 转义问题
+
+```bash
+curl -X POST "http://127.0.0.1:8888/v1/audio/transcriptions" \
+  -F "file=@test.wav" \
+  -F 'prompt={"no-chunk": true, "beam-size": 5}' \
+  -F "response_format=verbose_json" \
+  -F "timestamp_granularities[]=segment"
+```
+
+- 命令行风格参数之间用空格分隔，不要加逗号
+
+```bash
+curl -X POST "http://127.0.0.1:8888/v1/audio/transcriptions" \
+  -F "file=@test.wav" \
+  -F "prompt=--audio-filter --beam-size 2" \
+  -F "response_format=text,segment2srt"
+```
+
+#### Python 示例
+
+- 确保已安装：`pip install requests`
+
+- json风格参数必须包裹在大括号内
+
+```python
+import requests
+import json
+
+url = "http://127.0.0.1:8888/v1/audio/transcriptions"
+file_path = "test.wav"
+
+# 构造 JSON 格式的 prompt 字符串
+prompt_config = {
+    "no-chunk": True,
+    "beam-size": 5
+}
+
+payload = {
+    # 将字典转为 JSON 字符串
+    "prompt": json.dumps(prompt_config),
+    "response_format": "verbose_json",
+    "timestamp_granularities[]": "segment"  # 可选: segment 或 word
+}
+
+with open(file_path, "rb") as f:
+    files = {"file": f}
+    response = requests.post(url, data=payload, files=files)
+
+# 打印结果
+print(response.status_code)
+print(json.dumps(response.json(), indent=2, ensure_ascii=False))
+```
+
+- 命令行风格参数之间用空格分隔，不要加逗号
+
+```python
+import requests
+
+url = "http://127.0.0.1:8888/v1/audio/transcriptions"
+file_path = "test.wav"
+
+payload = {
+    # 直接写命令行参数风格的字符串，空格分隔
+    "prompt": "--audio-filter --beam-size 2",
+    
+    # 自定义多选，逗号分隔，不要带前面的横线
+    "response_format": "text,segment2srt" 
+}
+
+with open(file_path, "rb") as f:
+    files = {"file": f}
+    response = requests.post(url, data=payload, files=files)
+
+# 打印结果
+print(response.status_code)
+# 返回的是 asr.py 的原始字典数据，不是 OpenAI 格式
+data = response.json()
+print("Text 内容:", data.get("text"))
+print("SRT 内容:\n", data.get("segment2srt"))
+```
+
 ## Packages
 
 [reazonspeech.evaluation](pkg/evaluation)

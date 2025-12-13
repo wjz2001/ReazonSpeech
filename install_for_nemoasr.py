@@ -132,6 +132,11 @@ def main():
         'pyannote.database==6.1.0',
         'pyannote.metrics==4.0.0',
         'onnxruntime==1.22.1',
+        'annotated-doc==0.0.4',
+        'fastapi==0.124.2',
+        'python-multipart==0.0.20',
+        'starlette==0.50.0',
+        'uvicorn==0.38.0',
     ]
     run_command(core_packages_command)
     
