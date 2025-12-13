@@ -150,12 +150,6 @@ reazonspeech 文件路径
 | `-subword2json` | 输出带时间戳的所有子词（Subword）并转换为 .subwords.json 文件 |
 | `-kass` | 生成逐字计时的卡拉OK式 .ass 字幕文件 |
 
-这是为您整理的 `README.md` 新增内容。
-
-这段内容展示了如何启动服务，并提供了一个包含**所有关键参数类型**（包括 OpenAI 标准参数、ReazonSpeech 核心配置、VAD、ZCR、精修参数）的“全家桶”示例。
-
-***
-
 ## API 服务部署
 
 ### 启动服务
