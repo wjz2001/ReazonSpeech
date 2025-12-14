@@ -1641,12 +1641,6 @@ def main(argv=None):
                     # 回退为逐条推理（内部会顺序处理整个 batch_audio 列表）
                     hyps = transcribe_audio(model, batch_audio)[0]
 
-            # === 修改开始：插入调试打印 ===
-            if logger.debug_mode:
-                for idx, h in enumerate(hyps):
-                    print(f"【DEBUG探针】块索引: {batch_meta[idx]['chunk_index']}, 识别文本: [{decode_hypothesis(model, h).text}]")
-            # === 修改结束 ===
-
             # 处理结果
             for hyp, meta in zip(hyps, batch_meta):
                 if not hyp: continue

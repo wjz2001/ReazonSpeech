@@ -35,32 +35,30 @@ REM ======================================================================
 echo ======================================================================
 choice /c YN /m "是否开启 API 服务？（Y=开启 API 服务；N=执行文件识别）"
 
-if %ERRORLEVEL% == 1 (
-    echo.
+if errorlevel 2 goto GetFile
 
-    echo =========================================
+echo.
 
-    echo 正在启动 ReazonSpeech API 服务……
+echo =========================================
 
-    echo (按 Ctrl+C 可终止服务)
+echo 正在启动 ReazonSpeech API 服务……
 
-    echo==========================================
+echo (按 Ctrl+C 可终止服务)
 
-    echo.
+echo==========================================
+
+echo.
     
-    REM 直接执行 reazonspeech 命令
-    reazonspeech
+REM 直接执行 reazonspeech 命令
+reazonspeech
     
-    echo.
+echo.
 
-    echo API 服务已停止
+echo API 服务已停止
 
-    pause
+pause
 
-    exit /b 0
-)
-
-REM 如果用户选择 N，则继续向下执行原来的逻辑
+exit /b 0
 
 echo.
 
