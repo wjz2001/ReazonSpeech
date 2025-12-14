@@ -170,7 +170,7 @@ reazonspeech
 | **file** | 是 | 音频文件或视频文件 |
 | **response_format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`<br>2. **ReazonSpeech 专用格式**：如 `kass`，`segment2tsv` 等（即上面的输出参数去除开头短横线，多个参数用逗号分隔） |
 | **prompt** | 否 | **配置除输出参数和debug参数外所有参数**：<br>在此处传入所有支持除输出参数和debug参数外所有的配置参数 |
-| **timestamp_granularities[]** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
+| **timestamp_granularities** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
 
 ### 调用示例
 
@@ -183,7 +183,7 @@ curl -X POST "http://127.0.0.1:8888/v1/audio/transcriptions" \
   -F "file=@test.wav" \
   -F 'prompt={"no-chunk": true, "beam-size": 5}' \
   -F "response_format=verbose_json" \
-  -F "timestamp_granularities[]=segment"
+  -F "timestamp_granularities=["segment"]"
 ```
 
 - 命令行风格参数之间用空格分隔，不要加逗号
@@ -218,7 +218,7 @@ payload = {
     # 将字典转为 JSON 字符串
     "prompt": json.dumps(prompt_config),
     "response_format": "verbose_json",
-    "timestamp_granularities[]": "segment"  # 可选: segment 或 word
+    "timestamp_granularities": ["segment"]  # 可选: segment 或 word
 }
 
 with open(file_path, "rb") as f:
