@@ -13,7 +13,7 @@ from typing import Optional, Annotated
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 # 从 asr 中获取：主入口 + 构建 ArgumentParser 的函数
-from asr import main as asr_main, arg_parser
+from asr import main as asr_main, arg_parser, get_asr_model
 
 def get_local_ip():
     """
@@ -613,7 +613,9 @@ def transcriptions(
 
 
 def main():
-    """给 asr.py 调用的入口：选择端口 + 启动 uvicorn"""
+    """给 asr.py 调用的入口：预加载模型+选择端口 + 启动 uvicorn"""
+    get_asr_model()
+
     host = "0.0.0.0"
     local_ip = get_local_ip()
     port = find_free_port(host, 8888)

@@ -426,31 +426,48 @@ def arg_parser():
     )
     return parser
 
+_BATCH_SIZE_CACHE = None
+_BATCH_SIZE_LOCK = threading.Lock()
 def auto_tune_batch_size(model, max_duration_s):
     """
     根据显存自动估算 Batch Size
     """
+    global _BATCH_SIZE_CACHE
 
-    if not torch.cuda.is_available():
-        return 1
+     # 检查缓存，无锁读取，如果已存在直接返回
+    if _BATCH_SIZE_CACHE is not None:
+        return _BATCH_SIZE_CACHE
 
-    device = torch.cuda.current_device()
-    torch.cuda.empty_cache()
-    baseline = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
+    # 加锁计算，防止并发请求导致重复计算
+    with _BATCH_SIZE_LOCK:
+        # 双重检查，防止在等待锁的过程中已经被其他线程计算完了
+        if _BATCH_SIZE_CACHE is not None:
+            return _BATCH_SIZE_CACHE
 
-    try:
-        with torch.inference_mode():
-            # 构造 dummy 数据 (30s 空白音频)
-            _ = transcribe_audio(model, [torch.zeros(int(max_duration_s * SAMPLERATE), dtype=torch.float32)])
-
-    except RuntimeError:
-        return 1 # OOM 或其他错误，回退到 1
-
-    per_sample = max(torch.cuda.max_memory_allocated(device) - baseline, 1)
+        if not torch.cuda.is_available():
+            _BATCH_SIZE_CACHE = 1
+            return 1
     
-    # 计算理论最大值，至少为 1，0.7和2是安全限制
-    return max(1, int(torch.cuda.mem_get_info(device)[0] * 0.7) // per_sample // 2)
+        device = torch.cuda.current_device()
+        torch.cuda.empty_cache()
+        baseline = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    
+        try:
+            with torch.inference_mode():
+                # 构造 dummy 数据 (30s 空白音频)
+                _ = transcribe_audio(model, [torch.zeros(int(max_duration_s * SAMPLERATE), dtype=torch.float32)])
+    
+        except RuntimeError:
+            _BATCH_SIZE_CACHE = 1
+            return 1 # OOM 或其他错误，回退到 1
+    
+        per_sample = max(torch.cuda.max_memory_allocated(device) - baseline, 1)
+        result = max(1, int(torch.cuda.mem_get_info(device)[0] * 0.7) // per_sample // 2)
+
+        # 计算理论最大值，至少为 1，0.7和2是安全限制
+        _BATCH_SIZE_CACHE = result
+        return result
 
 def calibrate_zcr_threshold(speech_probs, zcr_array):
     """
