@@ -85,8 +85,6 @@ set "zcrTh=" & set "beamSize=" & set "batchSize=" & set "userFilter="
 
 echo ======================================================================
 
-set "inputFile="
-
 set /p "inputFile=请拖入您的音频/视频文件或输入它的完整路径，然后按回车键："
 
 rem 移除可能存在于路径开头和结尾的引号
@@ -250,7 +248,6 @@ echo.
 echo 请输入新数值，或直接按回车以使用默认值
 
 REM --- 询问 Batch Size ---
-set "batchParams="
 set /p "batchSize=输入 batch_size（批量推理大小，默认：自动估算，范围：1~1280（仅整数），超过16可能会增加延迟）："
 
 if NOT "!batchSize!"=="" (
@@ -258,8 +255,6 @@ if NOT "!batchSize!"=="" (
 )
 
 echo.
-
-set "beamParams="  REM 首先确保变量为空
 
 set /p "beamSize=输入 beam_size（集束搜索宽度，默认：4，范围：4~256（仅整数），更大的值可能更准确但更慢）："
 
@@ -403,13 +398,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令: reazonspeech "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!puncOption!!debugOption!!outputOptions!
+echo 最终执行的命令：reazonspeech "!inputFile!" !chunkOption!!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!audioFilterOption!!puncOption!!debugOption!!outputOptions!
 
 echo ======================================================================
 
 echo.
 
-reazonspeech "!inputFile!" %chunkOption%!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!puncOption!!debugOption!!outputOptions!
+reazonspeech "!inputFile!" !chunkOption!!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!audioFilterOption!!puncOption!!debugOption!!outputOptions!
 
 echo.
 

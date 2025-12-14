@@ -689,28 +689,21 @@ def get_speech_timestamps_onnx(
     将一段 waveform 转换为若干语音时间段
     """
     # 通过 ≤10 秒滑窗，拼出整段 speech_probs
-    total_duration_s = waveform.shape[1] / SAMPLERATE
-
     all_probs = []
     start_sample = 0
-    while start_sample < waveform.shape[1]:
-        end_sample = min(start_sample + int(10.0 * SAMPLERATE), waveform.shape[1])
+    total = waveform.shape[1]
+    while start_sample < total:
+        end_sample = min(start_sample + int(10.0 * SAMPLERATE), total)
+        # 如果尾巴太短于约1s，直接把本窗扩到结尾（吞尾巴）
+        if (total - end_sample) < SAMPLERATE:
+            end_sample = total
         # [1, T_chunk]
         chunk = waveform[:, start_sample:end_sample]
-        real_T = chunk.shape[1]
-
-        # 如果尾巴太短，就右侧补 0 到 pad_T
-        if real_T < 251:
-            pad_T = 512
-            chunk = torch.nn.functional.pad(chunk, (0, pad_T - real_T))
-        else:
-            pad_T = real_T
-
         #  ONNX 输出 (batch, T, classes)，取 [0] 变成 (T, classes)，再取[0]
         logits = torch.from_numpy(
             onnx_session.run(
                 None,
-                {"input_values": chunk.unsqueeze(0).numpy()}
+                {"input_values": chunk.contiguous().unsqueeze(0).numpy()}
             )[0]
             )[0]
 
@@ -721,11 +714,6 @@ def get_speech_timestamps_onnx(
         # 转回 Numpy 以便进入 Python 循环
         # logits[:, 0] > 静音维度，logits[:,1:] > 语音维度
         probs = torch.sigmoid(torch.logsumexp(logits[:,1:], dim=1) - logits[:, 0]).numpy()
-
-        # 把 probs 裁回“真实长度”对应的帧数，避免时间漂移
-        if real_T < pad_T:
-            probs = probs[:max(1, int(np.ceil(len(probs) * (real_T / pad_T))))]
-
         all_probs.append(probs)
         start_sample = end_sample
 
@@ -738,7 +726,7 @@ def get_speech_timestamps_onnx(
 
     # 统一按「整段时长 / 帧数」来近似每帧对应的时间长度
     # segmentation-3.0 实际上是 10ms 一帧，这个计算方式在任意长度下都一致
-    frame_duration_s = total_duration_s / num_frames
+    frame_duration_s = total / SAMPLERATE / num_frames
 
     # 双阈值 + 填平短静音 + 丢弃短语音 + 直接生成秒级区间
     # 最小语音段帧数（小于这个长度的语音段会被丢弃）
