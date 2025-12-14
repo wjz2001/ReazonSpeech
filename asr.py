@@ -697,6 +697,14 @@ def get_speech_timestamps_onnx(
         end_sample = min(start_sample + int(10.0 * SAMPLERATE), waveform.shape[1])
         # [1, T_chunk]
         chunk = waveform[:, start_sample:end_sample]
+        real_T = chunk.shape[1]
+
+        # 如果尾巴太短，就右侧补 0 到 pad_T
+        if real_T < 251:
+            pad_T = 512
+            chunk = torch.nn.functional.pad(chunk, (0, pad_T - real_T))
+        else:
+            pad_T = real_T
 
         #  ONNX 输出 (batch, T, classes)，取 [0] 变成 (T, classes)，再取[0]
         logits = torch.from_numpy(
@@ -713,6 +721,10 @@ def get_speech_timestamps_onnx(
         # 转回 Numpy 以便进入 Python 循环
         # logits[:, 0] > 静音维度，logits[:,1:] > 语音维度
         probs = torch.sigmoid(torch.logsumexp(logits[:,1:], dim=1) - logits[:, 0]).numpy()
+
+        # 把 probs 裁回“真实长度”对应的帧数，避免时间漂移
+        if real_T < pad_T:
+            probs = probs[:max(1, int(np.ceil(len(probs) * (real_T / pad_T))))]
 
         all_probs.append(probs)
         start_sample = end_sample
