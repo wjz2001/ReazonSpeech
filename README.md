@@ -85,20 +85,20 @@ reazonspeech 文件路径
 |-----------|:-------------:|:---------:|
 | `--audio-filter` | 添加ffmpeg音频滤镜参数 | `highpass=f=60,lowpass=f=8000` |
 
-- 不写 `--audio_filter`  
+- 不写 `--audio-filter`  
   **不启用任何滤镜**，推荐在录音干净时使用
 
-- 写 `--audio_filter` 但不带参数  
+- 写 `--audio-filter` 但不带参数  
   启用默认滤镜：`highpass=f=60,lowpass=f=8000`
 
   - highpass=f=60：去掉 60Hz 超低频
 
   - lowpass=f=8000：压除 8 kHz 以上的高频噪声，同时保留较多辅音高频
 
-- 写 `--audio_filter "[滤镜链参数]"`  
+- 写 `--audio-filter "[滤镜链参数]"`  
   把滤镜链参数原样传给 `ffmpeg -af` 例如：
 
-  `--audio_filter "highpass=f=60,lowpass=f=8000"`
+  `--audio-filter "highpass=f=60,lowpass=f=8000"`
 
   - [ffmpeg音频滤镜列表](https://ffmpeg.org/ffmpeg-filters.html#Audio-Filters)
 

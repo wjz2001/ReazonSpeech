@@ -140,17 +140,16 @@ else:
                 pass  # 某些精简系统可能没有 /proc/self/status
 
         # 退化方案：用 resource 的 ru_maxrss（历史最大常驻集）
-        if resource is not None:
-            try:
-                maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                # macOS 上 ru_maxrss 单位是 bytes；
-                if sys.platform == "darwin":
-                    return maxrss / (1024 ** 3)
-                else:
-                    # Linux 一般是 KB
-                    return maxrss / (1024 ** 2)
-            except Exception:
-                pass
+        try:
+            maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # macOS 上 ru_maxrss 单位是 bytes；
+            if sys.platform == "darwin":
+                return maxrss / (1024 ** 3)
+            else:
+                # Linux 一般是 KB
+                return maxrss / (1024 ** 2)
+        except Exception:
+            pass
 
         # 实在拿不到就返回 None
         return None
@@ -237,7 +236,7 @@ def arg_parser():
         choices=range(4, 257), # range(4, 257) 包含 4 到 256，不包含 257
         default=4,
         metavar="[4-256]", # 设置这个参数，帮助信息里就会显示为 [4-256]，而不是列出几十个数字
-        help="设置集束搜索（Beam Search）宽度，范围为 4 到 257 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
+        help="设置集束搜索（Beam Search）宽度，范围为 4 到 256 之间的整数，默认值是 4 ，更大的值可能更准确但更慢",
         )
 
     parser.add_argument(
@@ -692,6 +691,8 @@ def get_speech_timestamps_onnx(
     all_probs = []
     start_sample = 0
     total = waveform.shape[1]
+    # 预先计算重叠样本数
+    overlap_samples = int(OVERLAP_S * SAMPLERATE)
     while start_sample < total:
         end_sample = min(start_sample + int(10.0 * SAMPLERATE), total)
         # 如果尾巴太短于约1s，直接把本窗扩到结尾（吞尾巴）
@@ -705,7 +706,7 @@ def get_speech_timestamps_onnx(
                 None,
                 {"input_values": chunk.contiguous().unsqueeze(0).numpy()}
             )[0]
-            )[0]
+        )[0]
 
         # 聚合语音组能量 (Index 1-6)
         # torch.logsumexp 默认 keepdim=False，输入 (T,6) -> 输出 (T)
@@ -714,8 +715,29 @@ def get_speech_timestamps_onnx(
         # 转回 Numpy 以便进入 Python 循环
         # logits[:, 0] > 静音维度，logits[:,1:] > 语音维度
         probs = torch.sigmoid(torch.logsumexp(logits[:,1:], dim=1) - logits[:, 0]).numpy()
+        # 当前窗口的实际样本数
+        window_samples = end_sample - start_sample
+
+        # 只有当窗口样本数大于0时才处理
+        if window_samples > 0:
+            is_first = start_sample == 0
+            is_last = end_sample == total
+            # 计算“帧/样本”的缩放比例，需要裁剪的帧数
+            crop_frames = int(round(overlap_samples * len(probs) / window_samples))
+            
+            # 确定起止索引，如果是首窗，起点为0；否则裁剪掉头部重叠区
+            start_idx = 0 if is_first else crop_frames
+            
+            # 如果是尾窗，终点为总长度；否则裁剪掉尾部重叠区
+            end_idx = len(probs) if is_last else (len(probs) - crop_frames)
+            probs = probs[start_idx:end_idx]
+
         all_probs.append(probs)
-        start_sample = end_sample
+
+        if end_sample >= total:
+            break
+        start_sample += int((10.0 - OVERLAP_S * 2) * SAMPLERATE)
+
 
     if len(all_probs) == 1:
         speech_probs = all_probs[0]
@@ -958,7 +980,7 @@ def load_audio_ffmpeg(file, audio_filter):
                     + "\n"
                     "请尝试：\n"
                     "  1. 升级系统中的 ffmpeg 至较新版本；\n"
-                    "  2. 或者修改/移除 --audio_filter 参数\n"
+                    "  2. 或者修改/移除 --audio-filter 参数\n"
                     f"完整错误信息：\n{stderr_text}"
                 )
         raise RuntimeError(f"ffmpeg 解码失败，输出为空: {file}\nstderr={p.stderr.decode('utf-8', 'ignore')}")
@@ -1172,8 +1194,8 @@ def prepare_acoustic_features(waveform, speech_probs, frame_duration_s, use_zcr)
         
         # 使用 10% 分位数，防止极静帧导致门限失效
         # 这能有效忽略偶尔出现的数字静音 (0值)，找到真正的“底噪层”
-        # 乘以 2 倍作为安全门限，并设定 1e-4 的硬下限
-        noise_threshold = max(torch.quantile(frame_maxs_flat, 0.10).item() * 2, 1e-4)
+        # 乘以 2 倍作为安全门限，并设定 1e-6 的硬下限
+        noise_threshold = max(torch.quantile(frame_maxs_flat, 0.10).item() * 2, 1e-6)
         logger.debug(f"【ZCR】底噪门限已设定为：{noise_threshold:.6f}")
 
         # 计算 ZCR
@@ -1255,7 +1277,7 @@ def refine_tail_end_timestamp(
     dyn_tau = np.clip(np.percentile(p_smooth, percentile) + offset, 0.10, 0.95)
 
     # 取尾段能量的低分位数，找“相对安静”的能量水平
-    dyn_e_tau = max(np.percentile(e_smooth, energy_percentile) + energy_offset, 1e-4)
+    dyn_e_tau = max(np.percentile(e_smooth, energy_percentile) + energy_offset, 1e-6)
 
     min_silence_frames = max(1, int(min_silence_duration_ms / 1000.0 / frame_duration_s))
 
@@ -1434,9 +1456,9 @@ def main(argv=None):
 
     if args.input_file is None:
         # CLI 模式没传参数，自动转为启动 Server
-            import server 
-            server.main()
-            return  # 启动服务后直接结束 main 函数，防止往下执行报错
+        import server 
+        server.main()
+        return  # 启动服务后直接结束 main 函数，防止往下执行报错
 
     # 配置全局日志等级
     logger.set_debug(args.debug and not api_mode)
@@ -1496,19 +1518,6 @@ def main(argv=None):
                 parser.error(f"【参数错误】未添加 --refine-tail，不能设置参数 --{p}")
 
     if not args.no_chunk:
-        if onnxruntime is None:
-            logger.warn("缺少 onnxruntime，请运行 'pip install onnxruntime'")
-            if api_mode:
-                return {
-                    "error": {
-                        "message": "缺少 onnxruntime，请运行 'pip install onnxruntime'",
-                        "type": "server_error",         # 服务端环境问题
-                        "param": None,
-                        "code": "onnxruntime_missing",
-                    }
-                }
-            return
-
         if not (local_onnx_model_path := Path(__file__).resolve().parent / "models" / "model_quantized.onnx").exists():
             logger.warn(
                 f"未在 '{local_onnx_model_path}' 中找到 Pyannote-segmentation-3.0 模型"
@@ -1970,7 +1979,6 @@ def main(argv=None):
         # 检查用户是否指定了任何一种文件输出格式
         if not (file_output_requested := any(
                     (
-                        args.text,
                         args.segment,
                         args.segment2srt,
                         args.segment2vtt,

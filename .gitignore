@@ -4,7 +4,7 @@ __pycache__
 *.wav
 !/test.wav
 *.srt
-*.txt
+
 *.ass
 *.flac
 *.egg-info
@@ -15,3 +15,5 @@ __pycache__
 /pkg/k2-asr/build/
 /pkg/nemo-asr/build/
 /gitpush.bat
+/CLAUDE.md
+/AGENTS.md
