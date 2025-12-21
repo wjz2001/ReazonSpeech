@@ -74,6 +74,7 @@ set "zcrParams="
 set "beamParams="
 set "batchParams="
 set "audioFilterOption="
+set "limiterFilterOption="
 set "puncOption="
 set "debugOption="
 set "outputOptions="
@@ -264,36 +265,80 @@ if NOT "!beamSize!"=="" (
 
 echo.
 
-REM --- 询问 Audio Filter ---
-set "audioFilterOption="
-set "userFilter="
+REM --- 询问音频滤镜
+:AskFilter
 
-choice /c YN /m "是否使用 FFmpeg 音频滤镜？（Y=是；N=否）"
+echo ======================================================================
 
-if %ERRORLEVEL% == 2 (
+echo 请选择音频处理方式：
 
-    echo 已设置高级识别参数
+echo   1. 不使用任何滤镜
+
+echo   2. 使用标准音频滤镜（--audio-filter）
+
+echo   3. 使用带限制器的音频滤镜，可防止爆音（--limiter-filter）
+
+echo.
+
+choice /c 123 /m "请选择编号："
+
+if %ERRORLEVEL% == 1 (
+
+    echo 已选择不使用滤镜
+
+    echo 已完成高级识别参数设置
 
     goto AskPunctuation
+
 )
+
+if %ERRORLEVEL% == 2 goto UseAudioFilter
+if %ERRORLEVEL% == 3 goto UseLimiter
+
+:UseAudioFilter
 
 echo.
 
-echo 请输入滤镜链参数，或直接按回车以使用默认值（highpass=f=60,lowpass=f=8000）
+echo 请输入标准滤镜链参数，或直接按回车以使用默认值（highpass=f=60,lowpass=f=8000）
 
-set /p "userFilter=滤镜链参数："
+set /p "userFilter=标准滤镜参数："
 
 if "!userFilter!"=="" (
-    REM 用户回车，使用默认标志
     set "audioFilterOption= --audio-filter"
 ) else (
-    REM 用户输入了内容，加上引号以防空格截断
-    set "audioFilterOption= --audio-filter \"!userFilter!\""
+    set "audioFilterOption= --audio-filter "!userFilter!""
 )
 
-echo 已设置高级识别参数
+echo.
+
+echo 已完成高级识别参数设置
+
+goto AskPunctuation
+
+:UseLimiter
 
 echo.
+
+echo 使用 --limiter-filter 时必须手动输入滤镜参数值
+
+set /p "userLimiter=请输入限制器滤镜参数 (不能为空，例如：highpass=f=60)："
+
+if "!userLimiter!"=="" (
+
+    echo.
+
+    echo --limiter-filter 参数不能为空，请重新输入！
+
+    goto UseLimiter
+
+)
+set "limiterFilterOption= --limiter-filter "!userLimiter!""
+
+echo.
+
+echo 已完成高级识别参数设置
+
+goto AskPunctuation
 
 REM --- 询问是否保留句末标点 ---
 :AskPunctuation
@@ -398,13 +443,13 @@ echo ======================================================================
 
 echo 正在开始识别，请稍候……
 
-echo 最终执行的命令：reazonspeech "!inputFile!" !chunkOption!!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!audioFilterOption!!puncOption!!debugOption!!outputOptions!
+echo 最终执行的命令：reazonspeech "!inputFile!" !chunkOption!!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!audioFilterOption!!limiterFilterOption!!puncOption!!debugOption!!outputOptions!
 
 echo ======================================================================
 
 echo.
 
-reazonspeech "!inputFile!" !chunkOption!!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!audioFilterOption!!puncOption!!debugOption!!outputOptions!
+reazonspeech "!inputFile!" !chunkOption!!chunkParams!!zcrParams!!tailParams!!batchParams!!beamParams!!audioFilterOption!!limiterFilterOption!!puncOption!!debugOption!!outputOptions!
 
 echo.
 

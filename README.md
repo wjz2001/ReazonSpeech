@@ -84,8 +84,11 @@ reazonspeech 文件路径
 | 参数 | 作用 | 默认值 |
 |-----------|:-------------:|:---------:|
 | `--audio-filter` | 添加ffmpeg音频滤镜参数 | `highpass=f=60,lowpass=f=8000` |
+| `--limiter-filter` | 添加ffmpeg音频滤镜参数，并自动在滤镜链末尾附加 alimiter 限制器 | `无` |
 
-- 不写 `--audio-filter`  
+- `--audio-filter` 和 `--limiter-filter` 不能共存
+
+- 不写 `--audio-filter` 或不写 `--limiter-filter`
   **不启用任何滤镜**，推荐在录音干净时使用
 
 - 写 `--audio-filter` 但不带参数  
@@ -95,10 +98,14 @@ reazonspeech 文件路径
 
   - lowpass=f=8000：压除 8 kHz 以上的高频噪声，同时保留较多辅音高频
 
-- 写 `--audio-filter "[滤镜链参数]"`  
+- 写 `--audio-filter "[滤镜链参数]"` 或写 `--limiter-filter "[滤镜链参数]"`
   把滤镜链参数原样传给 `ffmpeg -af` 例如：
 
   `--audio-filter "highpass=f=60,lowpass=f=8000"`
+
+  `--limiter-filter "highpass=f=60,lowpass=f=8000"`
+
+  - `--limiter-filter`会自动在滤镜链末尾附加`alimiter=limit=0.98:level=disabled:attack=5:release=50:latency=1`
 
   - [ffmpeg音频滤镜列表](https://ffmpeg.org/ffmpeg-filters.html#Audio-Filters)
 
