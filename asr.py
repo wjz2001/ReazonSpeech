@@ -1,6 +1,7 @@
 import argparse
 import copy
 import ctypes
+import math
 import os
 import threading
 import tempfile
@@ -326,7 +327,7 @@ def arg_parser():
         help="【ZCR】开启自适应 ZCR 阈值计算，zcr_threshold作为兜底",
     )
 
-    # --- 段尾精修参数（必须先使用VAD） ---
+    # --- 精修参数（必须先使用VAD） ---
     parser.add_argument(
         "--refine-tail",
         action="store_true",
@@ -521,7 +522,7 @@ def auto_tune_batch_size(model, max_duration_s):
             return 1 # OOM 或其他错误，回退到 1
     
         per_sample = max(torch.cuda.max_memory_allocated(device) - baseline, 1)
-        result = max(1, int(torch.cuda.mem_get_info(device)[0] * 0.7) // per_sample // 2)
+        result = max(1, int(torch.cuda.mem_get_info(device)[0] * 0.7 // per_sample // 2))
 
         # 计算理论最大值，至少为 1，0.7和2是安全限制
         _BATCH_SIZE_CACHE = result
@@ -743,11 +744,13 @@ def get_speech_timestamps_onnx(
       speeches_ms: List[[start_ms, end_ms], ...]  # int ms
       speech_probs: np.ndarray                    # per-frame prob
       frame_duration_ms: float                    # ms per frame
+      frame_times_ms: np.ndarray                  # 每帧对应的绝对时间轴（ms），与 speech_probs 对齐
     使用 segmentation-3.0 ONNX + ≤10 秒滑窗 + 双阈值后处理，
     将一段 waveform 转换为若干语音时间段
     """
-    # 通过 ≤10 秒滑窗，拼出整段 speech_probs
+    # 通过 ≤10 秒滑窗，拼出整段 speech_probs 和 frame_times_ms
     all_probs = []
+    all_times = []
     start_sample = 0
     total = waveform.shape[1]
     # 预先计算重叠样本数
@@ -773,29 +776,34 @@ def get_speech_timestamps_onnx(
         # 竞争: 语音 - 静音，再Sigmoid
         # 转回 Numpy 以便进入 Python 循环
         # logits[:, 0] > 静音维度，logits[:,1:] > 语音维度
-        probs = torch.sigmoid(torch.logsumexp(logits[:,1:], dim=1) - logits[:, 0]).numpy()
+        probs_full = torch.sigmoid(torch.logsumexp(logits[:,1:], dim=1) - logits[:, 0]).numpy()
         # 当前窗口的实际样本数
         window_samples = end_sample - start_sample
 
         is_first = start_sample == 0
         is_last = end_sample == total
         # 计算“帧/样本”的缩放比例，需要裁剪的帧数
-        crop_frames = int(round(overlap_samples * len(probs) / window_samples))
+        crop_frames = int(round(overlap_samples * len(probs_full) / window_samples))
         
         # 确定起止索引，如果是首窗，起点为0；否则裁剪掉头部重叠区
         start_idx = 0 if is_first else crop_frames
         
         # 如果是尾窗，终点为总长度；否则裁剪掉尾部重叠区
-        end_idx = len(probs) if is_last else (len(probs) - crop_frames)
-        probs = probs[start_idx:end_idx]
+        end_idx = len(probs_full) if is_last else (len(probs_full) - crop_frames)
 
-        all_probs.append(probs)
+        # 拼 frame_times_ms：用该窗“真实覆盖时长 / 该窗输出帧数”做线性映射，再按同样裁剪
+        hop_ms = (window_samples * 1000.0 / SAMPLERATE) / len(probs_full)
+        times_full = start_sample * 1000.0 / SAMPLERATE + np.arange(len(probs_full), dtype=np.float32) * hop_ms
+
+        all_probs.append(probs_full[start_idx:end_idx])
+        all_times.append(times_full[start_idx:end_idx])
 
         if end_sample >= total:
             break
         start_sample += int(round((10000 - OVERLAP_MS * 2) * SAMPLERATE / 1000))
 
     speech_probs = all_probs[0] if len(all_probs) == 1 else np.concatenate(all_probs, axis=0)
+    frame_times_ms = all_times[0] if len(all_times) == 1 else np.concatenate(all_times, axis=0)
 
     num_frames = speech_probs.shape[0]
 
@@ -805,9 +813,9 @@ def get_speech_timestamps_onnx(
 
     # 双阈值 + 填平短静音 + 丢弃短语音 + 直接生成秒级区间
     # 最小语音段帧数（小于这个长度的语音段会被丢弃）
-    min_speech_frames = max(1, int(min_speech_duration_ms / frame_duration_ms))
+    min_speech_frames = math.ceil(min_speech_duration_ms / frame_duration_ms)
     # 最小静音段帧数（短于这个长度的静音视为“短静音”，会被填平）
-    min_silence_frames = max(1, int(min_silence_duration_ms / frame_duration_ms))
+    min_silence_frames = math.ceil(min_silence_duration_ms / frame_duration_ms)
 
     speeches = []           # 直接存毫秒级结果 [[start_ms, end_ms], ...]
     in_speech = False       # 当前是否处于语音段中
@@ -833,7 +841,7 @@ def get_speech_timestamps_onnx(
                     # 大于等于 min_speech_frames 才是真正的语音块
                     if (seg_end_f - seg_start_f) >= min_speech_frames:
                         start_ms = int(seg_start_f * frame_duration_ms)
-                        end_ms = int(np.ceil(seg_end_f * frame_duration_ms))
+                        end_ms = math.ceil(seg_end_f * frame_duration_ms)
                         speeches.append([start_ms, end_ms])
                     # 重置状态，等待下一段
                     in_speech = False
@@ -848,15 +856,15 @@ def get_speech_timestamps_onnx(
         seg_end_f = num_frames
         if (seg_end_f - seg_start_f) >= min_speech_frames:
             start_ms = int(seg_start_f * frame_duration_ms)
-            end_ms = int(np.ceil(seg_end_f * frame_duration_ms))
+            end_ms = math.ceil(seg_end_f * frame_duration_ms)
             speeches.append([start_ms, end_ms])
 
-    # 完整的语音概率数组 speech_probs 和每一帧的持续时间 frame_duration_ms
-    return speeches, speech_probs, frame_duration_ms
+    # 完整的语音概率数组 speech_probs 、每一帧的持续时间 frame_duration_ms、每帧对应的绝对时间轴 frame_times_ms
+    return speeches, speech_probs, frame_duration_ms, frame_times_ms
 
 def global_smart_segmenter(
     start_ms, end_ms, speech_probs,
-    energy_array, frame_duration_ms, max_duration_ms,
+    energy_array, frame_times_ms, max_duration_ms,
     vad_threshold, zcr_threshold, zcr_array):
     """
     入口函数：分析一个长 VAD 段，返回切割好的子段列表。
@@ -879,9 +887,7 @@ def global_smart_segmenter(
         }
     """
     def _frame_cost(frame_idx):
-        """计算单帧作为切分点的代价（代价越低越适合切分）
-           ZCR 判定使用 max(|x1|, |x2|) > th
-        """
+        """计算单帧作为切分点的代价（代价越低越适合切分）"""
         # 基础 VAD 概率成本
         if speech_probs[frame_idx] > vad_threshold:
             return 100.0  # 惩罚高概率点，强硬约束：确信是语音的地方绝不切
@@ -910,8 +916,9 @@ def global_smart_segmenter(
     # 生成候选点（筛选 VAD 概率 < max(0.15, vad_threshold - 0.15) 的局部低点）
     candidates = []
     # 边界保护：避免切在段首/段尾靠得太近
-    search_start = int(start_ms / frame_duration_ms) + int(OVERLAP_MS / frame_duration_ms)
-    search_end = int(end_ms / frame_duration_ms) - int(OVERLAP_MS / frame_duration_ms)
+    # 用 frame_times_ms 反查 frame 索引
+    search_start = int(np.searchsorted(frame_times_ms, start_ms + OVERLAP_MS, side="left"))
+    search_end = int(np.searchsorted(frame_times_ms, end_ms - OVERLAP_MS, side="right"))
 
     # 提取搜索区间的概率
     # search_end > search_start + 2 是为了确保区间内至少有 3 帧数据
@@ -930,7 +937,11 @@ def global_smart_segmenter(
         # 还原绝对索引：+1 是因为 p_curr 从切片的第1个元素开始，+search_start 是切片偏移
         # 遍历筛选出的索引计算成本
         for idx in (np.where(mask)[0] + 1 + search_start):
-            candidates.append({"frame": idx, "time": int(round(idx * frame_duration_ms)), "cost": _frame_cost(idx)})
+            candidates.append({
+                "frame": idx,
+                "time": int(round(frame_times_ms[idx])),
+                "cost": _frame_cost(idx)
+            })
 
     segments = []
     curr_start = start_ms
@@ -1380,45 +1391,52 @@ def prepare_acoustic_features(waveform, speech_probs, frame_duration_ms, use_zcr
     
     return speech_probs, energy_array, zcr_array
 
-def refine_tail_end_timestamp(
+def refine_tail_timestamp(
     last_token_start_ms,   # 该段最后一个子词的开始时间
     rough_end_ms,          # 原段结束时间
-    speech_probs,         # VAD 概率序列（get_speech_timestamps_onnx 返回的第二项）
+    speech_probs,          # VAD 概率序列（get_speech_timestamps_onnx 返回的第二项）
     frame_duration_ms,
+    frame_times_ms,        # 每帧对应的绝对时间（ms），长度与 speech_probs 对齐
     max_end_ms,            # 该段所属 VAD 大块的硬上限
     min_silence_duration_ms,   # 判定静音的最小时长
-    lookahead_ms,         # 发现静音后再向后看一点，避免马上回到语音
-    safety_margin_ms,     # 安全边距，避免切在突变点
-    min_tail_keep_ms,     # 至少保留最后 token 后的这点时长，避免切得太硬
-    percentile,           # 自适应阈值，值越大，越容易将高概率有语音区域判为静音
-    offset,               # 在自适应阈值的基础上增加的固定偏移量，值越大，越容易将高概率区域有语音区域判为静音
+    lookahead_ms,          # 发现静音后再向后看一点，避免马上回到语音（clamp 在区间内）
+    safety_margin_ms,      # 安全边距，避免切在突变点
+    min_tail_keep_ms,      # 至少保留最后 token 后的这点时长，避免切得太硬
+    percentile,            # 自适应阈值，值越大，越容易将高概率有语音区域判为静音
+    offset,                # 在自适应阈值的基础上增加的固定偏移量，值越大，越容易将高概率区域有语音区域判为静音
     energy_array,
     energy_percentile,
     energy_offset,
     use_zcr,
     zcr_threshold,
     zcr_array,
-    zcr_high_ratio,  # 高ZCR帧的占比阈值
-    kernel
+    zcr_high_ratio,        # 高ZCR帧的占比阈值
+    kernel,
+    allow_extra_tail  # True: 允许向外多看 1s（段尾）；False: 不允许（句首反向精修）
 ):
     """
-    在 [last_token_start_s, max_end_s] 范围内做所有自适应统计（percentile 等），
-    正常情况下只在这个范围内找切点
-    如果在这段内出现 “概率突然掉、但能量或 ZCR 仍然偏高” 的可疑静音，
-    则允许在额外的 1 秒尾巴内继续按同一阈值寻找真正静音切点
-    """
-    # 仅在“最后子词之后”的尾窗内搜索
-    start_idx = int(last_token_start_ms / frame_duration_ms)
-    end_idx = int(np.ceil(max_end_ms / frame_duration_ms))
+    在 [last_token_start_ms, max_end_ms] 范围内做所有自适应统计（percentile 等），
+    正常情况下只在这个范围内找切点。
 
-    # 允许在 [max_end_s, max_end_s + 1] 内额外搜索，但不用于统计阈值
-    search_end_idx = int(np.ceil((max_end_ms + OVERLAP_MS) / frame_duration_ms))
+    - allow_extra_tail=True 时：
+      如果在这段内出现 “概率突然掉、但能量或 ZCR 仍然偏高” 的可疑静音，
+      则允许在额外的 1 秒尾巴内继续按同一阈值寻找真正静音切点。
+    - allow_extra_tail=False 时：
+      严格限制在 max_end_ms 以内（用于句首反向精修）。
+    """
+    # 仅在“最后子词之后”的尾窗内搜索（用 frame_times_ms 对齐索引，避免漂移）
+    start_idx = int(np.searchsorted(frame_times_ms, last_token_start_ms, side="left"))
+    end_idx = int(np.searchsorted(frame_times_ms, max_end_ms, side="right"))
+
+    # 允许在 [max_end_ms, max_end_ms + 1s] 内额外搜索，但不用于统计阈值（可关闭）
+    extra_ms = OVERLAP_MS if allow_extra_tail else 0
+    search_end_idx = int(np.searchsorted(frame_times_ms, max_end_ms + extra_ms, side="right"))
 
     # 至少要有 4 帧才能进行有效的统计学分析
     if start_idx >= len(speech_probs) or end_idx - start_idx <= 4:
         return min(rough_end_ms, max_end_ms)
 
-    # 只在 [last_token_start_s, max_end_s] 这一截上做平滑和统计
+    # 只在 [last_token_start_ms, max_end_ms] 这一截上做平滑和统计
     p_smooth = np.convolve(speech_probs[start_idx:end_idx], kernel, mode="same")
     e_smooth = np.convolve(energy_array[start_idx:end_idx], kernel, mode="same")
 
@@ -1430,13 +1448,13 @@ def refine_tail_end_timestamp(
     # 取尾段能量的低分位数，找“相对安静”的能量水平
     dyn_e_tau = max(np.percentile(e_smooth, energy_percentile) + energy_offset, 1e-6)
 
-    min_silence_frames = max(1, int(min_silence_duration_ms / frame_duration_ms))
+    min_silence_frames = math.ceil(min_silence_duration_ms / frame_duration_ms)
 
     def _is_sudden_drop_with_high_acoustic(i):
         """
         判定当前以 i 为起点、长度为 min_silence_frames 的窗口是否属于：
         “概率突然掉，但能量/ZCR 仍然偏高”的可疑静音
-        只基于 [last_token_start_s, max_end_s] 内的数据进行判断
+        只基于 [last_token_start_ms, max_end_ms] 内的数据进行判断
         """
         # 检测“概率突降 + 能量/ZCR 仍偏高”的窗口时，回看多长时间（秒 -> 帧）
         sudden_window_frames = max(4,
@@ -1498,7 +1516,7 @@ def refine_tail_end_timestamp(
         if not (np.mean(e_smooth[i : i + min_silence_frames]) < dyn_e_tau):
             return False
 
-        # 3. ZCR 保护 (检测清辅音)
+        # ZCR 保护 (检测清辅音)
         if use_zcr:
             z_start = global_base_idx + i
             z_end = z_start + min_silence_frames
@@ -1508,31 +1526,38 @@ def refine_tail_end_timestamp(
             high_zcr_ratio = np.mean(zcr_array[z_start:z_end] > zcr_threshold)
             # 只有当高 ZCR 帧的比例超过设定值（如 0.3）时，才触发保护
             if high_zcr_ratio > zcr_high_ratio:
-                logger.debug(f"【ZCR】疑似静音段 {SRTWriter._format_time(z_start * frame_duration_ms / 1000)} --> {SRTWriter._format_time(z_end * frame_duration_ms / 1000)} 内高频帧占比 {high_zcr_ratio:.2f} > {zcr_high_ratio}，视为清辅音，跳过切分")
+                # 这里仍用 frame_duration_ms 做日志的近似展示（核心时间戳计算已改用 frame_times_ms）
+                logger.debug(
+                    f"【ZCR】疑似静音段 {SRTWriter._format_time((z_start * frame_duration_ms) / 1000)} --> {SRTWriter._format_time((z_end * frame_duration_ms) / 1000)} 内高频帧占比 {high_zcr_ratio:.2f} > {zcr_high_ratio}，视为清辅音，跳过切分"
+                )
                 return False
 
-        # 滞回检查 —— 确认后面不会马上回到高概率语音
-        if i + min_silence_frames < min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / frame_duration_ms)):
-            if np.any(p_smooth[i + min_silence_frames:min(len(p_smooth), i + min_silence_frames + int(lookahead_ms / frame_duration_ms))] >= min(0.98, dyn_tau + offset)):
-                # 后面很快又高概率说话了，不当静音切点
+        # 滞回检查 —— 确认后面不会马上回到高概率语音（clamp 在区间内）
+        lookahead_frames = math.ceil(lookahead_ms / frame_duration_ms)
+        if i + min_silence_frames < min(len(p_smooth), i + min_silence_frames + lookahead_frames):
+            if np.any(
+                p_smooth[
+                    i + min_silence_frames : min(len(p_smooth), i + min_silence_frames + lookahead_frames)
+                ] >= min(0.98, dyn_tau + offset)
+            ):
                 return False
 
         return True
 
     def _calc_refined_time(idx_offset, limit_ms):
-        """计算最终时间戳，应用安全边距和最大限制"""
+        """计算最终时间戳（ms），应用安全边距和最大限制；idx_offset 为全局帧索引"""
         return min(
             max(
-                idx_offset * frame_duration_ms + safety_margin_ms,
+                frame_times_ms[idx_offset] + safety_margin_ms,
                 last_token_start_ms + min_tail_keep_ms
             ),
             limit_ms
-            )
+        )
 
     # 标记：是否在分析区间内遇到过“概率突降 + 高能量/ZCR”的可疑静音
     allow_use_extra_tail = False
 
-    # === 只在 [last_token_start_s, max_end_s] 内做切分 ===
+    # === 只在 [last_token_start_ms, max_end_ms] 内做切分 ===
     for i in range(len(p_smooth) - min_silence_frames + 1):
         # 检查这段是否属于「概率突降 + 高能量/ZCR」的可疑静音
         if _is_sudden_drop_with_high_acoustic(i):
@@ -1544,9 +1569,8 @@ def refine_tail_end_timestamp(
         if _is_stable_silence(i, p_smooth, e_smooth, start_idx):
             return _calc_refined_time(start_idx + i, max_end_ms)
 
-    # === 第二阶段：是否允许在 [max_end_s, max_end_s + 1] 内继续找切点 ===
-    if not allow_use_extra_tail:
-        # 没有出现“可疑静音”，严格限制在 max_end_s 以内
+    # === 第二阶段：是否允许在 [max_end_ms, max_end_ms + 1s] 内继续找切点 ===
+    if (not allow_extra_tail) or (not allow_use_extra_tail):
         return min(rough_end_ms, max_end_ms)
 
     # 有可疑静音，可以利用已有阈值在多出的 1 秒内继续搜索
@@ -1867,8 +1891,8 @@ def main(argv=None):
             vad_model_load_end = time.perf_counter()
             logger.info(f"【VAD】模型加载完成")
 
-            # 运行 VAD (代码逻辑保持不变)
-            speeches, speech_probs, frame_duration_ms = get_speech_timestamps_onnx(
+            # 运行 VAD
+            speeches, speech_probs, frame_duration_ms, frame_times_ms = get_speech_timestamps_onnx(
                 waveform,
                 onnx_session,
                 args.vad_threshold,
@@ -1895,6 +1919,8 @@ def main(argv=None):
             # 声学特征准备
             if args.auto_zcr or args.refine_tail:
                 speech_probs, energy_array, zcr_array = prepare_acoustic_features(waveform, speech_probs, frame_duration_ms, args.zcr)
+            # 对齐 frame_times_ms
+            frame_times_ms = frame_times_ms[:len(speech_probs)]
 
             # ZCR 阈值校准 
             # 确定最终使用的 ZCR 阈值
@@ -1963,7 +1989,7 @@ def main(argv=None):
                 else:
                     # === 长块 (二次切分) ===
                     # 运行局部 VAD
-                    sub_speeches, sub_speech_probs, sub_frame_duration_ms = get_speech_timestamps_onnx(
+                    sub_speeches, sub_speech_probs, sub_frame_duration_ms, sub_frame_times_ms = get_speech_timestamps_onnx(
                         chunk,
                         onnx_session,
                         args.vad_threshold,
@@ -1982,6 +2008,9 @@ def main(argv=None):
                     sub_speech_probs, sub_energy_array, sub_zcr_array = prepare_acoustic_features(
                             chunk, sub_speech_probs, sub_frame_duration_ms, args.zcr
                     )
+
+                    # 对齐 frame_times_ms
+                    sub_frame_times_ms = sub_frame_times_ms[:len(sub_speech_probs)]
                     
                     # 智能切分
                     nonsilent_ranges_ms = [] 
@@ -1996,7 +2025,7 @@ def main(argv=None):
                                 seg[1],
                                 sub_speech_probs,      # 局部概率
                                 sub_energy_array,      # 局部能量
-                                sub_frame_duration_ms,  # 局部帧长
+                                sub_frame_times_ms,
                                 MAX_SPEECH_DURATION_MS,
                                 args.vad_threshold,
                                 final_zcr_threshold,   # 复用全局计算出的最佳阈值
@@ -2086,17 +2115,18 @@ def main(argv=None):
         logger.info("文本片段生成完成")
 
         if args.refine_tail: # 只在启用精修且map存在时精修
-            logger.info("【精修】正在修除每段的尾部静音……")
-
             # 短窗平滑，5 是窗口大小
             kernel = np.ones(5, dtype=np.float32) / 5
+
+            logger.info("【精修】正在修除每段的尾部静音……")
             for i, segment in enumerate(all_segments):
                 # 遍历map，所以需要通过索引i来更新原始的all_segments列表
-                segment.end_seconds = refine_tail_end_timestamp(
+                segment.end_seconds = refine_tail_timestamp(
                     int(round(segment.subwords[-1].seconds * 1000)),
                     int(round(segment.end_seconds * 1000)),
                     speech_probs,
                     frame_duration_ms,
+                    frame_times_ms,
                     int(round((min(segment.vad_limit, all_segments[i + 1].start_seconds) if i < len(all_segments) - 1 else segment.vad_limit) * 1000)),
                     args.min_silence_duration_ms,
                     args.tail_lookahead_ms,
@@ -2111,9 +2141,9 @@ def main(argv=None):
                     final_zcr_threshold,
                     zcr_array,
                     args.tail_zcr_high_ratio,
-                    kernel
+                    kernel,
+                    allow_extra_tail=True
                 ) / 1000
-
             # 邻段防重叠微调
             for i in range(len(all_segments) - 1):
                 if all_segments[i].end_seconds > all_segments[i + 1].start_seconds:
@@ -2275,7 +2305,7 @@ def main(argv=None):
 
                 for segment in all_segments:
                     karaoke_text = "".join(
-                        f"{{\\k{max(1, round((sub.end_seconds - sub.seconds) * 100))}}}{sub.token}"
+                        f"{{\\k{math.ceil(round((sub.end_seconds - sub.seconds) * 100))}}}{sub.token}"
                         for sub in segment.subwords
                     )
                     f.write(f"Dialogue: 0,{ASSWriter._format_time(segment.start_seconds)},{ASSWriter._format_time(segment.end_seconds)},Default,,0,0,0,,{karaoke_text}\n")
