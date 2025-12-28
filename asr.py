@@ -478,10 +478,8 @@ def assign_vad_ownership_keep_windows(vad_segments, keep_silence_ms, total_durat
 
     # 补齐字段
     for i in range(n):
-        seg = vad_segments[i]
-
-        seg["own_keep_start_ms"] = own_keep_start_ms[i]
-        seg["own_keep_end_ms"] = own_keep_end_ms[i]
+        vad_segments[i]["own_keep_start_ms"] = own_keep_start_ms[i]
+        vad_segments[i]["own_keep_end_ms"] = own_keep_end_ms[i]
 
     return vad_segments
 
@@ -880,10 +878,10 @@ def global_smart_segmenter(
     返回：List[dict]
       每个元素：
         {
-          "start_ms": 推理段起点（秒，包含重叠区），
-          "end_ms": 推理段终点（秒，包含重叠区），
-          "keep_start_ms": 提交窗口起点（秒，中段起点），
-          "keep_end_ms": 提交窗口终点（秒，中段终点），
+          "start_ms": 推理段起点（毫秒，包含重叠区），
+          "end_ms": 推理段终点（毫秒，包含重叠区），
+          "keep_start_ms": 提交窗口起点（毫秒，中段起点），
+          "keep_end_ms": 提交窗口终点（毫秒，中段终点），
         }
     """
     def _frame_cost(frame_idx):
@@ -1411,26 +1409,20 @@ def refine_tail_timestamp(
     zcr_threshold,
     zcr_array,
     zcr_high_ratio,        # 高ZCR帧的占比阈值
-    kernel,
-    allow_extra_tail  # True: 允许向外多看 1s（段尾）；False: 不允许（句首反向精修）
+    kernel
 ):
     """
     在 [last_token_start_ms, max_end_ms] 范围内做所有自适应统计（percentile 等），
-    正常情况下只在这个范围内找切点。
-
-    - allow_extra_tail=True 时：
-      如果在这段内出现 “概率突然掉、但能量或 ZCR 仍然偏高” 的可疑静音，
-      则允许在额外的 1 秒尾巴内继续按同一阈值寻找真正静音切点。
-    - allow_extra_tail=False 时：
-      严格限制在 max_end_ms 以内（用于句首反向精修）。
+    正常情况下只在这个范围内找切点
+    如果在这段内出现 “概率突然掉、但能量或 ZCR 仍然偏高” 的可疑静音，
+    则允许在额外的 1 秒尾巴内继续按同一阈值寻找真正静音切点。
     """
     # 仅在“最后子词之后”的尾窗内搜索（用 frame_times_ms 对齐索引，避免漂移）
     start_idx = int(np.searchsorted(frame_times_ms, last_token_start_ms, side="left"))
     end_idx = int(np.searchsorted(frame_times_ms, max_end_ms, side="right"))
 
     # 允许在 [max_end_ms, max_end_ms + 1s] 内额外搜索，但不用于统计阈值（可关闭）
-    extra_ms = OVERLAP_MS if allow_extra_tail else 0
-    search_end_idx = int(np.searchsorted(frame_times_ms, max_end_ms + extra_ms, side="right"))
+    search_end_idx = int(np.searchsorted(frame_times_ms, max_end_ms + OVERLAP_MS, side="right"))
 
     # 至少要有 4 帧才能进行有效的统计学分析
     if start_idx >= len(speech_probs) or end_idx - start_idx <= 4:
@@ -1570,7 +1562,7 @@ def refine_tail_timestamp(
             return _calc_refined_time(start_idx + i, max_end_ms)
 
     # === 第二阶段：是否允许在 [max_end_ms, max_end_ms + 1s] 内继续找切点 ===
-    if (not allow_extra_tail) or (not allow_use_extra_tail):
+    if not allow_use_extra_tail:
         return min(rough_end_ms, max_end_ms)
 
     # 有可疑静音，可以利用已有阈值在多出的 1 秒内继续搜索
@@ -2141,8 +2133,7 @@ def main(argv=None):
                     final_zcr_threshold,
                     zcr_array,
                     args.tail_zcr_high_ratio,
-                    kernel,
-                    allow_extra_tail=True
+                    kernel
                 ) / 1000
             # 邻段防重叠微调
             for i in range(len(all_segments) - 1):

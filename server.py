@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import contextlib
+import io
 import re
 import shlex
 import shutil
@@ -454,6 +456,63 @@ def transcriptions(
 
         # 组装 argv 并调用 asr.main(argv=...)
         # argv 有值 => asr.main 会进入 API 模式，并返回内存中的结果 dict
+        prompt_warnings = []
+        # 必须同时满足
+        # _apply_prompt_to_argv 不抛 HTTPException
+        # 最终拼出来的 argv 能被 asr.arg_parser() 解析通过（否则说明 prompt 里有垃圾 token）
+        user_prompt_ok = False
+        if not prompt.strip():
+            prompt_warnings.append("未输入任何提示词")
+            prompt = ""
+        else:
+            try:
+                tmp_argv = [input_path]
+                _apply_prompt_to_argv(tmp_argv, prompt)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    arg_parser().parse_args(tmp_argv)
+                user_prompt_ok = True
+            except (HTTPException, SystemExit):
+                # 无论用户乱填啥都不报错，直接忽略用户 prompt，尝试 fallback
+                prompt_warnings.append("提示词不符合格式要求")
+                prompt = ""
+
+        # prompt 为空或无效 -> 尝试读取 server.py 同级目录下的 reazonspeechprompt.txt
+        if not user_prompt_ok:
+            fallback_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "reazonspeechprompt.txt"
+            )
+
+            file_prompt_raw = ""
+            if os.path.isfile(fallback_path):
+                try:
+                    with open(fallback_path, "r", encoding="utf-8-sig") as f:
+                        file_prompt_raw = f.read()
+                except Exception:
+                    file_prompt_raw = ""
+            else:
+                prompt_warnings.append("找不到 reazonspeechprompt.txt")
+
+            file_prompt = file_prompt_raw.strip()
+            if not file_prompt:
+                prompt_warnings.append("reazonspeechprompt.txt 中无内容")
+                prompt = ""
+            else:
+                try:
+                    tmp_argv = [input_path]
+                    _apply_prompt_to_argv(tmp_argv, file_prompt)
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        arg_parser().parse_args(tmp_argv)
+                    prompt = file_prompt
+                    prompt_warnings.append("使用 reazonspeechprompt.txt 中的内容作为提示词")
+                except (HTTPException, SystemExit):
+                    prompt_warnings.append("reazonspeechprompt.txt 中的内容不符合格式要求")
+                    prompt = ""
+
+        # 只在服务端日志打印，不返回给客户端，不影响识别流程
+        if prompt_warnings:
+            print(f"【提示词错误】{prompt_warnings}")
+
         if mode == "openai":
             argv = build_argv_openai(input_path, prompt, rf, timestamp_granularities)
         else:

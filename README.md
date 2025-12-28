@@ -10,11 +10,13 @@ project.
 
 ## nemo版部署
 
-### 零、配置 python3 环境
+### 零、配置环境
 
 如果你的设备未安装python3.10，请照此[教程](https://pvt9.com/_posts/pythoninstall)安装
 
 如果你在国内，请自行搜索“pip 使用国内镜像源”相关教程
+
+[windows安装cuda和cudnn](https://www.cnblogs.com/RiverRiver/p/18103991)
 
 
 ### 一、下载程序
@@ -67,7 +69,7 @@ python -m venv venv
 ## 用法
 
 ```bash
-reazonspeech 文件路径
+reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 ```
 
 ### 其他参数
@@ -178,6 +180,19 @@ reazonspeech
 | **response_format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`<br>2. **ReazonSpeech 专用格式**：如 `kass`，`segment2tsv` 等（即上面的输出参数去除开头短横线，多个参数用逗号分隔） |
 | **prompt** | 否 | **配置除输出参数和debug参数外所有参数**：<br>在此处传入所有支持除输出参数和debug参数外所有的配置参数 |
 | **timestamp_granularities** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
+
+- 如果你的应用不支持输入或自定义 prompt 提示词，那么可以在根目录下新建文件 `reazonspeechprompt.txt`，在其中填写 prompt 参数，示例如下：
+
+```
+--beam 5 --no-chunk
+```
+
+```
+{
+  "beam": 5,
+  "no_chunk": true
+}
+```
 
 ### 调用示例
 
