@@ -578,7 +578,7 @@ def transcriptions(
             verbose: dict = {
                 "task": "transcribe",
                 "language": "japanese",
-                "duration": 0.0,
+                "duration": duration,
                 "text": result["text"] or "",
             }
 
@@ -618,8 +618,6 @@ def transcriptions(
                     )
                 if words:
                     verbose["words"] = words
-            
-            verbose["duration"] = duration
 
             # usage：写整段音频实际时长（秒）
             verbose["usage"] = {

@@ -860,6 +860,32 @@ def get_speech_timestamps_onnx(
     # 完整的语音概率数组 speech_probs 、每一帧的持续时间 frame_duration_ms、每帧对应的绝对时间轴 frame_times_ms
     return speeches, speech_probs, frame_duration_ms, frame_times_ms
 
+_VAD_ONNX_SESSION = None
+_VAD_ONNX_MODEL_LOAD_COST = 0.0
+_VAD_ONNX_SESSION_LOCK = threading.Lock()
+def get_vad_onnx_session(model_path):
+    """
+    获取 Pyannote-segmentation-3.0 的 onnxruntime.InferenceSession 单例，复用已加载 Session
+    """
+    global _VAD_ONNX_SESSION, _VAD_ONNX_MODEL_LOAD_COST
+
+    with _VAD_ONNX_SESSION_LOCK:
+        if _VAD_ONNX_SESSION is None:
+
+            vad_model_load_start = time.perf_counter()
+            logger.info("【VAD】正在从本地路径加载 Pyannote-segmentation-3.0 模型……")
+            session = onnxruntime.InferenceSession(
+                str(model_path),
+                providers=["CPUExecutionProvider"]
+            )
+            vad_model_load_end = time.perf_counter()
+            logger.info(f"【VAD】模型加载完成")
+    
+            _VAD_ONNX_SESSION = session
+            _VAD_ONNX_MODEL_LOAD_COST = vad_model_load_end - vad_model_load_start
+
+        return _VAD_ONNX_SESSION
+
 def global_smart_segmenter(
     start_ms, end_ms, speech_probs,
     energy_array, frame_times_ms, max_duration_ms,
@@ -1281,28 +1307,49 @@ def open_folder(path):
     如果 path 是文件，则打开其所在文件夹并选中（高亮）该文件（仅限 Win/Mac）
     如果 path 是文件夹，则直接打开该文件夹
     """
-    path = Path(path).resolve() # 确保是绝对路径
+    path = Path(path).resolve()
     if not path.exists():
-        logger.warn(f"目录 '{path}' 不存在，无法自动打开")
+        logger.warn(f"路径 '{path}' 不存在，无法自动打开")
         return
+
+    opened_target = None # 记录“实际传给系统打开器”的对象
+
     try:
+        # returncode == 0 通常表示命令被成功接收执行
         if sys.platform == "win32":
             if path.is_file():
+                opened_target = path
                 # Windows 使用 explorer /select,"文件路径" 来高亮文件
-                subprocess.run(["explorer", "/select,", str(path)])
+                cp = subprocess.run(["explorer", "/select,", str(path)], check=False)
+                ok = (cp.returncode == 0)
             else:
-                os.startfile(path)
+                opened_target = path
+                os.startfile(path)  # Windows 专用“用默认关联程序打开”，无 returncode
+                ok = True
 
-        elif sys.platform == "darwin":  # macOS
-            # macOS 使用 open -R "文件路径" 来在 Finder 中揭示文件
-            subprocess.run(["open", "-R", str(path)])
+        elif sys.platform == "darwin":
+            if path.is_file():
+                opened_target = path
+                # macOS 使用 open -R "文件路径" 来在 Finder 中揭示文件
+                cp = subprocess.run(["open", "-R", str(path)], check=False)
+            else:
+                opened_target = path
+                cp = subprocess.run(["open", str(path)], check=False)
+            ok = (cp.returncode == 0)
 
-        else:  # Linux and other Unix-like
-            target = path.parent if path.is_file() else path
-            subprocess.run(["xdg-open", str(target)])
-        logger.info(f"已自动为您打开目录：{path}")
+        else:
+            #如果传入的是文件：打开父目录；如果传入的是目录：直接打开目录
+            opened_target = path.parent if path.is_file() else path
+            cp = subprocess.run(["xdg-open", str(opened_target)], check=False)
+            ok = (cp.returncode == 0)
+
+        if ok:
+            logger.info(f"已打开：{opened_target}")
+        else:
+            logger.warn(f"尝试打开目录失败（returncode={cp.returncode}），请手动访问：{opened_target}")
+
     except Exception as e:
-        logger.warn(f"尝试自动打开目录失败：{e}，请手动访问：{path}")
+        logger.warn(f"尝试自动打开目录失败：{e}，请手动访问：{opened_target or path}")
 
 def prepare_acoustic_features(waveform, speech_probs, frame_duration_ms, use_zcr):
     """计算并对齐声学特征（能量、ZCR），供智能切分使用"""
@@ -1734,8 +1781,6 @@ def main(argv=None):
     temp_chunk_dir = None
 
     # --- 执行核心的语音识别流程 ---
-    vad_model_load_start = 0
-    vad_model_load_end = 0
     recognition_start_time = 0
     recognition_end_time = 0
     original_decoding_cfg = None
@@ -1875,13 +1920,7 @@ def main(argv=None):
 
         # --- 分支 B: 使用 VAD 分块 ---
         else:
-            logger.info("【VAD】正在从本地路径加载 Pyannote-segmentation-3.0 模型……")
-            vad_model_load_start = time.perf_counter()
-            onnx_session = onnxruntime.InferenceSession(
-                str(local_onnx_model_path), providers=["CPUExecutionProvider"]
-            )
-            vad_model_load_end = time.perf_counter()
-            logger.info(f"【VAD】模型加载完成")
+            onnx_session = get_vad_onnx_session(local_onnx_model_path)
 
             # 运行 VAD
             speeches, speech_probs, frame_duration_ms, frame_times_ms = get_speech_timestamps_onnx(
@@ -2324,12 +2363,12 @@ def main(argv=None):
 
         if recognition_end_time - recognition_start_time > 0:
             # 只有当VAD加载时间大于0时才打印，否则不显示
-            if vad_model_load_end - vad_model_load_start > 0:
+            if _VAD_ONNX_MODEL_LOAD_COST > 0:
                 logger.info(
-                    f"Pyannote-segmentation-3.0 模型加载耗时：{format_duration(vad_model_load_end - vad_model_load_start)}"
+                    f"Pyannote-segmentation-3.0 模型加载耗时：{format_duration(_VAD_ONNX_MODEL_LOAD_COST)}"
                 )
                 logger.info(
-                    f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time - (vad_model_load_end - vad_model_load_start))}"
+                    f"语音识别核心流程耗时：{format_duration(recognition_end_time - recognition_start_time - _VAD_ONNX_MODEL_LOAD_COST)}"
                 )
             else:
                 logger.info(
