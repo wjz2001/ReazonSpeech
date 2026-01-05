@@ -49,14 +49,16 @@ def load_model(device=None):
         # 使用根目录下的 'asr.py' 文件作为锚点来定位项目根目录
         project_root = find_project_root(marker_file="asr.py")
     except FileNotFoundError as e:
+        project_root = None
         # 如果找不到根目录，不退出，只打印一个提示信息
         print(f"【提示】未能定位到项目根目录（{e}）")
         print("【提示】将直接尝试从 Hugging Face 下载模型")
 
     # 基于找到的根目录，安全地构建 models 文件夹的路径
-    model_dir = os.path.join(project_root, 'models')
-    model_name = 'reazonspeech-nemo-v2.nemo'
-    local_model_path = os.path.join(model_dir, model_name)
+    if project_root is not None:
+        model_dir = os.path.join(project_root, 'models')
+        model_name = 'reazonspeech-nemo-v2.nemo'
+        local_model_path = os.path.join(model_dir, model_name)
 
     if device is None:
         if torch.cuda.is_available():

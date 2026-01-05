@@ -22,7 +22,6 @@ else:
     import resource  
 
 from collections import Counter, deque
-from fractions import Fraction
 from pathlib import Path
 from reazonspeech.nemo.asr import load_model
 from reazonspeech.nemo.asr.audio import SAMPLERATE
@@ -199,7 +198,7 @@ def _calc_mode(samples):
 # === 内存 / 显存监控结束 ===
 
 OVERLAP_MS = 1000  # 此处定义重叠时长
-PAD_MS = int(Fraction(str(PAD_SECONDS)) * 1000)
+PAD_MS = int(PAD_SECONDS * 1000)
 
 def arg_parser():
     # --- 设置命令行参数解析 ---

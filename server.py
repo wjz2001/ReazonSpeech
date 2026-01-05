@@ -483,17 +483,16 @@ def transcriptions(
                 "reazonspeechprompt.txt"
             )
 
-            file_prompt_raw = ""
+            file_prompt = ""
             if os.path.isfile(fallback_path):
                 try:
                     with open(fallback_path, "r", encoding="utf-8-sig") as f:
-                        file_prompt_raw = f.read()
+                        file_prompt = f.read().strip()
                 except Exception:
-                    file_prompt_raw = ""
+                    file_prompt = ""
             else:
                 prompt_warnings.append("找不到 reazonspeechprompt.txt")
 
-            file_prompt = file_prompt_raw.strip()
             if not file_prompt:
                 prompt_warnings.append("reazonspeechprompt.txt 中无内容")
                 prompt = ""
