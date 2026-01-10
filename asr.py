@@ -436,7 +436,7 @@ def arg_parser():
 def assign_vad_ownership_keep_windows(vad_segments, keep_silence_ms, total_duration_ms):
     """
     输入：vad_segments = list[dict]，每个 dict 包含:
-      {"start_ms": ..., "end_ms": ..., "keep_start_ms": ..., "keep_end_ms": ...}
+      {"start_ms": ..., "end_ms": ..., "raw_keep_start_ms": ..., "raw_keep_end_ms": ...}
 
     输出：直接在每个 dict 上写入：
       own_keep_start_ms / own_keep_end_ms
@@ -753,7 +753,7 @@ def get_speech_timestamps_onnx(
     # 预先计算重叠样本数
     overlap_samples = int(round(OVERLAP_MS * SAMPLERATE / 1000))
     while start_sample < total:
-        end_sample = min(start_sample + int(10 * SAMPLERATE), total)
+        end_sample = min(start_sample + 10 * SAMPLERATE, total)
         # 如果尾巴太短于约1s，直接把本窗扩到结尾（吞尾巴）
         if (total - end_sample) < SAMPLERATE:
             end_sample = total
@@ -905,8 +905,8 @@ def global_smart_segmenter(
         {
           "start_ms": 推理段起点（毫秒，包含重叠区），
           "end_ms": 推理段终点（毫秒，包含重叠区），
-          "keep_start_ms": 提交窗口起点（毫秒，中段起点），
-          "keep_end_ms": 提交窗口终点（毫秒，中段终点），
+          "raw_keep_start_ms": 提交窗口起点（毫秒，中段起点），
+          "raw_keep_end_ms": 提交窗口终点（毫秒，中段终点），
         }
     """
     def _frame_cost(frame_idx):
@@ -932,8 +932,8 @@ def global_smart_segmenter(
         return [{
             "start_ms": start_ms,
             "end_ms": end_ms,
-            "keep_start_ms": start_ms,
-            "keep_end_ms": end_ms,
+            "raw_keep_start_ms": start_ms,
+            "raw_keep_end_ms": end_ms,
         }]
 
     # 生成候选点（筛选 VAD 概率 < max(0.15, vad_threshold - 0.15) 的局部低点）
@@ -977,8 +977,8 @@ def global_smart_segmenter(
             segments.append({
                 "start_ms": curr_start,
                 "end_ms": end_ms,
-                "keep_start_ms": start_ms if prev_cut is None else prev_cut,
-                "keep_end_ms": end_ms,
+                "raw_keep_start_ms": start_ms if prev_cut is None else prev_cut,
+                "raw_keep_end_ms": end_ms,
             })
             break
 
@@ -1009,8 +1009,8 @@ def global_smart_segmenter(
         segments.append({
             "start_ms": curr_start,
             "end_ms": cut_t + OVERLAP_MS,
-            "keep_start_ms": start_ms if prev_cut is None else prev_cut,
-            "keep_end_ms": cut_t,
+            "raw_keep_start_ms": start_ms if prev_cut is None else prev_cut,
+            "raw_keep_end_ms": cut_t,
         })
 
         prev_cut = cut_t
@@ -1236,13 +1236,13 @@ def load_audio_ffmpeg(file, audio_filter, limiter_filter):
     # s16le -> float32 [-1, 1)
     audio_np = (np.frombuffer(p.stdout, dtype=np.int16).astype(np.float32) / 32768)
 
-    return torch.from_numpy(audio_np).unsqueeze(0), int((audio_np.size * 1000 + SAMPLERATE // 2) // SAMPLERATE) # [1, T]
+    return torch.from_numpy(audio_np).unsqueeze(0), (audio_np.size * 1000 + SAMPLERATE // 2) // SAMPLERATE # [1, T]
 
 def merge_short_segments_adaptive(segments, max_duration_ms):
     """
     把短于 1000ms 的片段合并到相邻较短的片段中，优先合并更短的一侧，并确保合并后的总时长不超过 max_duration_ms
     仅接受字典列表：
-      {"start_ms","end_ms","keep_start_ms","keep_end_ms", ...}
+      {"start_ms","end_ms","raw_keep_start_ms","raw_keep_end_ms", ...}
     """
     if not segments:
         return []
@@ -1259,13 +1259,13 @@ def merge_short_segments_adaptive(segments, max_duration_ms):
             prev_seg = result[-1] if result else None
             next_seg = working_segments[i + 1] if i + 1 < len(working_segments) else None
 
-            dur_prev_ms = (prev_seg["end_ms"] - prev_seg["start_ms"]) if prev_seg else float("inf")
-            dur_next_ms = (next_seg["end_ms"] - next_seg["start_ms"]) if next_seg else float("inf")
+            dur_prev_ms = (prev_seg["end_ms"] - prev_seg["start_ms"]) if prev_seg else math.inf
+            dur_next_ms = (next_seg["end_ms"] - next_seg["start_ms"]) if next_seg else math.inf
 
             # 向左合的新时长 = 当前结束 - 前段开始
-            dur_if_left_ms = (seg["end_ms"] - prev_seg["start_ms"]) if prev_seg else float("inf")
+            dur_if_left_ms = (seg["end_ms"] - prev_seg["start_ms"]) if prev_seg else math.inf
             # 向右合的新时长 = 后段结束 - 当前开始
-            dur_if_right_ms = (next_seg["end_ms"] - seg["start_ms"]) if next_seg else float("inf")
+            dur_if_right_ms = (next_seg["end_ms"] - seg["start_ms"]) if next_seg else math.inf
 
             target_side = None
             # 两边都合法，哪边合并后更短合哪边
@@ -1281,14 +1281,14 @@ def merge_short_segments_adaptive(segments, max_duration_ms):
             if target_side == "left":
                 logger.debug(f"【VAD】片段（{seg_duration_ms / 1000:.2f} 秒）{SRTWriter._format_time(seg['start_ms'] / 1000)} --> {SRTWriter._format_time(seg['end_ms'] / 1000)}，向左合并: 前段（{dur_prev_ms / 1000:.2f} 秒）{SRTWriter._format_time(prev_seg['start_ms'] / 1000)} -->{SRTWriter._format_time(prev_seg['end_ms'] / 1000)} 延长至 {(dur_prev_ms + seg_duration_ms) / 1000:.2f} 秒")
                 prev_seg["end_ms"] = seg["end_ms"]
-                prev_seg["keep_end_ms"] = seg["keep_end_ms"]
+                prev_seg["raw_keep_end_ms"] = seg["raw_keep_end_ms"]
                 i += 1
                 continue
 
             elif target_side == "right":
-                logger.debug(f"【VAD】片段（{seg_duration_ms / 1000.0:.2f} 秒）{SRTWriter._format_time(seg['start_ms'] / 1000.0)} --> {SRTWriter._format_time(seg['end_ms'] / 1000)}，向右合并: 后段（{dur_next_ms / 1000:.2f} 秒）{SRTWriter._format_time(next_seg['start_ms'] / 1000)} -->{SRTWriter._format_time(next_seg['end_ms'] / 1000)} 延长至 {(seg_duration_ms + dur_next_ms) / 1000:.2f} 秒")
+                logger.debug(f"【VAD】片段（{seg_duration_ms / 1000:.2f} 秒）{SRTWriter._format_time(seg['start_ms'] / 1000.0)} --> {SRTWriter._format_time(seg['end_ms'] / 1000)}，向右合并: 后段（{dur_next_ms / 1000:.2f} 秒）{SRTWriter._format_time(next_seg['start_ms'] / 1000)} -->{SRTWriter._format_time(next_seg['end_ms'] / 1000)} 延长至 {(seg_duration_ms + dur_next_ms) / 1000:.2f} 秒")
                 next_seg["start_ms"] = seg["start_ms"]
-                next_seg["keep_start_ms"] = seg["keep_start_ms"]
+                next_seg["raw_keep_start_ms"] = seg["raw_keep_start_ms"]
                 i += 1
                 continue
             
@@ -1792,8 +1792,8 @@ def main(argv=None):
         # 使用单例模式获取模型，避免重复加载
         model = get_asr_model()
 
-        # 获取模型最大允许输入语音块长度
-        MAX_SPEECH_DURATION_MS = int(round(model.cfg.train_ds.max_duration * 1000))
+        # 获取模型最大允许输入语音块长度，去除 slice_waveform_ms 额外添加的两侧 PAD_MS
+        MAX_SPEECH_DURATION_MS = int(round(model.cfg.train_ds.max_duration * 1000)) - 2 * PAD_MS
 
         # 设定 Batch Size
         if args.batch_size is None:
@@ -1846,6 +1846,10 @@ def main(argv=None):
                     isinstance(e, torch.cuda.OutOfMemoryError)
                     or ("out of memory" in msg and ("cuda" in msg or "cudnn" in msg or "cublas" in msg))
                 )
+
+            for number in batch_meta:
+                logger.info(f"正在推理语音块 {number['display_number']}")
+
             hit_oom = False
             # ---- 第一次尝试：用当前 batch_size 一次性跑完 ----
             try:
@@ -1882,39 +1886,75 @@ def main(argv=None):
                 # 解码
                 decoded_subwords = decode_hypothesis(model, hyp).subwords
 
-                # 所有边界都统一到“整数微秒域”，加上时间偏移
                 for sub in decoded_subwords:
-                    # token 时间：统一用“整数微秒 floor”
-                    sub_us = int(sub.seconds * 1_000_000) + int(meta["base_offset_ms"]) * 1000
-                    # 用微秒判断归属（严格半开区间），start: floor（偏早），end: ceil（偏晚）
-                    if int(meta["keep_start_ms"]) * 1000 <= sub_us < int(meta["keep_end_ms"]) * 1000:
-                        # 保持 token 时间戳也从同一套 us 派生，写回 seconds
-                        sub.seconds = sub_us / 1_000_000
-                        all_chunk_subwords_collection[meta["chunk_index"]].append(sub)
+                    t_us = int(sub.seconds * 1_000_000) + meta["base_offset_ms"] * 1000
+
+                    # 判断归属（own_keep，半开区间；t==end 归下一个）
+                    idx = int(np.searchsorted(own_starts_us, t_us, side="right")) - 1
+
+                    if idx < 0:
+                        owner = 0
+                    elif t_us < own_ends_us[idx]:
+                        owner = idx
+                    elif idx + 1 >= len(own_keep_us):
+                        owner = len(own_keep_us) - 1
+                    else:
+                        # 落在 gap：选择“最近边界”，距离相等时归右侧
+                        owner = (idx + 1) if (own_starts_us[idx + 1] - t_us <= t_us - own_ends_us[idx]) else idx
+
+                    # 保留、去重等（raw_keep，半开区间）
+                    keep = True
+                    if not int(meta["raw_keep_start_ms"]) * 1000 <= t_us < int(meta["raw_keep_end_ms"]) * 1000:
+                        # 不在当前推理段的 raw_keep，检查它是否被 owner chunk 中的其它 raw_keep 覆盖，没有被覆盖保留并按最近边界 owner 归属
+                        for ws_us, we_us in raw_keep_windows_us_by_chunk[owner]:
+                            if ws_us <= t_us < we_us:
+                                # 属于同一个 owner 的其它推理段，当前这份大概率在 overlap 中，丢弃
+                                keep = False
+                                break
+
+                    if not keep:
+                        continue
+
+                    sub.seconds = t_us / 1_000_000
+                    all_chunk_subwords_collection[owner].append(sub)
 
             batch_audio.clear()
             batch_meta.clear()
 
         # --- 分支 A: 不分块 (No Chunk) ---
         if args.no_chunk:
+            logger.info("未使用VAD，一次性处理整个文件……")
+            # 初始化归属索引
+            own_keep_us = [(0, total_audio_ms * 1000)]
+            own_starts_us = np.array([own_keep_us[0][0]], dtype=np.int64)
+            own_ends_us = np.array([own_keep_us[0][1]], dtype=np.int64)
+
+            raw_keep_windows_us_by_chunk = {0: [(0, total_audio_ms * 1000)]}
+
+            planned_segments = [{
+                "chunk_index": 0,
+                "display_number": 1,
+                "audio_start_ms": 0,
+                "audio_end_ms": total_audio_ms,
+                "base_offset_ms": 0,
+                "own_keep_start_ms": 0,
+                "own_keep_end_ms": total_audio_ms,
+                "raw_keep_start_ms": 0,
+                "raw_keep_end_ms": total_audio_ms,
+            }]
+
+            all_chunk_subwords_collection = [[]]  # index 0
+
             full_chunk = slice_waveform_ms(waveform, 0, total_audio_ms)
+
             if args.debug and not api_mode:
                 fd, temp_full_wav_path = tempfile.mkstemp(suffix=".wav")
                 os.close(fd)
                 save_tensor_as_wav(temp_full_wav_path, full_chunk)
 
-            logger.info("未使用VAD，一次性处理整个文件……")
-            
-            # 同样走 batch 流程（虽然只有 1 个）
-            all_chunk_subwords_collection.append([]) # index 0
-            
+            # 统一推理
             batch_audio.append(full_chunk.squeeze(0))
-            batch_meta.append({
-                "chunk_index": 0,
-                "base_offset_ms": 0,
-                "keep_start_ms": 0,
-                "keep_end_ms": int(total_audio_ms),
-            })
+            batch_meta.append(planned_segments[0])
             flush_batch()
 
         # --- 分支 B: 使用 VAD 分块 ---
@@ -1964,7 +2004,7 @@ def main(argv=None):
             logger.debug("【VAD】正在合并短于1秒的语音块……")
             merged_ranges_s = assign_vad_ownership_keep_windows(
                 merge_short_segments_adaptive(
-                    [{"start_ms": s[0],"end_ms": s[1],"keep_start_ms": s[0],"keep_end_ms": s[1]}for s in speeches],
+                    [{"start_ms": s[0],"end_ms": s[1],"raw_keep_start_ms": s[0],"raw_keep_end_ms": s[1]}for s in speeches],
                     MAX_SPEECH_DURATION_MS
                 ),
                 args.keep_silence,
@@ -1975,6 +2015,20 @@ def main(argv=None):
             else:
                 logger.debug(f"【VAD】没有需要合并的语音块")
             
+            # own_keep用于确定归属块，半开区间 [start, end)
+            own_keep_us = [
+                (seg["own_keep_start_ms"] * 1000, seg["own_keep_end_ms"] * 1000)
+                for seg in merged_ranges_s
+            ]
+            own_starts_us = np.array([s for s, _ in own_keep_us], dtype=np.int64)
+            own_ends_us = np.array([e for _, e in own_keep_us], dtype=np.int64)
+
+            # raw_keep 覆盖窗口，用于子块是否保留/去重/兜底
+            raw_keep_windows_us_by_chunk = {i: [] for i in range(len(merged_ranges_s))}
+
+            # 计划表：每个元素代表一次实际推理的音频窗（未 pad 的范围）及其 keep/own 信息
+            planned_segments = []
+
             # 初始化结果收集器
             all_chunk_subwords_collection = [[] for _ in range(len(merged_ranges_s))]
 
@@ -2001,23 +2055,35 @@ def main(argv=None):
                     )
 
                 # 判断短块还是长块
-                if (chunk_dict["end_ms"] - chunk_dict["start_ms"]) <= MAX_SPEECH_DURATION_MS // 3:
+                if (end_ms - start_ms) <= (MAX_SPEECH_DURATION_MS + 2 * PAD_MS) // 3:
                     # === 短块 ===
-                    logger.info(" --> 短块，直接加入 Batch")
+                    logger.info(" --> 短块，直接推理")
                     
-                    # 加入 Batch
-                    batch_audio.append(chunk.squeeze(0))
-                    # 坐标变换：全局时间 = 一级块偏移 + 相对时间
-                    # 短块的 keep 窗口就是它在全局时间轴上的起止时间
-                    batch_meta.append({
+                    raw_keep_windows_us_by_chunk[i].append((
+                        chunk_dict["own_keep_start_ms"] * 1000,
+                        chunk_dict["own_keep_end_ms"] * 1000
+                        ))
+
+                    planned_segments.append({
                         "chunk_index": i,
+                        "display_number": i + 1,
+                        # 推理时再从原始 waveform 切片并 pad（保证只 pad 一次）
+                        "audio_start_ms": start_ms,
+                        "audio_end_ms": end_ms,
                         "base_offset_ms": start_ms,
-                        "keep_start_ms": chunk_dict["own_keep_start_ms"],
-                        "keep_end_ms": chunk_dict["own_keep_end_ms"],
+
+                        # 归属：只看 own_keep
+                        "own_keep_start_ms": chunk_dict["own_keep_start_ms"],
+                        "own_keep_end_ms": chunk_dict["own_keep_end_ms"],
+
+                        # 保留：只看 raw_keep（短块没有二次切分窗口，raw_keep=own_keep）
+                        "raw_keep_start_ms": chunk_dict["own_keep_start_ms"],
+                        "raw_keep_end_ms": chunk_dict["own_keep_end_ms"],
                     })
                 
                 else:
                     # === 长块 (二次切分) ===
+                    logger.info("") # 断开上一行
                     # 运行局部 VAD
                     sub_speeches, sub_speech_probs, sub_frame_duration_ms, sub_frame_times_ms = get_speech_timestamps_onnx(
                         chunk,
@@ -2032,7 +2098,7 @@ def main(argv=None):
                         # 兜底策略：如果二次 VAD 没切出来（例如全是噪音），回退到整块识别
                         logger.warn("    【VAD】二次 VAD 未发现有效分割点，回退到整块识别")
                         # 构造一个覆盖整个 chunk 的虚拟 VAD 段
-                        sub_speeches = [[0, int((chunk.shape[1] * 1000) // SAMPLERATE)]]
+                        sub_speeches = [[0, (chunk.shape[1] * 1000) // SAMPLERATE]]
 
                     # 局部特征计算
                     sub_speech_probs, sub_energy_array, sub_zcr_array = prepare_acoustic_features(
@@ -2069,42 +2135,68 @@ def main(argv=None):
                     refined_sub_speeches = merge_short_segments_adaptive(nonsilent_ranges_ms, MAX_SPEECH_DURATION_MS)
 
                     if len(refined_sub_speeches) > 1:
-                        logger.info(f"    --> Batch 中加入 {len(refined_sub_speeches)} 个子片段：")
+                        logger.info(f"    --> 拆为 {len(refined_sub_speeches)} 个子片段：")
 
-                    # 遍历子块加入 Batch
+                    # 遍历子块
                     for sub_idx, sub_seg in enumerate(refined_sub_speeches):
-                        # sub_seg 是相对于 chunk (已含Padding) 的秒数
-                        # 提取子块音频并加上静音保护
-                        sub_chunk = slice_waveform_ms(chunk, sub_seg["start_ms"], sub_seg["end_ms"])
-                        
-                        # Debug 时导出临时子块文件
+                        # 最终时间 = 一级块全局偏移 + 二级块在一级块内的偏移 + 识别出的相对时间
+                        # 因为 sub_seg 是基于含填充的父chunk计算的，它包含了父chunk头部的 0.5s 静音，必须扣除
+                        # 先把 sub_seg 的 keep 窗口映射到全局音频
+                        raw_keep_start_ms = start_ms + sub_seg["raw_keep_start_ms"] - PAD_MS
+                        raw_keep_end_ms = start_ms + sub_seg["raw_keep_end_ms"] - PAD_MS
+                        # 推理窗同样映射到全局
+                        audio_start_ms = start_ms + sub_seg["start_ms"] - PAD_MS
+                        audio_end_ms = start_ms + sub_seg["end_ms"] - PAD_MS
+
+                        # clamp 到 [0, total_audio_ms]，并确保 end >= start ===
+                        raw_keep_start_ms = max(0, min(raw_keep_start_ms, total_audio_ms))
+                        raw_keep_end_ms = max(0, min(raw_keep_end_ms, total_audio_ms))
+                        if raw_keep_end_ms < raw_keep_start_ms:
+                            raw_keep_end_ms = raw_keep_start_ms
+
+                        audio_start_ms = max(0, min(audio_start_ms, total_audio_ms))
+                        audio_end_ms = max(0, min(audio_end_ms, total_audio_ms))
+                        if audio_end_ms < audio_start_ms:
+                            audio_end_ms = audio_start_ms
+
+                        raw_keep_windows_us_by_chunk[i].append((raw_keep_start_ms * 1000, raw_keep_end_ms * 1000))
+
+                        planned_segments.append({
+                            "chunk_index": i,
+                            "display_number": f"{i+1}-{sub_idx+1}",
+                            # 二次切分 sub_chunk：改为全局时间从原 waveform 切，推理时只 pad 一次
+                            "audio_start_ms": audio_start_ms,
+                            "audio_end_ms": audio_end_ms,
+                            "base_offset_ms": audio_start_ms,
+
+                            # 判断块归属使用 own_keep
+                            "own_keep_start_ms": chunk_dict["own_keep_start_ms"],
+                            "own_keep_end_ms": chunk_dict["own_keep_end_ms"],
+
+                            # 保留、去重等使用 raw_keep
+                            "raw_keep_start_ms": raw_keep_start_ms,
+                            "raw_keep_end_ms": raw_keep_end_ms,
+                        })
+
+                        # Debug 时导出临时子块文件，从 waveform 直接切（只 pad 一次）
                         if args.debug and not api_mode:
-                            save_tensor_as_wav(temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav", sub_chunk)
+                            save_tensor_as_wav(
+                                temp_chunk_dir / f"chunk_{i + 1}_sub_{sub_idx + 1}.wav",
+                                slice_waveform_ms(waveform, audio_start_ms, audio_end_ms)
+                                )
 
                         if len(refined_sub_speeches) != 1:
-                            logger.info(f"第 {i + 1}-{sub_idx + 1} 段 {SRTWriter._format_time(sub_seg['start_ms'] / 1000)} --> {SRTWriter._format_time(sub_seg['end_ms'] / 1000)}，时长：{(sub_seg['end_ms'] - sub_seg['start_ms']) / 1000:.2f} 秒")
-                        
-                        batch_audio.append(sub_chunk.squeeze(0))
-                        batch_meta.append({
-                            "chunk_index": i,
-                            # 最终时间 = 一级块全局偏移 + 二级块在一级块内的偏移 + 识别出的相对时间
-                            # 因为 sub_seg[0] 是基于含填充的父chunk计算的，它包含了父chunk头部的 0.5s 静音，必须扣除
-                            "base_offset_ms": start_ms + sub_seg["start_ms"] - PAD_MS,
-                            "keep_start_ms": max(
-                                                 start_ms + sub_seg["keep_start_ms"] - PAD_MS,
-                                                 chunk_dict["own_keep_start_ms"],
-                                             ),
-                            "keep_end_ms": min(
-                                               start_ms + sub_seg["keep_end_ms"] - PAD_MS,
-                                               chunk_dict["own_keep_end_ms"],
-                                           ),
-                        })
-                        
-                        # 如果 batch 满了，立即执行
-                        if len(batch_audio) >= BATCH_SIZE:
-                            flush_batch()
+                            logger.info(f"第 {i + 1}-{sub_idx + 1} 段 {SRTWriter._format_time(audio_start_ms / 1000)} --> {SRTWriter._format_time(audio_end_ms / 1000)}，时长：{(audio_end_ms - audio_start_ms) / 1000:.2f} 秒")
 
-                # 每一级块循环末尾，检查 batch 是否满了
+            # 按 planned_segments 统一推理并从 waveform 切片并 pad，保证每次推理窗都只 pad 一次
+            for meta in planned_segments:
+                batch_audio.append(slice_waveform_ms(
+                                       waveform,
+                                       meta["audio_start_ms"],
+                                       meta["audio_end_ms"]
+                                   ).squeeze(0))
+                batch_meta.append(meta)
+                # 每次循环末尾，检查 batch 是否满了
                 if len(batch_audio) >= BATCH_SIZE:
                     flush_batch()
 
@@ -2116,6 +2208,7 @@ def main(argv=None):
             for sub_list in all_chunk_subwords_collection:
                 raw_subwords.extend(sub_list)
             logger.debug(f"【VAD】所有语音块处理完毕")
+        raw_subwords.sort(key=lambda s: s.seconds)
 
         # --- 计时结束：核心识别流程 ---
         recognition_end_time = time.perf_counter()
