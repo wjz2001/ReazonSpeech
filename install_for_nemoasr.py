@@ -1,6 +1,5 @@
 import subprocess
 import sys
-import os
 import platform
 import re
 import shutil
@@ -47,49 +46,6 @@ def detect_cuda_version():
     except Exception as e:
         print(f"执行 nvidia-smi 时发生错误：{e}，无法确定 CUDA 版本，将跳过安装 PyTorch")
         return None
-
-def patch_exp_manager():
-    """在已安装的 nemo_toolkit 中查找并修补 exp_manager.py 文件 (仅限 Windows)"""
-    print("\n> 尝试修补 nemo_toolkit ……")
-    try:
-        import nemo
-        # 找到 nemo 包的 __init__.py 文件
-        nemo_init_path = nemo.__file__
-        # 从 __init__.py 向上找到 nemo 包的根目录
-        nemo_root_path = os.path.dirname(nemo_init_path)
-        # 构造目标文件的绝对路径
-        file_path = os.path.join(nemo_root_path, 'utils', 'exp_manager.py')
-
-        if not os.path.exists(file_path):
-            print(f"未能找到文件 {file_path}，修补失败，请确认 nemo_toolkit 是否已正确安装")
-            sys.exit(1)
-
-        print(f"正在修补文件：{file_path}")
-
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        original_line = "rank_termination_signal: signal.Signals = signal.SIGKILL"
-        patched_line = "rank_termination_signal: signal.Signals = signal.SIGKILL if os.name != 'nt' else signal.SIGTERM"
-
-        if patched_line in content:
-            print("文件已被修补")
-            return
-
-        if original_line not in content:
-            print("未找到需要修补的目标代码行")
-            return
-        
-        new_content = content.replace(original_line, patched_line)
-
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        
-        print("修补成功")
-
-    except Exception as e:
-        print(f"修补过程中发生意外错误：{e}")
-        sys.exit(1)
 
 def run_command(command_list):
     cmd_str = ' '.join(command_list)
@@ -181,10 +137,6 @@ def main():
         'uvicorn==0.38.0',
     ]
     run_command(core_packages_command)
-    
-    # 如果是 Windows，执行 Nemo 的特殊修补
-    if sys.platform == "win32":
-        patch_exp_manager()
     
     # 以可编辑模式安装本地的 ReazonSpeech ASR 包
     reazonspeech_install_command = ['pip', 'install', '-e', './pkg/nemo-asr']
