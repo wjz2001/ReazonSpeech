@@ -76,7 +76,7 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 
 | 参数 | 作用 | 默认值 |
 |-----------|:-------------:|:---------:|
-| `--debug` | 处理结束后不删除临时文件，并自动打开临时分块目录，显示更多日志 | `无` |
+| `--debug` | 处理结束后保存语音块，并自动打开语音块保存目录，显示更多日志 | `无` |
 | `--batch-size` | 数字越大批量推理的速度越快，不填则自动根据显存估算（只使用 CPU 则默认为 1） | `1` |
 | `--beam` | 设置集束搜索宽度，范围为 4 到 256 之间的整数，更大的值可能更准确但更慢 | `4` |
 | `--no-remove-punc` | 禁止自动剔除句末标点，保留原始识别结果 | `无` |
@@ -91,9 +91,11 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 - `--audio-filter` 和 `--limiter-filter` 不能共存
 
 - 不写 `--audio-filter` 或不写 `--limiter-filter`
+
   **不启用任何滤镜**，推荐在录音干净时使用
 
-- 写 `--audio-filter` 但不带参数  
+- 写 `--audio-filter` 但不带参数
+
   启用默认滤镜：`highpass=f=60,lowpass=f=8000`
 
   - highpass=f=60：去掉 60Hz 超低频
@@ -101,6 +103,7 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
   - lowpass=f=8000：压除 8 kHz 以上的高频噪声，同时保留较多辅音高频
 
 - 写 `--audio-filter "[滤镜链参数]"` 或写 `--limiter-filter "[滤镜链参数]"`
+
   把滤镜链参数原样传给 `ffmpeg -af` 例如：
 
   `--audio-filter "highpass=f=60,lowpass=f=8000"`
@@ -111,18 +114,18 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 
   - [ffmpeg音频滤镜列表](https://ffmpeg.org/ffmpeg-filters.html#Audio-Filters)
 
-### VAD参数
+### VAD 参数
 
 | 参数 | 作用 | 默认值 |
 |-----------|:-------------:|:---------:|
-| `--no-chunk` | 禁止使用VAD | `无` |
-| `--vad_threshold` | VAD判断为语音的置信度阈值（0.05-1） | `0.4` |
-| `--vad_end_threshold` | VAD判断为语音结束后静音的置信度阈值（0.05-1） | `vad_threshold的值减去0.15` |
+| `--no-chunk` | 禁止使用 VAD | `无` |
+| `--vad_threshold` | VAD 判断为语音的置信度阈值（0.05-1） | `0.4` |
+| `--vad_end_threshold` | VAD 判断为语音结束后静音的置信度阈值（0.05-1） | `vad_threshold的值减去0.15` |
 | `--min_speech_duration_ms` | 移除短于此时长（毫秒）的语音块 | `100` |
 | `--min_silence_duration_ms` | 短于此时长（毫秒）的语音块不被视为间隔 | `200` |
 | `--keep_silence` | 在语音块前后扩展的时长（毫秒） | `300` |
 
-### 过零率检测参数（必须先开启VAD）
+### 过零率检测参数（必须先开启 VAD）
 
 | 参数 | 作用 | 默认值 |
 |-----------|:-------------:|:---------:|
@@ -130,7 +133,7 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 | `--zcr_threshold` | 手动设置 ZCR 阈值 | `0.15` |
 | `--auto_zcr` | 开启自适应 ZCR 阈值计算，zcr_threshold作为兜底 | `无` |
 
-### 段尾精修参数（必须先开启VAD）
+### 段尾精修参数（必须先开启 VAD）
 
 | 参数 | 作用 | 默认值 |
 |-----------|:-------------:|:---------:|
@@ -176,9 +179,9 @@ reazonspeech
 
 | 参数名 | 必填 | 说明 |
 | :--- | :---: | :--- |
-| **file** | 是 | 音频文件或视频文件 |
+| **file** | 是 | 上传音频文件或视频文件 |
 | **response_format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`<br>2. **ReazonSpeech 专用格式**：如 `kass`，`segment2tsv` 等（即上面的输出参数去除开头短横线，多个参数用逗号分隔） |
-| **prompt** | 否 | **配置除输出参数和debug参数外所有参数**：<br>在此处传入除输出参数和 debug 参数外所有的配置参数 |
+| **prompt** | 否 | 在此处传入除输出参数和 debug 参数外所有的配置参数 |
 | **timestamp_granularities** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
 
 - 如果你的应用不支持输入或自定义 prompt 提示词，那么可以在根目录下新建文件 `reazonspeechprompt.txt`，在其中填写 prompt 参数，示例如下：
