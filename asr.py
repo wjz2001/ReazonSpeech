@@ -1854,7 +1854,7 @@ def main(argv=None):
             # ---- 第一次尝试：用当前 batch_size 一次性跑完 ----
             try:
                 with torch.inference_mode():
-                    hyps = transcribe_audio(model, batch_audio, len(batch_audio))[0]  # 取元组第 0 个元素，即结果列表
+                    hyps = transcribe_audio(model, batch_audio, len(batch_audio))
     
             except RuntimeError as e:
                 if _is_oom_error(e):
@@ -1877,7 +1877,7 @@ def main(argv=None):
         
                 with torch.inference_mode():
                     # 回退为逐条推理（内部会顺序处理整个 batch_audio 列表）
-                    hyps = transcribe_audio(model, batch_audio)[0]
+                    hyps = transcribe_audio(model, batch_audio)
 
             # 处理结果
             for hyp, meta in zip(hyps, batch_meta):
