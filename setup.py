@@ -10,11 +10,11 @@ if __name__ == "__main__" and len(sys.argv) == 1:
 setup(
     name="ReazonSpeech", # 项目名称
     version="3.0.0",
-    py_modules=["asr", "server"], # python 文件名 (不带 .py 后缀)
+    py_modules=["asr", "server", "run"], # python 文件名 (不带 .py 后缀)
     entry_points={
         "console_scripts": [
             # 格式： "命令名 = 文件名:函数名"
-            "reazonspeech = asr:main",
+            "reazonspeech = run:main",
         ],
     },
 )

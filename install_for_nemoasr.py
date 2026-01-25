@@ -124,7 +124,7 @@ def main():
     print("正在安装依赖……")
     core_packages_command = [
         'pip', 'install',
-        'nemo_toolkit[asr]==2.1.0',
+        'nemo_toolkit[asr]==2.6.1',
         'pyannote.pipeline==3.0.1',
         'pyannote.core==6.0.1',
         'pyannote.database==6.1.0',
