@@ -64,3 +64,28 @@ def decode_hypothesis(model, hyp):
         start = end + 1
 
     return TranscribeResult(text, subwords, segments)
+
+def find_end_of_segment_by_step(subwords, start, phonemic_break_steps):
+    length = len(subwords)
+    for idx in range(start, length):
+        if idx < (length - 1):
+            cur = subwords[idx]
+            nex = subwords[idx + 1]
+            if nex.token not in TOKEN_PUNC:
+                if cur.token in TOKEN_EOS:
+                    break
+                elif (idx - start) >= SUBWORDS_PER_SEGMENTS:
+                        if cur.token in TOKEN_COMMA or (nex.step_index - cur.step_index) > phonemic_break_steps:
+                            break
+    return idx
+
+def decode_hypothesis_to_subword_info(model, hyp):
+    y_sequence = hyp.y_sequence.tolist()[1:]
+
+    results = []
+    for idx, (token_id, step) in enumerate(zip(y_sequence, hyp.timestamp)):
+        token = model.tokenizer.ids_to_text([token_id])
+        step_index = int(step - idx - 1)
+        results.append((token_id, token, step_index))
+
+    return results
