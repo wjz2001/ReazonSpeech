@@ -9,7 +9,7 @@ if __name__ == "__main__" and len(sys.argv) == 1:
 
 setup(
     name="ReazonSpeech", # 项目名称
-    version="2.3.0",
+    version="3.0.0",
     py_modules=["asr", "server"], # python 文件名 (不带 .py 后缀)
     entry_points={
         "console_scripts": [
