@@ -41,7 +41,7 @@ class ChunkInfo:
     own_keep_start_sample: int
     own_keep_end_sample: int  # 半开 [start, end)
     vad_limit_sample: int
-    raw_keep_windows_sample: list[tuple[int, int]]  # list of 半开窗口
+    keep_windows_sample: list[tuple[int, int]]  # list of 半开窗口
 
 @dataclass(slots=True)
 class SubwordInfo:

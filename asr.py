@@ -588,7 +588,10 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_samples, t
             next_group_start_idx += 1
 
         # 确定当前 VAD 块内的搜索边界
-        end_idx = min(next_group_start_idx - 1, find_end_of_segment_by_step(all_subwords, start, PHONEMIC_BREAK_STEPS))
+        end_idx = min(
+            next_group_start_idx - 1,
+            find_end_of_segment_by_step(all_subwords, start, (int(PHONEMIC_BREAK * 1000) + STEP_MS - 1) // STEP_MS)
+            )
 
         # 动态停顿阈值
         pause_split_indices = []
@@ -745,14 +748,14 @@ def get_speech_timestamps_onnx(
 ):
     """
     返回：
-      speeches: List[[start_samples, end_samples], ...]  # int ms
+      speeches: List[[start_samples, end_samples], ...]
       speech_probs: np.ndarray                    # per-frame prob
       frame_hop_samples # 每帧大致跨度（sample）
       frame_times_sample # 每帧对应的“帧起点 sample”，与 speech_probs 对齐
     使用 segmentation-3.0 ONNX + ≤10 秒滑窗 + 双阈值后处理，
     将一段 waveform 转换为若干语音时间段
     """
-    # 通过 ≤10 秒滑窗，拼出整段 speech_probs 和 frame_times_sample
+    # 通过 ≤9 秒滑窗，拼出整段 speech_probs 和 frame_times_sample
     all_probs = []
     all_times = []
     start_sample = 0
@@ -805,7 +808,7 @@ def get_speech_timestamps_onnx(
         if end_sample >= total:
             break
 
-        start_sample += int(10 * SAMPLERATE - 2 * OVERLAP_SAMPLES)
+        start_sample += int(10 * SAMPLERATE - 2 * SAMPLERATE)
 
     speech_probs = all_probs[0] if len(all_probs) == 1 else np.concatenate(all_probs, axis=0)
     frame_times_sample = all_times[0] if len(all_times) == 1 else np.concatenate(all_times, axis=0)
@@ -908,7 +911,7 @@ def global_smart_segmenter(
     - 如果大于 max_duration_sample：
         * 在低 VAD 概率的局部极小值处生成候选点，并计算 cost
         * 从左到右贪心切分（必要时回退到硬切）
-        * 相邻段推理范围重叠 2*OVERLAP_SAMPLES，但提交窗口在 cut 处分割，保证不重复提交
+        * 相邻段推理范围重叠 2*SAMPLERATE，但提交窗口在 cut 处分割，保证不重复提交
 
     返回：List[dict]
     """
@@ -943,8 +946,8 @@ def global_smart_segmenter(
     candidates = []
     # 边界保护：避免切在段首/段尾靠得太近
     # 用 frame_times_samples 反查 frame 索引
-    search_start = int(np.searchsorted(frame_times_sample, start_sample + OVERLAP_SAMPLES, side="left"))
-    search_end = int(np.searchsorted(frame_times_sample, end_sample - OVERLAP_SAMPLES, side="right"))
+    search_start = int(np.searchsorted(frame_times_sample, start_sample + SAMPLERATE, side="left"))
+    search_end = int(np.searchsorted(frame_times_sample, end_sample - SAMPLERATE, side="right"))
 
     # 提取搜索区间的概率
     # search_end > search_start + 2 是为了确保区间内至少有 3 帧数据
@@ -986,7 +989,7 @@ def global_smart_segmenter(
             break
 
         # 向前移动指针：跳过窗口左侧的旧候选点（切点必须 > curr_start + OVERLAP_MS，才能保证 next_start > curr_start）
-        while cand_idx < len(candidates) and candidates[cand_idx]["time_sample"] <= (curr_start + OVERLAP_SAMPLES):
+        while cand_idx < len(candidates) and candidates[cand_idx]["time_sample"] <= (curr_start + SAMPLERATE):
             cand_idx += 1
 
         # 收集当前窗口内的候选点
@@ -996,7 +999,7 @@ def global_smart_segmenter(
         temp_idx = cand_idx
         while temp_idx < len(candidates):
             c = candidates[temp_idx]
-            if c["time_sample"] > (curr_start + max_duration_sample - OVERLAP_SAMPLES):
+            if c["time_sample"] > (curr_start + max_duration_sample - SAMPLERATE):
                 # 因为列表是有序的，一旦超过右边界，后面的都无效
                 break
             cands.append(c)
@@ -1007,17 +1010,17 @@ def global_smart_segmenter(
             cut_t = min(cands, key=lambda c: c["cost"])["time_sample"]
         else:
             # 当前窗口里没有任何合适候选，只能硬切
-            cut_t = curr_start + max_duration_sample - OVERLAP_SAMPLES
+            cut_t = curr_start + max_duration_sample - SAMPLERATE
 
         segments.append({
             "start_sample": curr_start,
-            "end_sample": cut_t + OVERLAP_SAMPLES,
+            "end_sample": cut_t + SAMPLERATE,
             "keep_start_sample": start_sample if prev_cut is None else prev_cut,
             "keep_end_sample": cut_t,
         })
 
         prev_cut = cut_t
-        curr_start = cut_t - OVERLAP_SAMPLES
+        curr_start = cut_t - SAMPLERATE
 
     return segments
 
@@ -1507,7 +1510,7 @@ def refine_tail_timestamp(
     start_idx = int(np.searchsorted(frame_times_sample, int(last_token_start_sample), side="left"))
     end_idx = int(np.searchsorted(frame_times_sample, int(max_end_sample), side="right"))
     # 允许在 [max_end_sample, max_end_sample + 1s] 内额外搜索，但不用于统计阈值（可关闭）
-    search_end_idx = int(np.searchsorted(frame_times_sample, int(max_end_sample + OVERLAP_SAMPLES), side="right"))
+    search_end_idx = int(np.searchsorted(frame_times_sample, int(max_end_sample + SAMPLERATE), side="right"))
 
     # 至少要有 4 帧才能进行有效的统计学分析
     if start_idx >= len(speech_probs) or end_idx - start_idx <= 4:
@@ -1665,7 +1668,7 @@ def refine_tail_timestamp(
     for j in range(0, len(extra_p_smooth) - min_silence_frames + 1):
         if _is_stable_silence(j, extra_p_smooth, extra_e_smooth, end_idx):
             # 上限放宽到 max_end_s + OVERLAP_S
-            return _calc_refined_sample(end_idx + j, int(max_end_sample + OVERLAP_SAMPLES))
+            return _calc_refined_sample(end_idx + j, int(max_end_sample + SAMPLERATE))
 
     # 兜底：没找到稳定静音，保留原结束时间
     return min(rough_end_sample, max_end_sample)
@@ -1700,11 +1703,10 @@ def transcribe_audio(model, audio, batch_size=1):
     return model.transcribe(audio=audio, batch_size=batch_size, return_hypotheses=True, verbose=False)
 
 # === 把秒常量变成毫秒整数 ===
-STEP_MILLISECONDS = int(SECONDS_PER_STEP * 1000 + 0.5)  # 0.08 -> 80
-PHONEMIC_BREAK_STEPS = (int(PHONEMIC_BREAK * 1000) + STEP_MILLISECONDS - 1) // STEP_MILLISECONDS
-PAD_SAMPLES = ms_to_samp_round(int(PAD_SECONDS * 1000))
-STEP_SAMPLES = ms_to_samp_round(STEP_MILLISECONDS)
-OVERLAP_SAMPLES = ms_to_samp_round(1000)
+STEP_MS = int(SECONDS_PER_STEP * 1000 + 0.5)  # 0.08 -> 80
+STEP_SAMPLES = ms_to_samp_round(STEP_MS)
+PAD_SAMPLES = int(PAD_SECONDS * SAMPLERATE)
+MAX_SPEECH_DURATION_SAMPLES = 18 * SAMPLERATE
 
 def main(argv=None):
     parser = arg_parser()
@@ -1855,11 +1857,6 @@ def main(argv=None):
         # 使用单例模式获取模型，避免重复加载
         model = get_asr_model()
 
-        # 获取模型最大允许输入语音块长度，去除 slice_waveform_sample 额外添加的两侧 PAD_MS
-        max_duration_milliseconds = int(model.cfg.train_ds.max_duration * 1000 + 0.5)
-        max_duration_samples = ms_to_samp_round(max_duration_milliseconds)
-        MAX_SPEECH_DURATION_SAMPLES = max_duration_samples - 2 * PAD_SAMPLES
-
         # 设定 Batch Size
         if args.batch_size is None:
             if torch.cuda.is_available():
@@ -1961,9 +1958,9 @@ def main(argv=None):
                     if idx < 0:
                         owner = 0
                     elif t_sample < own_ends_sample[idx]:
-                            owner = idx
+                        owner = idx
                     elif idx + 1 >= len(own_keep_sample):
-                            owner = len(own_keep_sample) - 1
+                        owner = len(own_keep_sample) - 1
                     else:
                         # 落在 gap：选择“最近边界”，距离相等时归右侧
                         left_dist = t_sample - own_ends_sample[idx]
@@ -2067,8 +2064,6 @@ def main(argv=None):
                     }
                 return
 
-            vad_chunk_end_samples = [seg[1] for seg in speeches]
-
             # 声学特征准备
             if args.auto_zcr or args.refine_tail:
                 speech_probs, energy_array, zcr_array = prepare_acoustic_features(waveform, speech_probs, args.zcr)
@@ -2148,7 +2143,7 @@ def main(argv=None):
                     save_tensor_as_wav(temp_chunk_dir / f"chunk_{i + 1}.wav", chunk)
 
                 logger.info(
-                    f"【VAD】正在处理语音块 {i + 1}/{len(merged_ranges)} （该块起止时间："
+                    f"【VAD】正在处理语音块 {i + 1}/{len(nonsilent_speeches)} （该块起止时间："
                     f"{fmt_time(samp_to_ms_floor(chunk_dict['start_sample']) / 1000)} --> "
                     f"{fmt_time(samp_to_ms_ceil(chunk_dict['end_sample']) / 1000)}，"
                     f"时长：{(chunk_dict['end_sample'] - chunk_dict['start_sample']) / SAMPLERATE:.2f} 秒）",
@@ -2156,7 +2151,7 @@ def main(argv=None):
                 )
 
                 # 判断短块还是长块
-                if end_sample - start_sample <= (MAX_SPEECH_DURATION_SAMPLES + 2 * PAD_SAMPLES) // 3:
+                if end_sample - start_sample <= 10 * SAMPLERATE:
                     # === 短块 ===
                     logger.info(" --> 短块，直接识别")
                     
