@@ -1722,12 +1722,6 @@ def main(argv=None):
     # API 模式：在内存里累积输出；CLI 模式：写文件
     api_result = {} if api_mode else None
 
-    if args.input_file is None:
-        # CLI 模式没传参数，自动转为启动 Server
-        import server 
-        server.main()
-        return  # 启动服务后直接结束 main 函数，防止往下执行报错
-
     # 配置全局日志等级
     logger.set_debug(args.debug and not api_mode)
 
@@ -2063,6 +2057,8 @@ def main(argv=None):
                         }
                     }
                 return
+
+            vad_chunk_end_samples = [seg[1] for seg in speeches]
 
             # 声学特征准备
             if args.auto_zcr or args.refine_tail:
@@ -2618,4 +2614,5 @@ def main(argv=None):
         return api_result            
 
 if __name__ == "__main__":
-    main()
+    print("请勿直接运行本文件")
+    sys.exit(1)

@@ -686,5 +686,5 @@ def main():
 
 
 if __name__ == "__main__":
-    print("请使用: reazonspeech 命令启动 API 服务，不要直接运行本文件")
+    print("请使用: reazonspeech 命令启动 API 服务，勿要直接运行本文件")
     sys.exit(1)
