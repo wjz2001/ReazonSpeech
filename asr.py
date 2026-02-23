@@ -28,7 +28,7 @@ from reazonspeech.nemo.asr.transcribe import load_model
 from reazonspeech.nemo.asr.audio import SAMPLERATE
 from reazonspeech.nemo.asr.decode import PAD_SECONDS, SECONDS_PER_STEP, SUBWORDS_PER_SEGMENTS, PHONEMIC_BREAK, TOKEN_PUNC
 from reazonspeech.nemo.asr.decode import find_end_of_segment_by_step, decode_hypothesis_to_subword_info
-from reazonspeech.nemo.asr.interface import ChunkInfo, SubwordInfo, SegmentInfo, PreciseSubword, PreciseSegment
+from reazonspeech.nemo.asr.interface import SubwordInfo, SegmentInfo, PreciseSubword, PreciseSegment
 from reazonspeech.nemo.asr.writer import SRTWriter, ASSWriter, TextWriter, TSVWriter, VTTWriter
 
 # --- 日志控制 ---
@@ -693,6 +693,23 @@ def create_precise_segments_from_subwords(raw_subwords, vad_chunk_end_samples, t
         start = end_idx + 1
 
     return all_segments, all_subwords
+
+def enforce_monotonic_start_inplace(subs, total_audio_samples):
+    """
+    强制 start_sample 严格单调递增，避免排序/分段逻辑被相同或倒序时间戳破坏。
+    （你后面会用 next_start 来推 end_sample，所以 monotonic 很重要）
+    """
+    if not subs:
+        return
+    prev = int(max(0, min(int(subs[0].start_sample), int(total_audio_samples))))
+    subs[0].start_sample = prev
+    for i in range(1, len(subs)):
+        cur = int(subs[i].start_sample)
+        cur = max(cur, prev + 1)
+        if cur > total_audio_samples:
+            cur = int(total_audio_samples)
+        subs[i].start_sample = cur
+        prev = cur
 
 def format_duration(seconds):
     """将秒数格式化为 'X时Y分Z.ZZ秒' 的形式"""
@@ -1924,9 +1941,6 @@ def main(argv=None):
         # --- 批处理相关变量 ---
         batch_audio = [] # 待处理的音频数据队列
         batch_meta = [] # 存 {'index': chunk_index, 'offset': time_offset}
-        # 预先为所有可能的一级块分配结果列表，稍微多一点空间也没事，后续按 append 顺序对应
-        # 在 VAD 循环中动态添加
-        all_chunk_subwords_collection = [] 
 
         def flush_batch():
             """内部闭包：执行批量推理并归位结果"""
@@ -1980,48 +1994,28 @@ def main(argv=None):
                     continue
                 # 解码
                 decoded = decode_hypothesis_to_subword_info(model, hyp)
+                plan_idx = int(meta["plan_index"])
 
                 for token_id, token, step_index in decoded:
+                    # raw_local<0 时 clamp 到 0
                     local_start_sample = max(0, step_index * STEP_SAMPLES - PAD_SAMPLES)
                     t_sample = meta["base_offset_sample"] + local_start_sample
 
-                    # 判断归属（own_keep，半开区间；t==end 归下一个）
-                    idx = int(np.searchsorted(own_starts_sample, t_sample, side="right")) - 1
+                    # clamp 到全局范围
+                    if t_sample < 0:
+                        t_sample = 0
+                    elif t_sample > total_audio_samples:
+                        t_sample = total_audio_samples
 
-                    if idx < 0:
-                        owner = 0
-                    elif t_sample < own_ends_sample[idx]:
-                        owner = idx
-                    elif idx + 1 >= len(own_keep_sample):
-                        owner = len(own_keep_sample) - 1
-                    else:
-                        # 落在 gap：选择“最近边界”，距离相等时归右侧
-                        left_dist = t_sample - own_ends_sample[idx]
-                        right_dist = own_starts_sample[idx + 1] - t_sample
-                        owner = (idx + 1) if (right_dist <= left_dist) else idx
-
-                    # 去重/保留（keep）,严格半开 [start, end)
-                    keep = True
-                    if not (meta["keep_start_sample"] <= t_sample < meta["keep_end_sample"]):
-                        # 不在当前推理段的 keep，检查它是否被 owner chunk 中的其它 keep 覆盖，没有被覆盖保留并按最近边界 owner 归属
-                        for ws, we in keep_windows_sample_by_chunk[owner]:
-                            if ws <= t_sample < we:
-                                keep = False
-                                break
-
-                    if not keep:
-                        continue
-
-                    subwordinfo = SubwordInfo(
+                    subwords_by_plan[plan_idx].append(SubwordInfo(
                         token_id=token_id,
                         token=token,
                         start_sample=t_sample,
-                        end_sample=t_sample + STEP_SAMPLES, # 临时值，后续切段阶段会用 next_start/vad_limit 重算
-                        step_index=step_index,
-                        chunk_index=owner,
-                        vad_limit_sample=chunks[owner].vad_limit_sample,
-                    )
-                    all_chunk_subwords_collection[owner].append(subwordinfo)
+                        end_sample=t_sample + STEP_SAMPLES,   # 临时值，后面会用 next_start/vad_limit 重算
+                        step_index=int(step_index),
+                        chunk_index=int(meta["chunk_index"]), # 仍保留“来自哪个 VAD 大块”的信息
+                        vad_limit_sample=0,                   # 后续 create_precise_segments_from_subwords 会覆盖
+                    ))
 
             batch_audio.clear()
             batch_meta.clear()
@@ -2029,22 +2023,9 @@ def main(argv=None):
         # --- 分支 A: 不分块 (No Chunk) ---
         if args.no_chunk:
             logger.info("未使用VAD，一次性处理整个文件……")
-            # 初始化归属索引
-            chunks = [ChunkInfo(
-                chunk_index=0,
-                own_keep_start_sample=0,
-                own_keep_end_sample=total_audio_samples,
-                vad_limit_sample=total_audio_samples,
-                keep_windows_sample=[(0, total_audio_samples)],
-            )]
-
-            own_keep_sample = [(0, total_audio_samples)]
-            own_starts_sample = np.array([0], dtype=np.int64)
-            own_ends_sample = np.array([total_audio_samples], dtype=np.int64)
-
-            keep_windows_sample_by_chunk = {0: [(0, total_audio_samples)]}
-
+            
             planned_segments = [{
+                "plan_index": 0,
                 "chunk_index": 0,
                 "display_number": 1,
                 "audio_start_sample": 0,
@@ -2057,18 +2038,10 @@ def main(argv=None):
             }]
 
             full_chunk = slice_waveform_sample(waveform, 0, total_audio_samples)
-
             if args.debug and not api_mode:
                 fd, temp_full_wav_path = tempfile.mkstemp(suffix=".wav")
                 os.close(fd)
                 save_tensor_as_wav(temp_full_wav_path, full_chunk)
-
-            all_chunk_subwords_collection = [[]]
-
-            # 统一推理
-            batch_audio.append(full_chunk.squeeze(0))
-            batch_meta.append(planned_segments[0])
-            flush_batch()
 
         # --- 分支 B: 使用 VAD 分块 ---
         else:
@@ -2132,33 +2105,9 @@ def main(argv=None):
                 logger.debug(f"【VAD】原 {len(speeches)} 个语音块已合并为 {len(nonsilent_speeches)} 个语音块")
             else:
                 logger.debug(f"【VAD】没有需要合并的语音块")
-            
-            # own_keep用于确定归属块，半开区间 [start, end)
-            own_keep_sample = [
-                (seg["own_keep_start_sample"], seg["own_keep_end_sample"])
-                for seg in nonsilent_speeches
-            ]
-            own_starts_sample = np.array([s for s, _ in own_keep_sample], dtype=np.int64)
-            own_ends_sample = np.array([e for _, e in own_keep_sample], dtype=np.int64)
-
-            # keep 覆盖窗口，用于子块是否保留/去重/兜底
-            keep_windows_sample_by_chunk = {i: [] for i in range(len(nonsilent_speeches))}
-
-            chunks = []
-            for i, seg in enumerate(nonsilent_speeches):
-                chunks.append(ChunkInfo(
-                    chunk_index=i,
-                    own_keep_start_sample=seg["own_keep_start_sample"],
-                    own_keep_end_sample=seg["own_keep_end_sample"],
-                    vad_limit_sample=seg["end_sample"],
-                    keep_windows_sample=keep_windows_sample_by_chunk[i],
-                ))
 
             # 计划表：每个元素代表一次实际推理的音频窗（未 pad 的范围）及其 keep/own 信息
             planned_segments = []
-
-            # 初始化结果收集器
-            all_chunk_subwords_collection = [[] for _ in range(len(nonsilent_speeches))]
 
             if args.debug and not api_mode:
                 temp_chunk_dir = Path(tempfile.mkdtemp())
@@ -2190,27 +2139,27 @@ def main(argv=None):
                     # === 短块 ===
                     logger.info(" --> 短块，直接识别")
                     
-                    keep_windows_sample_by_chunk[i].append((
-                        chunk_dict["own_keep_start_sample"],
-                        chunk_dict["own_keep_end_sample"]
-                        ))
-
+                    audio_start_sample = max(0, int(start_sample) - int(ms_to_samp_round(1200)))
+                    audio_end_sample = min(int(total_audio_samples), int(end_sample) + int(ms_to_samp_round(600)))
+                    if audio_end_sample < audio_start_sample:
+                        audio_end_sample = audio_start_sample
                     planned_segments.append({
+                        "plan_index": len(planned_segments),
+
                         "chunk_index": i,
                         "display_number": i + 1,
                         # 推理时再从原始 waveform 切片并 pad（保证只 pad 一次）
-                        "audio_start_sample": start_sample,
-                        "audio_end_sample": end_sample,
-                        "base_offset_sample": start_sample,
-
+                        "audio_start_sample": audio_start_sample,
+                        "audio_end_sample": audio_end_sample,
+                        "base_offset_sample": audio_start_sample,
                         # 归属：只看 own_keep
                         "own_keep_start_sample": chunk_dict["own_keep_start_sample"],
                         "own_keep_end_sample": chunk_dict["own_keep_end_sample"],
-
                         # 保留：只看 keep（短块没有二次切分窗口，keep=own_keep）
                         "keep_start_sample": chunk_dict["own_keep_start_sample"],
                         "keep_end_sample": chunk_dict["own_keep_end_sample"],
                     })
+
                 
                 else:
                     # === 长块 (二次切分) ===
@@ -2288,20 +2237,20 @@ def main(argv=None):
                         if audio_end_sample < audio_start_sample:
                             audio_end_sample = audio_start_sample
 
-                        keep_windows_sample_by_chunk[i].append((keep_start_sample, keep_end_sample))
-
+                        audio_start_sample = max(0, int(audio_start_sample) - int(ms_to_samp_round(1200)))
+                        audio_end_sample = min(int(total_audio_samples), int(audio_end_sample) + int(ms_to_samp_round(600)))
+                        if audio_end_sample < audio_start_sample:
+                            audio_end_sample = audio_start_sample
                         planned_segments.append({
+                            "plan_index": len(planned_segments),
                             "chunk_index": i,
                             "display_number": f"{i+1}-{sub_idx+1}",
-
                             "audio_start_sample": audio_start_sample,
                             "audio_end_sample": audio_end_sample,
                             "base_offset_sample": audio_start_sample,
-
                             # 判断块归属使用 own_keep
                             "own_keep_start_sample": int(chunk_dict["own_keep_start_sample"]),
                             "own_keep_end_sample": int(chunk_dict["own_keep_end_sample"]),
-
                             # 保留、去重等使用 keep
                             "keep_start_sample": keep_start_sample,
                             "keep_end_sample": keep_end_sample,
@@ -2320,27 +2269,118 @@ def main(argv=None):
                                 f"时长：{(int(audio_end_sample) - int(audio_start_sample)) / SAMPLERATE:.2f} 秒"
                             )
 
-            # 按 planned_segments 统一推理并从 waveform 切片并 pad，保证每次推理窗都只 pad 一次
-            for meta in planned_segments:
-                batch_audio.append(slice_waveform_sample(
+        # 初始化 subwords_by_plan
+        subwords_by_plan = [[] for _ in range(len(planned_segments))]
+
+        # 执行推理并收集
+        for meta in planned_segments:
+            batch_audio.append(
+                slice_waveform_sample(
                     waveform,
                     meta["audio_start_sample"],
                     meta["audio_end_sample"],
-                ).squeeze(0))
-                batch_meta.append(meta)
-                # 每次循环末尾，检查 batch 是否满了
-                if len(batch_audio) >= BATCH_SIZE:
-                    flush_batch()
+                ).squeeze(0)
+            )
+            batch_meta.append(meta)
 
-            # 循环结束后，处理剩余的 batch
-            flush_batch()
-            
-        raw_subwords = []
-        if all_chunk_subwords_collection:
-            for sub_list in all_chunk_subwords_collection:
-                raw_subwords.extend(sub_list)
-            logger.debug(f"【VAD】所有语音块处理完毕")
-        raw_subwords.sort(key=lambda s: (s.start_sample, s.step_index))
+            if len(batch_audio) >= BATCH_SIZE:
+                flush_batch()
+
+        flush_batch()
+
+        # 每个 plan 内先：排序 + 段首 prefix 去 clamp 重定位 + 单调化
+        for meta in planned_segments:
+            subs = subwords_by_plan[int(meta["plan_index"])]
+            if not subs:
+                continue
+            """
+            只对“段首被 clamp 的 prefix token”（raw_local<0 的连续前缀）做去 clamp 化重定位：
+              raw_local = step_index * STEP_SAMPLES - PAD_SAMPLES
+            将这段 prefix 的 start_sample 重定位到 keep_start_sample 附近，并做 1 sample 的递增展开避免同一时间戳堆叠。
+            """
+            # 以 step_index 为主排序，保证 prefix 的判断稳定
+            subs.sort(key=lambda s: (s.step_index, s.start_sample))
+        
+            anchor = max(0, min(int(meta["keep_start_sample"]), int(total_audio_samples)))
+        
+            # 找连续 prefix：raw_local < 0
+            p = 0
+            for sw in subs:
+                raw_local = int(sw.step_index) * STEP_SAMPLES - PAD_SAMPLES
+                if raw_local < 0:
+                    p += 1
+                else:
+                    break
+        
+            if p <= 0:
+                continue
+        
+            # 重定位 prefix 到 keep_start 附近，并展开
+            for j in range(p):
+                subs[j].start_sample = min(anchor + j, int(total_audio_samples))
+    
+            enforce_monotonic_start_inplace(subs, int(total_audio_samples))
+
+        # 相邻 plan 做 40 token 精确 token_id 重叠检测 
+        merged = []
+        prev_meta = None
+
+        for meta in planned_segments:
+            right = subwords_by_plan[int(meta["plan_index"])]
+            if not right:
+                continue
+
+            if not merged:
+                merged.extend(right)
+                prev_meta = meta
+                continue
+
+            # 取尾/头最多 40 个 token_id 做精确匹配
+            left_tail = merged[-40:] if len(merged) > 40 else merged
+            right_head = right[:40] if len(right) > 40 else right
+            """返回 k：left 的后 k 个 token_id == right 的前 k 个 token_id（精确匹配）"""
+            left_ids = [sw.token_id for sw in left_tail]
+            right_ids = [sw.token_id for sw in right_head]
+
+            k = 0
+            max_k = min(40, len(left_ids), len(right_ids))
+            for kk in range(max_k, 1, -1):
+                if left_ids[-kk:] == right_ids[:kk]:
+                    k = kk
+                    break
+
+            if k <= 0:
+                merged.extend(right)
+                prev_meta = meta
+                continue
+
+            # 删左还是删右
+            prev_keep_end = int(prev_meta["keep_end_sample"])
+            curr_keep_start = int(meta["keep_start_sample"])
+            Bmid = (prev_keep_end + curr_keep_start) // 2
+            margin = int(ms_to_samp_round(200))
+
+            left_overlap = merged[-k:]
+            right_overlap = right[:k]
+
+            tL = int(np.median([int(s.start_sample) for s in left_overlap]))
+            tR = int(np.median([int(s.start_sample) for s in right_overlap]))
+
+            right_clamped_like = (tR <= int(meta["audio_start_sample"]) + int(ms_to_samp_round(50)))
+
+            if (tL < Bmid - margin) and (tR >= Bmid - margin) and (not right_clamped_like):
+                # 删左保右
+                del merged[-k:]
+                merged.extend(right)
+            else:
+                # 删右保左
+                merged.extend(right[k:])
+
+            prev_meta = meta
+
+        raw_subwords = merged
+        enforce_monotonic_start_inplace(raw_subwords, int(total_audio_samples))
+        logger.debug(f"【VAD】所有语音块处理完毕")
 
         # --- 计时结束：核心识别流程 ---
         recognition_end_time = time.perf_counter()

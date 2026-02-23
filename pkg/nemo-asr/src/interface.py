@@ -36,14 +36,6 @@ class TranscribeConfig:
     raw_hypothesis: bool = False
 
 @dataclass(slots=True)
-class ChunkInfo:
-    chunk_index: int
-    own_keep_start_sample: int
-    own_keep_end_sample: int  # 半开 [start, end)
-    vad_limit_sample: int
-    keep_windows_sample: list[tuple[int, int]]  # list of 半开窗口
-
-@dataclass(slots=True)
 class SubwordInfo:
     token_id: int
     token: str
