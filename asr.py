@@ -755,13 +755,17 @@ def get_speech_timestamps_onnx(
     使用 segmentation-3.0 ONNX + ≤10 秒滑窗 + 双阈值后处理，
     将一段 waveform 转换为若干语音时间段
     """
-    # 通过 ≤9 秒滑窗，拼出整段 speech_probs 和 frame_times_sample
-    all_probs = []
-    all_times = []
-    start_sample = 0
+    # 通过 ≤10 秒滑窗，拼出整段 speech_probs 和 frame_times_sample
+    # 固定全局帧步长：10ms
+    frame_hop_samples = ms_to_samp_round(10)
+
     total = waveform.shape[1]
-    # 预先计算重叠样本数
-    overlap_samples = ms_to_samp_round(1000)
+    n_global = (total + frame_hop_samples - 1) // frame_hop_samples + 1
+    accum = np.zeros(n_global, dtype=np.float32)
+    weight = np.zeros(n_global, dtype=np.float32)
+
+    start_sample = 0 
+
     while start_sample < total:
         end_sample = min(start_sample + 10 * SAMPLERATE, total)
         # 如果尾巴太短于约1s，直接把本窗扩到结尾（吞尾巴）
@@ -783,42 +787,45 @@ def get_speech_timestamps_onnx(
         # 竞争: 语音 - 静音，再Sigmoid
         # 转回 Numpy 以便进入 Python 循环
         # logits[:, 0] > 静音维度，logits[:,1:] > 语音维度
-        probs_full = torch.sigmoid(torch.logsumexp(logits[:,1:], dim=1) - logits[:, 0]).numpy()
+        probs_full = torch.sigmoid(torch.logsumexp(logits[:, 1:], dim=1) - logits[:, 0]).numpy()
+
         # 当前窗口的实际样本数
         window_samples = end_sample - start_sample
-
-        is_first = start_sample == 0
-        is_last = end_sample == total
-        # 计算“帧/样本”的缩放比例，需要裁剪的帧数
-        crop_frames = (overlap_samples * len(probs_full) + (window_samples // 2)) // window_samples
-        
-        # 确定起止索引，如果是首窗，起点为0；否则裁剪掉头部重叠区
-        start_idx = 0 if is_first else crop_frames
-        
-        # 如果是尾窗，终点为总长度；否则裁剪掉尾部重叠区
-        end_idx = len(probs_full) if is_last else (len(probs_full) - crop_frames)
 
         # 生成 frame_times_sample：每帧对应“帧起点”的绝对 sample（np.int64）
         # 纯整数 floor 映射：保证落在 [start_sample, end_sample) 内
         times_full_sample = start_sample + (np.arange(len(probs_full), dtype=np.int64) * int(window_samples)) // len(probs_full)
 
-        all_probs.append(probs_full[start_idx:end_idx])
-        all_times.append(times_full_sample[start_idx:end_idx])
+        # Hamming 权重
+        w = np.hamming(len(probs_full)).astype(np.float32)
+
+        # warm-up 0.5s，对短窗做保护，warm-up trim：非首窗丢掉左 warm-up，非尾窗丢掉右 warm-up
+        warm_up = min(0.5 * SAMPLERATE, window_samples // 4)  # 防短窗
+        valid = np.ones(len(probs_full), dtype=bool)
+        if not start_sample == 0:
+            valid &= (times_full_sample >= start_sample + warm_up)
+        if not end_sample == total:
+            valid &= (times_full_sample <= end_sample - warm_up)
+
+        # 映射到全局 10ms 网格做 overlap-add
+        gidx = np.clip((times_full_sample + frame_hop_samples // 2) // frame_hop_samples, 0, n_global - 1)
+
+        accum[gidx[valid]] += probs_full[valid] * w[valid]
+        weight[gidx[valid]] += w[valid]
 
         if end_sample >= total:
             break
 
+        # 10s 滑窗、8s 步长（2s overlap）
         start_sample += int(10 * SAMPLERATE - 2 * SAMPLERATE)
 
-    speech_probs = all_probs[0] if len(all_probs) == 1 else np.concatenate(all_probs, axis=0)
-    frame_times_sample = all_times[0] if len(all_times) == 1 else np.concatenate(all_times, axis=0)
-    frame_times_sample = np.maximum.accumulate(frame_times_sample.astype(np.int64, copy=False))
+    speech_probs = accum / np.maximum(weight, 1e-6)
 
-    num_frames = speech_probs.shape[0]
-
-    # segmentation-3.0 实际上是 10ms 一帧，这个计算方式在任意长度下都一致
-    # 近似每帧跨度（sample）：用 ceil(total/num_frames)，用于把“样本阈值”换算成“帧数阈值”
-    frame_hop_samples = max(1, (waveform.shape[1] + speech_probs.shape[0] - 1) // speech_probs.shape[0])
+    frame_times_sample = (np.arange(n_global, dtype=np.int64) * frame_hop_samples)
+    # 去掉最后可能超出 total 的点
+    keep = frame_times_sample < total
+    speech_probs = speech_probs[keep]
+    frame_times_sample = frame_times_sample[keep]
 
     # 双阈值 + 填平短静音 + 丢弃短语音 + 直接生成秒级区间
     # 最小语音段帧数（小于这个长度的语音段会被丢弃）
@@ -861,9 +868,7 @@ def get_speech_timestamps_onnx(
                 silence_start_f = None
 
     # 处理结尾残留：文件结束时仍在语音段中
-    if in_speech:
-        seg_end_f = num_frames
-        if (seg_end_f - seg_start_f) >= min_speech_frames:
+    if in_speech and len(speech_probs) - seg_start_f >= min_speech_frames:
             start_sample = int(frame_times_sample[seg_start_f])
             end_sample = waveform.shape[1]
             if end_sample > start_sample:
@@ -1259,11 +1264,10 @@ def merge_short_segments_adaptive(segments, max_duration_sample):
     result = []
 
     i = 0
-    short_threshold_sample = ms_to_samp_round(1000)
     while i < len(working_segments):
         seg = working_segments[i]
         seg_duration_sample = seg["end_sample"] - seg["start_sample"]
-        if seg_duration_sample <= short_threshold_sample: # 不大于 1 秒才合并
+        if seg_duration_sample <= SAMPLERATE: # 不大于 1 秒才合并
             # 获取前后邻居
             prev_seg = result[-1] if result else None
             next_seg = working_segments[i + 1] if i + 1 < len(working_segments) else None

@@ -5,6 +5,7 @@ __pycache__
 !/test.wav
 *.srt
 *.txt
+!/reazonspeechprompt.txt
 *.ass
 *.flac
 *.egg-info

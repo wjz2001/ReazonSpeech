@@ -184,7 +184,9 @@ reazonspeech
 | **prompt** | 否 | 在此处传入除输出参数和 debug 参数外所有的配置参数 |
 | **timestamp_granularities** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
 
-- 如果你的应用不支持输入或自定义 prompt 提示词，那么可以在根目录下新建文件 `reazonspeechprompt.txt`，在其中填写 prompt 参数，示例如下：
+- 无需填写语言和模型名称参数，瞎填也可以，最终都不会生效，本 API 服务只提供日语和ReazonSpeech模型
+
+- 如果你的应用不支持输入或自定义 prompt 提示词，那么可以在根目录下新建文件 `reazonspeechprompt.txt`，在其中填写 prompt 参数，格式与调用接口时相同，示例如下：
 
 ```
 --beam 5 --no-chunk
