@@ -817,7 +817,7 @@ def get_speech_timestamps_onnx(
             break
 
         # 10s 滑窗、8s 步长（2s overlap）
-        start_sample += int(10 * SAMPLERATE - 2 * SAMPLERATE)
+        start_sample += int(8 * SAMPLERATE)
 
     speech_probs = accum / np.maximum(weight, 1e-6)
 
@@ -1531,46 +1531,61 @@ def refine_tail_timestamp(
     # 取尾段能量的低分位数，找“相对安静”的能量水平
     dyn_e_tau = max(np.percentile(e_smooth, energy_percentile) + energy_offset, 1e-6)
 
+    # 额外统计：用于自适应“突降”阈值与滞回
+    spread = max(float(np.percentile(p_smooth, 90)) - float(np.percentile(p_smooth, 10)), 1e-6)  
+
+    # 跨 dyn_tau 的“像语音/像静音”两阈值（避免只看单点差值）
+    hi = min(0.99, float(dyn_tau) + max(0.08, 0.25 * spread))   # 明确语音
+    lo = max(0.01, float(dyn_tau) - max(0.03, 0.10 * spread))  # 明确静音
+
+    # 自适应“突降幅度”基准阈值（方案A）
+    drop_th_base = float(np.clip(0.6 * spread, 0.15, 0.45))
+
     # samples -> frames（纯整数 ceil）
     min_silence_frames = max(1, (int(min_silence_samples) + frame_hop_samples - 1) // frame_hop_samples)
 
-    def _is_sudden_drop_with_high_acoustic(i):
+    def _sudden_drop_hangover_frames(i):
         """
-        判定当前以 i 为起点、长度为 min_silence_samples 的窗口是否属于：
-        “概率突然掉，但能量/ZCR 仍然偏高”的可疑静音
-        只基于 [last_token_start_sample, max_end_sample] 内的数据进行判断
+        若检测到“跨 hi/lo 的突降”且声学仍活跃（能量/ZCR高），返回建议的 hangover 帧数；
+        否则返回 0。
+
+        - drop 阈值随 spread 自适应
+        - “跨 dyn_tau”三条件：prev>hi、curr<lo、drop>=drop_th
+        - 声学强度越高，drop_th 越放宽、hangover 越长
+        - WebRTC hangover 意图：触发后延迟释放，避免尾音/清辅音被切
         """
-        # 检测“概率突降 + 能量/ZCR 仍偏高”的窗口时，回看多长时间（秒 -> 帧）
-        # 突降窗口：clamp(0.5*min_silence, 80ms..250ms) -> samples -> frames
-        sudden_window_frames = max(4,
-            int((min(ms_to_samp_round(250),
-                    max(
-                        ms_to_samp_round(80),
-                        int(min_silence_samples) // 2
-                    )) + frame_hop_samples - 1) // frame_hop_samples))
+        sudden_window_frames = max(
+            4,
+            int(
+                (
+                    min(
+                        ms_to_samp_round(250),
+                        max(ms_to_samp_round(80), int(min_silence_samples) // 2),
+                    )
+                    + frame_hop_samples
+                    - 1
+                )
+                // frame_hop_samples
+            ),
+        )
         prev_end = i
         prev_start = max(0, prev_end - sudden_window_frames)
-        # 如果切片为空（例如 i=0 时），说明没有“之前”的数据可供比较，直接返回 False
         if prev_end <= prev_start:
-            return False
+            return 0
 
-        # 获取“当前点之前”的一小段的最大概率
-        prev_max_p = p_smooth[prev_start:prev_end].max()
-        # 获取“当前点之后”的一小段（静音窗口）的平均概率
-        curr_mean_p = p_smooth[i : i + min_silence_frames].mean()
+        prev_max_p = float(p_smooth[prev_start:prev_end].max())
+        curr_mean_p = float(p_smooth[i : i + min_silence_frames].mean())
 
-        # 确保·前面是高置信度语音（显著高于静音阈值），再抬一点，防止把低置信噪声也当作“突降前的语音”
-        if prev_max_p < dyn_tau + offset:
-            return False
+        # 必须跨越“明显语音 -> 明显静音”（Schmitt trigger）
+        if prev_max_p < hi:
+            return 0
+        if curr_mean_p > lo:
+            return 0
 
-        # 确保当前窗口的概率相对前面明显“突降”
-        if prev_max_p - curr_mean_p < 0.35:
-            return False
-
-        # 能量或 ZCR 仍然偏高，说明声学上还很“活跃”，不像真正静音
+        # 声学活跃度
         high_energy = (
-            np.mean(e_smooth[prev_start:prev_end]) > dyn_e_tau
-            or np.mean(e_smooth[i : i + min_silence_frames]) > dyn_e_tau
+            float(np.mean(e_smooth[prev_start:prev_end])) > float(dyn_e_tau)
+            or float(np.mean(e_smooth[i : i + min_silence_frames])) > float(dyn_e_tau)
         )
 
         high_zcr = False
@@ -1578,11 +1593,26 @@ def refine_tail_timestamp(
             z_start = start_idx + i
             z_end = z_start + min_silence_frames
             high_zcr = (
-                np.mean(zcr_array[z_start:z_end] > zcr_threshold)
-                > zcr_high_ratio
+                float(np.mean(zcr_array[z_start:z_end] > zcr_threshold)) > float(zcr_high_ratio)
             )
 
-        return high_energy or high_zcr
+        if not (high_energy or high_zcr):
+            return 0
+
+        acoustic_strength = (1 if high_energy else 0) + (1 if high_zcr else 0)
+
+        # 自适应突降幅度阈值，并按声学证据放宽
+        drop_th = float(np.clip(drop_th_base - 0.05 * acoustic_strength, 0.12, 0.45))
+        if (prev_max_p - curr_mean_p) < drop_th:
+            return 0
+
+        # 声学证据越强，保护越久
+        hangover_ms = int(np.clip(200 + 150 * acoustic_strength, 120, 600))
+        hangover_frames = max(
+            1,
+            (ms_to_samp_round(hangover_ms) + int(frame_hop_samples) - 1) // int(frame_hop_samples),
+        )
+        return int(hangover_frames)
 
     def _is_stable_silence(i, p_arr, e_arr, global_base_idx):
         """
@@ -1626,7 +1656,7 @@ def refine_tail_timestamp(
             if la_end > len(p_arr):
                 la_end = len(p_arr)
             if la_end > la_start:
-                if np.any(p_arr[la_start:la_end] >= min(0.98, dyn_tau + offset)):
+                if np.any(p_arr[la_start:la_end] >= min(0.98, hi)):
                     return False
 
         return True
@@ -1649,14 +1679,19 @@ def refine_tail_timestamp(
     allow_use_extra_tail = False
 
     # === 只在 [last_token_start_sample, max_end_sample] 内找 ===
+    hangover_left = 0
     for i in range(0, len(p_smooth) - min_silence_frames + 1):
-        # 检查这段是否属于「概率突降 + 高能量/ZCR」的可疑静音
-        if _is_sudden_drop_with_high_acoustic(i):
+        # 先尝试触发“可疑突降”保护：返回 hangover 帧数
+        h = _sudden_drop_hangover_frames(i)
+        if h > 0:
             allow_use_extra_tail = True
-            # 这类可疑静音本身不作为切点
+            hangover_left = max(hangover_left, h)
+
+        # hangover 期间：强制跳过切点判定（避免尾音/清辅音被切）
+        if hangover_left > 0:
+            hangover_left -= 1
             continue
 
-        # 通用检查：是否稳定静音
         if _is_stable_silence(i, p_smooth, e_smooth, start_idx):
             return _calc_refined_sample(start_idx + i, int(max_end_sample))
 
