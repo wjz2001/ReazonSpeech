@@ -180,13 +180,14 @@ reazonspeech
 | 参数名 | 必填 | 说明 |
 | :--- | :---: | :--- |
 | **file** | 是 | 上传音频文件或视频文件 |
+| **model** | 否 | 本API服务仅支持ReazonSpeech模型，所以此参数无效 |
+| **language** | 否 | 本API服务仅支持日语，不支持其他语言，所以此参数无效 |
 | **response_format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`<br>2. **ReazonSpeech 专用格式**：如 `kass`，`segment2tsv` 等（即上面的输出参数去除开头短横线，多个参数用逗号分隔） |
 | **prompt** | 否 | 在此处传入除输出参数和 debug 参数外所有的配置参数 |
 | **timestamp_granularities** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
+| 其余参数均无效 |
 
-- 无需填写语言和模型名称参数，瞎填也可以，最终都不会生效。本 API 服务只支持日语和ReazonSpeech模型
-
-- 如果你的应用不支持输入或自定义 prompt 提示词，那么可以在根目录下新建文件 `reazonspeechprompt.txt`，在其中填写 prompt 参数，格式与调用接口时相同，示例如下：
+- 如果你的应用不支持输入或自定义 prompt 提示词，那么可以在根目录下找到文件 `reazonspeechprompt.txt`，在其中填写 prompt 参数，格式与调用接口时相同，示例如下：
 
 ```
 --beam 5 --no-chunk
