@@ -180,8 +180,8 @@ reazonspeech
 | 参数名 | 必填 | 说明 |
 | :--- | :---: | :--- |
 | **file** | 是 | 上传音频文件或视频文件 |
-| **model** | 否 | 本API服务仅支持ReazonSpeech模型，所以此参数无效 |
-| **language** | 否 | 本API服务仅支持日语，不支持其他语言，所以此参数无效 |
+| **model** | 否 | 本 API 服务仅支持 ReazonSpeech 模型，所以此参数可写可不写 |
+| **language** | 否 | 本 API 服务仅支持日语，不支持其他语言，所以此参数可写可不写 |
 | **response_format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`<br>2. **ReazonSpeech 专用格式**：如 `kass`，`segment2tsv` 等（即上面的输出参数去除开头短横线，多个参数用逗号分隔） |
 | **prompt** | 否 | 在此处传入除输出参数和 debug 参数外所有的配置参数 |
 | **timestamp_granularities** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
