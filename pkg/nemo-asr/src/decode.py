@@ -36,12 +36,16 @@ def decode_hypothesis(model, hyp):
         TranscribeResult
     """
     # NeMo prepends a blank token to y_sequence with ALSD.
-    # Trim that artifact token.
+    # Trim that artifact token from both y_sequence and timestamp,
+    # otherwise zip causes a 1-step misalignment that pulls the first
+    # real token's emit-step to 0 (blank's step), pushing its time
+    # to the chunk origin — observed as "phantom prefix" segments.
     y_sequence = hyp.y_sequence.tolist()[1:]
+    timestamps = (hyp.timestamp.tolist() if hasattr(hyp.timestamp, "tolist") else list(hyp.timestamp))[1:]
     text = model.tokenizer.ids_to_text(y_sequence)
 
     subwords = []
-    for idx, (token_id, step) in enumerate(zip(y_sequence, hyp.timestamp)):
+    for idx, (token_id, step) in enumerate(zip(y_sequence, timestamps)):
         subwords.append(Subword(
             token_id=token_id,
             token=model.tokenizer.ids_to_text([token_id]),
@@ -80,10 +84,13 @@ def find_end_of_segment_by_step(subwords, start, phonemic_break_steps):
     return idx
 
 def decode_hypothesis_to_subword_info(model, hyp):
+    # NeMo prepends a blank token to y_sequence with ALSD; its timestamp
+    # is also in hyp.timestamp[0]. Trim both to keep zip aligned.
     y_sequence = hyp.y_sequence.tolist()[1:]
+    timestamps = (hyp.timestamp.tolist() if hasattr(hyp.timestamp, "tolist") else list(hyp.timestamp))[1:]
 
     results = []
-    for idx, (token_id, step) in enumerate(zip(y_sequence, hyp.timestamp)):
+    for idx, (token_id, step) in enumerate(zip(y_sequence, timestamps)):
         token = model.tokenizer.ids_to_text([token_id])
         step_index = int(step - idx - 1)
         results.append((token_id, token, step_index))
