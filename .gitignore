@@ -14,6 +14,7 @@ __pycache__
 /models/
 /ReazonSpeech.egg-info/
 /.ssh/
+/.loop/
 /pkg/k2-asr/build/
 /pkg/nemo-asr/build/
 /gitpush.bat

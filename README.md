@@ -78,7 +78,6 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 |-----------|:-------------:|:---------:|
 | `--debug` | 处理结束后保存语音块，并自动打开语音块保存目录，显示更多日志 | `无` |
 | `--batch-size` | 数字越大批量推理的速度越快，不填则自动根据显存估算（只使用 CPU 则默认为 1） | `1` |
-| `--beam` | 设置集束搜索宽度，范围为 4 到 256 之间的整数，更大的值可能更准确但更慢 | `4` |
 | `--no-remove-punc` | 禁止自动剔除句末标点，保留原始识别结果 | `无` |
 
 ### 音频滤镜参数
@@ -90,7 +89,7 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 
 - `--audio-filter` 和 `--limiter-filter` 不能共存
 
-- 不写 `--audio-filter` 或不写 `--limiter-filter`
+- 即不写 `--audio-filter` 也不写 `--limiter-filter` 为
 
   **不启用任何滤镜**，推荐在录音干净时使用
 
@@ -112,7 +111,7 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 
   - `--limiter-filter`会自动在滤镜链末尾附加`alimiter=limit=0.98:level=disabled:attack=5:release=50:latency=1`
 
-  - [ffmpeg音频滤镜列表](https://ffmpeg.org/ffmpeg-filters.html#Audio-Filters)
+  - 参考：[ffmpeg音频滤镜列表](https://ffmpeg.org/ffmpeg-filters.html#Audio-Filters)
 
 ### VAD 参数
 
@@ -124,14 +123,6 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 | `--min_speech_duration_ms` | 移除短于此时长（毫秒）的语音块 | `100` |
 | `--min_silence_duration_ms` | 短于此时长（毫秒）的语音块不被视为间隔 | `200` |
 | `--keep_silence` | 在语音块前后扩展的时长（毫秒） | `300` |
-
-### 过零率检测参数（必须先开启 VAD）
-
-| 参数 | 作用 | 默认值 |
-|-----------|:-------------:|:---------:|
-| `--zcr` | 开启过零率检测，防止切断清辅音 | `无` |
-| `--zcr_threshold` | 手动设置 ZCR 阈值 | `0.15` |
-| `--auto_zcr` | 开启自适应 ZCR 阈值计算，zcr_threshold作为兜底 | `无` |
 
 ### 段尾精修参数（必须先开启 VAD）
 
@@ -146,6 +137,40 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 | `--tail_safety_margin_ms` | 在找到的切点后增加的安全边距（毫秒） | `30` |
 | `--tail_min_keep_ms` | 强制保留在段尾的最小时长（毫秒） | `30` |
 | `--tail_zcr_high_ratio` | 疑似静音窗口内高于 ZCR 阈值的帧超过此比例时（0.1-0.5），才会判定为清音 | `0.3` |
+
+### 过零率检测参数（必须先开启 VAD）
+
+| 参数 | 作用 | 默认值 |
+|-----------|:-------------:|:---------:|
+| `--zcr` | 开启过零率检测，防止切断清辅音 | `无` |
+| `--zcr_threshold` | 手动设置 ZCR 阈值 | `0.15` |
+| `--auto_zcr` | 开启自适应 ZCR 阈值计算，zcr_threshold作为兜底 | `无` |
+
+### 解码参数
+
+| 参数 | 作用 | 默认值 |
+|-----------|:-------------:|:---------:|
+| `--decoding-strategy` | RNN-T 解码策略，可选 `alsd` 或 `maes` | `alsd` |
+| `--beam` | 设置集束搜索宽度，范围为 4 到 256 之间的整数，更大的值可能更准确但更慢 | `4（maes开启时为 8）` |
+| `--maes-num-steps` | 必须先开启 `MAES`，设置 MAES 每个时间步的自适应扩展步数，`3`、`4` 精度略有提升，但代价是至少 1.5 倍的识别时间 | `2` |
+| `--maes-expansion-beta` | 必须先开启 `MAES`，设置 MAES 的额外候选数，会和 `--beam` 一起发挥作用，更大可能更准但更慢 | `2` |
+| `--maes-expansion-gamma` | 必须先开启 `MAES`，设置 MAES 的剪枝阈值，值越小速度越快但精度会下降，值越大精度越高但会消耗更多时间 | `2.30` |
+| `--softmax-temperature` | 设置 logits 温度，`<1` 分布更尖锐，可能对识别模糊发音有帮助；`>1` 分布更平滑，一般不推荐 | `1.00` |
+
+#### 推荐搭配（不一定适合所有情况）
+
+- **清晰发音/无噪音**
+   * **建议**：ALSD + beam=8，此时可提供最高的精确度
+
+- **模糊发音/日常对话**
+   * **建议**：MAES + beam=8，质量与 ALSD 相当，但速度快 2 倍
+
+3. **歌曲/带伴奏背景**
+   * **建议**：MAES + beam=8，不易被伴奏尤其是长段伴奏干扰，并能识别出更多字
+4. **多说话人/嘈杂背景**
+   * **建议**：ALSD + beam=24，可以最大程度防止漏字，极限为 beam=32
+
+5. `--maes-num-steps`、`--maes-expansion-beta`、`--maes-expansion-gamma`、`--softmax-temperature` 一般不必使用，用了也可能没有效果
 
 ### 输出参数
 
@@ -166,22 +191,23 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 
 ### 启动服务
 
-在终端直接运行命令：
+1. 在终端直接运行命令：
 
 ```bash
 reazonspeech
 ```
 
-启动成功后，服务默认监听端口 **8888**（如被占用会自动寻找空闲端口）
-- API 地址：`http://127.0.0.1:8888/v1/audio/transcriptions`
+ - 启动成功后，服务默认监听端口 **8888**（如被占用会自动寻找空闲端口）
+ 
+ - API 地址：`http://127.0.0.1:8888/v1/audio/transcriptions`
 
-启动服务时也可以附加配置参数，这些配置会作为全局默认值应用到每次请求：
+  1.1 启动服务时也可以附加配置参数，这些配置会作为全局默认值应用到每次请求：
 
 ```bash
 reazonspeech --beam 5 --no-chunk
 ```
 
-启动参数只允许使用 `--` 开头的配置参数，不允许使用 `-text`、`-segment2srt` 等输出参数。
+- 启动参数只允许使用 `--` 开头的配置参数，不允许使用 `-text`、`-segment2srt` 等输出参数
 
 ### 接口参数
 
@@ -195,15 +221,35 @@ reazonspeech --beam 5 --no-chunk
 | **timestamp_granularities** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
 | 其余参数均无效 |
 
-配置参数优先级从低到高为：启动服务时传入的配置参数、`reazonspeechprompt.txt`、请求中的 `prompt`。
+- 接口的 `prompt` 配置参数优先级高，`reazonspeechprompt.txt` 里的配置参数优先级中，启动服务时传入的配置参数优先级低。
 
-如果你的应用不支持输入或自定义 prompt 提示词，那么可以在根目录下找到文件 `reazonspeechprompt.txt`，在其中填写配置参数，格式与调用接口时的 `prompt` 相同，示例如下：
+  - 判断优先级的规则是一个参数一个参数地判断，而不是整体判断，优先级高的参数会覆盖优先级低的参数
+
+- 如果你的应用不支持输入或自定义 prompt 提示词，那么你可以在根目录下找到文件 `reazonspeechprompt.txt`，在其中填写配置参数，格式与接口参数 `prompt` 相同，示例如下：
+
+  - 该情况下视为接口的 `prompt` 配置参数值为**无**，优先级最低
 
 ```
 --beam 5 --no-chunk
 ```
 
-布尔配置参数可以用 `--no_参数名` 显式设为关闭，例如 `--no_no-chunk` 表示关闭 `--no-chunk` 这个布尔配置。
+### 接口专用参数
+
+- 布尔配置参数可以用对应的 `--no_参数名` 取消，均无默认值
+
+  - 取消成功的前提是 `--no_参数名` 的优先级高于对应的配置参数
+
+  - 如果在 CLI（命令行）模式中使用会立刻报错退出
+
+| 参数 | 作用 |
+| :--- | :---: |
+| `--no_no-remove-punc` | 允许删除标点符号 |
+| `--no_audio-filter` | 关闭音频滤波器 |
+| `--no_limiter-filter` | 关闭限幅滤波器 |
+| `--no_no-chunk` | 允许使用 VAD |
+| `--no_refine-tail` | 禁用段尾精修 |
+| `--no_zcr` | 禁用过零率检测 |
+| `--no_auto_zcr` | 禁用自适应 ZCR 阈值计算 |
 
 ### 调用示例
 

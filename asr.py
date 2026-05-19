@@ -231,6 +231,47 @@ def arg_parser():
         )
 
     parser.add_argument(
+        "--decoding-strategy",
+        type=str,
+        choices=["alsd", "maes"],
+        default=None,
+        help="RNN-T 解码策略，默认沿用模型自带（ALSD）；可选 maes 自适应扩展，对噪音/不标准发音更鲁棒",
+    )
+
+    parser.add_argument(
+        "--maes-num-steps",
+        type=int,
+        choices=[2, 3, 4],
+        default=2,
+        help="【仅 maes 生效】MAES 每时间步的自适应扩展步数，默认 2",
+    )
+
+    parser.add_argument(
+        "--maes-expansion-beta",
+        type=int,
+        choices=range(2, 65),
+        default=2,
+        metavar="[2-64]",
+        help="【仅 maes 生效】MAES 额外候选数（实际候选 = beam + beta），默认 2",
+    )
+
+    parser.add_argument(
+        "--maes-expansion-gamma",
+        type=float,
+        default=2.3,
+        metavar="[1.00-3.00]",
+        help="【仅 maes 生效】MAES 剪枝阈值（log-prob 单位），默认 2.3，范围 1.00-3.00",
+    )
+
+    parser.add_argument(
+        "--softmax-temperature",
+        type=float,
+        default=1.0,
+        metavar="[0.10-2.00]",
+        help="logits 温度，默认 1.0，范围 0.10-2.00。<1 分布更尖锐；>1 更平滑",
+    )
+
+    parser.add_argument(
         "--no-remove-punc",
         action="store_true",
         help="禁止自动剔除句末标点，保留原始识别结果",
@@ -1771,9 +1812,13 @@ def main(argv=None):
     if argv is None:
         args = parser.parse_args()
         api_mode = False
+        # 记录 CLI 模式下传入的原始参数列表
+        actual_args = sys.argv[1:] 
     else:
         args = parser.parse_args(argv)
         api_mode = True
+        # 记录 API 模式下传入的原始参数列表
+        actual_args = argv
 
     # API 模式：在内存里累积输出；CLI 模式：写文件
     api_result = {} if api_mode else None
@@ -1920,16 +1965,66 @@ def main(argv=None):
             BATCH_SIZE = args.batch_size
             logger.info(f"用户指定 Batch Size 值为 {BATCH_SIZE}")
 
-        if args.beam != model.cfg.decoding.beam.beam_size:
+        # 范围校验
+        if not (1.00 <= args.maes_expansion_gamma <= 3.00):
+            parser.error(f"--maes-expansion-gamma 必须在 [1.00, 3.00] 范围内，当前 {args.maes_expansion_gamma}")
+        if not (0.10 <= args.softmax_temperature <= 2.00):
+            parser.error(f"--softmax-temperature 必须在 [0.10, 2.00] 范围内，当前 {args.softmax_temperature}")
+
+        # 判断是否需要改 decoding 配置（任一参数与模型/默认不同就触发）
+        _effective_strategy = args.decoding_strategy if args.decoding_strategy is not None else model.cfg.decoding.strategy
+
+        if _effective_strategy == "maes":
+            # 判断原始参数列表中是否显式包含 "--beam"
+            user_explicit_beam = "--beam" in actual_args
+            
+            # 如果用户没有显式指定 --beam，则自动将 "beam" 提升至 8
+            if not user_explicit_beam and args.beam < 8:
+                logger.info("【解码策略】检测到使用 MAES 策略且未显式指定 --beam，已自动将 --beam 的默认值改为 8")
+                args.beam = 8
+
+        _need_change_decoding = (
+            args.beam != model.cfg.decoding.beam.beam_size
+            or (args.decoding_strategy is not None and args.decoding_strategy != model.cfg.decoding.strategy)
+            or (_effective_strategy == "maes" and (
+                args.maes_num_steps != parser.get_default("maes_num_steps")
+                or args.maes_expansion_beta != parser.get_default("maes_expansion_beta")
+                or args.maes_expansion_gamma != parser.get_default("maes_expansion_gamma")
+            ))
+            or args.softmax_temperature != parser.get_default("softmax_temperature")
+        )
+        if _need_change_decoding:
+            from omegaconf import OmegaConf, open_dict
+
             # 使用深拷贝来完全复制原始配置，确保它不受任何后续修改的影响
             original_decoding_cfg = copy.deepcopy(model.cfg.decoding)
-            
+
             # 同样使用深拷贝创建新配置，确保它与原始配置完全独立
             new_decoding_cfg = copy.deepcopy(model.cfg.decoding)
-            new_decoding_cfg.beam.beam_size = args.beam
-            
+
+            # omegaconf 默认 struct=True 禁止新增键；用 open_dict 临时放开
+            with open_dict(new_decoding_cfg):
+                new_decoding_cfg.beam.beam_size = args.beam
+                if args.decoding_strategy is not None:
+                    new_decoding_cfg.strategy = args.decoding_strategy
+                if _effective_strategy == "maes":
+                    new_decoding_cfg.maes_num_steps = args.maes_num_steps
+                    new_decoding_cfg.maes_expansion_beta = args.maes_expansion_beta
+                    new_decoding_cfg.maes_expansion_gamma = args.maes_expansion_gamma
+                new_decoding_cfg.softmax_temperature = args.softmax_temperature
+
             # 在所有识别任务开始前，应用这个新的解码策略
-            logger.info(f"正在应用新的解码策略：集束搜索宽度为 {args.beam} ……")
+            _maes_info = ""
+            if _effective_strategy == "maes":
+                _maes_info = (
+                    f"，maes_num_steps={args.maes_num_steps}"
+                    f"，maes_expansion_beta={args.maes_expansion_beta}"
+                    f"，maes_expansion_gamma={args.maes_expansion_gamma}"
+                )
+            logger.info(
+                f"正在应用新的解码策略：strategy={new_decoding_cfg.strategy}，"
+                f"beam={args.beam}{_maes_info}，softmax_temperature={args.softmax_temperature} ……"
+            )
             model.change_decoding_strategy(new_decoding_cfg)
 
         # --- 逐块识别并校正时间戳 ---
@@ -2693,5 +2788,5 @@ def main(argv=None):
         return api_result            
 
     if __name__ == "__main__":
-        print("请勿直接运行本文件")
+        print("请勿直接运行本文件，请使用: reazonspeech 命令加参数使用本程序")
         sys.exit(1)         

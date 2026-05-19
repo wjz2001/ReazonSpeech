@@ -10,6 +10,25 @@ TOKEN_EOS = {'。', '?', '!'}
 TOKEN_COMMA = {'、', ','}
 TOKEN_PUNC = TOKEN_EOS | TOKEN_COMMA
 
+# SentencePiece leading-whitespace meta piece (U+2581 "▁")
+_SP_LEADING_WHITESPACE = "▁"
+
+
+def _starts_with_sp_whitespace(model, token_id):
+    """Return True iff token_id maps to the SentencePiece leading-whitespace
+    meta piece (▁, U+2581).
+
+    NeMo's RNN-T beam search (ALSD/MAES/...) sometimes emits this meta piece
+    at hyp.y_sequence[0] with its own entry in hyp.timestamp[0]. The piece is
+    later dropped (it stringifies to ""), but if we do not also drop
+    timestamp[0] the subsequent zip(y_sequence, timestamp) is shifted by one
+    step — the first real token inherits step 0 and gets placed at the chunk
+    origin, producing phantom prefix segments. The trim must therefore be
+    conditional: when the hypothesis does not start with ▁ both arrays must
+    be kept intact."""
+    return model.tokenizer.tokenizer.id_to_piece(int(token_id)) == _SP_LEADING_WHITESPACE
+
+
 def find_end_of_segment(subwords, start):
     """Heuristics to identify speech boundaries"""
     length = len(subwords)
@@ -35,13 +54,14 @@ def decode_hypothesis(model, hyp):
     Returns:
         TranscribeResult
     """
-    # NeMo prepends a blank token to y_sequence with ALSD.
-    # Trim that artifact token from both y_sequence and timestamp,
-    # otherwise zip causes a 1-step misalignment that pulls the first
-    # real token's emit-step to 0 (blank's step), pushing its time
-    # to the chunk origin — observed as "phantom prefix" segments.
-    y_sequence = hyp.y_sequence.tolist()[1:]
-    timestamps = (hyp.timestamp.tolist() if hasattr(hyp.timestamp, "tolist") else list(hyp.timestamp))[1:]
+    # If the hypothesis starts with the SentencePiece leading-whitespace meta
+    # piece (▁), trim it from both y_sequence and timestamp to keep zip
+    # aligned. See _starts_with_sp_whitespace() for the rationale.
+    y_sequence = hyp.y_sequence.tolist()
+    timestamps = hyp.timestamp.tolist() if hasattr(hyp.timestamp, "tolist") else list(hyp.timestamp)
+    if y_sequence and _starts_with_sp_whitespace(model, y_sequence[0]):
+        y_sequence = y_sequence[1:]
+        timestamps = timestamps[1:]
     text = model.tokenizer.ids_to_text(y_sequence)
 
     subwords = []
@@ -84,10 +104,12 @@ def find_end_of_segment_by_step(subwords, start, phonemic_break_steps):
     return idx
 
 def decode_hypothesis_to_subword_info(model, hyp):
-    # NeMo prepends a blank token to y_sequence with ALSD; its timestamp
-    # is also in hyp.timestamp[0]. Trim both to keep zip aligned.
-    y_sequence = hyp.y_sequence.tolist()[1:]
-    timestamps = (hyp.timestamp.tolist() if hasattr(hyp.timestamp, "tolist") else list(hyp.timestamp))[1:]
+    # See _starts_with_sp_whitespace() for the rationale of this conditional trim.
+    y_sequence = hyp.y_sequence.tolist()
+    timestamps = hyp.timestamp.tolist() if hasattr(hyp.timestamp, "tolist") else list(hyp.timestamp)
+    if y_sequence and _starts_with_sp_whitespace(model, y_sequence[0]):
+        y_sequence = y_sequence[1:]
+        timestamps = timestamps[1:]
 
     results = []
     for idx, (token_id, step) in enumerate(zip(y_sequence, timestamps)):
