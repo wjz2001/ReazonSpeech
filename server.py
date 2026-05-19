@@ -1,5 +1,5 @@
 import argparse
-import json
+import concurrent.futures
 import os
 import contextlib
 import io
@@ -51,7 +51,8 @@ def get_args_info():
     """
     config: dict[str, dict] = {}
     output: dict[str, dict] = {}
-    config_flag_to_dest: set[str] = set()
+    config_flag_to_dest: dict[str, str] = {}
+    boolean_config_flags: set[str] = set()
 
     for action in arg_parser()._actions:
         # 位置参数（如 input_file）没有 option_strings，跳过
@@ -75,7 +76,10 @@ def get_args_info():
             config[action.dest] = {
                 "flags": long_flags,
             }
-            config_flag_to_dest.update(long_flags)
+            for flag in long_flags:
+                config_flag_to_dest[flag] = action.dest
+            if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+                boolean_config_flags.update(long_flags)
 
         if short_flags:
             output[action.dest] = {
@@ -86,6 +90,7 @@ def get_args_info():
         "config": config,
         "output": output,
         "config_flag_to_dest": config_flag_to_dest,
+        "boolean_config_flags": boolean_config_flags,
     }
 
 # 初始化参数信息
@@ -96,8 +101,11 @@ OUTPUT_INFO = ARGS_INFO["output"]               # dest -> {...}
 
 CONFIG_DESTS = set(CONFIG_INFO.keys())          # {"no_chunk", "beam", ...}
 OUTPUT_DESTS = set(OUTPUT_INFO.keys())          # {"text", "segment2srt", ...}
-CONFIG_FLAGS = ARGS_INFO["config_flag_to_dest"]   # {"--no-chunk", "--beam", ...}
+CONFIG_FLAG_TO_DEST = ARGS_INFO["config_flag_to_dest"]   # {"--no-chunk": "no_chunk", "--beam": "beam", ...}
+CONFIG_FLAGS = set(CONFIG_FLAG_TO_DEST)                  # {"--no-chunk", "--beam", ...}
+BOOLEAN_CONFIG_FLAGS = ARGS_INFO["boolean_config_flags"] # {"--debug", "--no-chunk", ...}
 OPENAI_RESPONSE_FORMATS = {"json", "text", "srt", "verbose_json", "vtt"}
+STARTUP_CONFIG: dict[str, object] = {}
 
 # response_format: item(dest 名) -> CLI 短选项 flag
 # 例如 "text" -> "-text", "segment2srt" -> "-segment2srt"
@@ -106,127 +114,114 @@ FMT_DEST_TO_FLAG: dict[str, str] = {
     for dest in OUTPUT_DESTS
 }
 
-def _apply_prompt_to_argv(argv: list[str], prompt: str):
-    """
-    将 OpenAI 样式的 prompt（CLI 字符串或 JSON）转成 asr.py 可识别的 CLI 选项，
-    只允许配置类参数（--xxx），不允许输出类短选项（-text 等）。
-    """
-    if not prompt.strip():
-        return
+class ConfigArgError(ValueError):
+    pass
 
-    # --- JSON 模式 ---
-    if prompt.lstrip().startswith("{"):
-        try:
-            cfg = json.loads(prompt)
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": {
-                        "message": f"prompt JSON 解析失败：{e}",
-                        "type": "invalid_request_error",
-                        "param": "prompt",
-                        "code": "invalid_prompt_json",
-                    }
-                },
-            )
-        if not isinstance(cfg, dict):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": {
-                        "message": 'prompt JSON 必须是一个对象（形如 {"no_chunk": true, ...}）',
-                        "type": "invalid_request_error",
-                        "param": "prompt",
-                        "code": "invalid_prompt_type",
-                    }
-                },
-            )
-        for key, val in cfg.items():
-            stripped_key = key.strip()
-            dest = stripped_key.replace("-", "_")
-            if dest not in CONFIG_DESTS:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": {
-                            "message": (
-                                f"prompt JSON 中包含未知配置参数 '{stripped_key}'，允许的配置参数有："
-                                f"{', '.join(sorted(CONFIG_DESTS))}"
-                            ),
-                            "type": "invalid_request_error",
-                            "param": stripped_key,
-                            "code": "unknown_config_param",
-                        }
-                    },
-                )
-            flag = CONFIG_INFO[dest]["flags"][0]
-            if isinstance(val, bool):
-                if val:
-                    argv.append(flag)
-            elif val is None:
-                continue
+
+def _parse_config_argv(argv: list[str], source: str) -> dict[str, object]:
+    if not argv:
+        return {}
+
+    def _normalize_config_argv_for_validation() -> tuple[list[str], set[str]]:
+        normalized_argv: list[str] = []
+        disabled_dests: set[str] = set()
+
+        for token in argv:
+            if token.startswith("-") and not token.startswith("--"):
+                raise ConfigArgError(f"{source} 中不允许使用单横线参数 '{token}'")
+
+            head = token.split("=", 1)[0]
+            lower_head = head.lower()
+
+            if lower_head.startswith("--no_"):
+                real_flag = "--" + head[len("--no_"):]
+                real_flag = real_flag.lower()
+                dest = CONFIG_FLAG_TO_DEST.get(real_flag)
+                if dest is None:
+                    raise ConfigArgError(f"{source} 中包含未知配置参数 '{token}'")
+                if real_flag not in BOOLEAN_CONFIG_FLAGS:
+                    raise ConfigArgError(f"{source} 中 '{token}' 只能用于布尔参数")
+
+                disabled_dests.add(dest)
+                normalized_argv.append(real_flag + token[len(head):])
             else:
-                argv.extend([flag, str(val)])
-        return
+                normalized_argv.append(lower_head + token[len(head):])
 
-    # --- CLI 字符串模式 ---
+        return normalized_argv, disabled_dests
+
+    normalized_argv, disabled_dests = _normalize_config_argv_for_validation()
+    parser = arg_parser()
+
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            args = parser.parse_args(normalized_argv)
+    except SystemExit:
+        message = stderr.getvalue().strip() or "参数解析失败"
+        raise ConfigArgError(f"{source} 参数错误：{message}")
+
+    if args.input_file:
+        raise ConfigArgError(f"{source} 中只允许使用 -- 配置参数，不允许包含输入文件或普通文本：'{args.input_file}'")
+
+    present_dests: set[str] = set()
+    for token in argv:
+        if token.startswith("--no_"):
+            continue
+        if token.startswith("--"):
+            head = token.split("=", 1)[0].lower()
+            dest = CONFIG_FLAG_TO_DEST.get(head)
+            if dest is not None:
+                present_dests.add(dest)
+
+    config: dict[str, object] = {
+        dest: getattr(args, dest)
+        for dest in present_dests
+    }
+    for dest in disabled_dests:
+        config[dest] = False
+
+    return config
+
+
+def _config_error_response(message: str, param: str | None = None):
+    return HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": param,
+                "code": "invalid_config_arg",
+            }
+        },
+    )
+
+def _parse_prompt_config(prompt: str, source: str, error_mode: str) -> dict[str, object]:
+    if not prompt.strip():
+        return {}
     try:
         tokens = shlex.split(prompt)
     except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": f"prompt CLI 解析失败：{e}",
-                    "type": "invalid_request_error",
-                    "param": "prompt",
-                    "code": "invalid_prompt_cli",
-                }
-            },
-        )
+        message = f"{source} CLI 解析失败：{e}"
+        if error_mode == "http":
+            raise _config_error_response(message, source)
+        print(f"【提示词错误】{message}")
+        return {}
 
-    for tok in tokens:
-        if not tok.startswith("-"):
-            argv.append(tok)
-            continue
-        # 短选项（-xxx），prompt 不允许出现
-        if tok.startswith("-") and not tok.startswith("--"):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": {
-                        "message": (
-                            f"prompt 中不允许指定 '{tok}'，输出参数请使用 response_format 指定"
-                        ),
-                        "type": "invalid_request_error",
-                        "param": "prompt",
-                        "code": "output_flag_in_prompt",
-                    }
-                },
-            )
-        # 长选项（--xxx）：必须是已知 config 参数
-        if tok not in CONFIG_FLAGS:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": {
-                        "message": (
-                            f"prompt 中包含未知配置参数 '{tok}'，允许的配置参数有："
-                            f"{', '.join(sorted(CONFIG_FLAGS))}"
-                        ),
-                        "type": "invalid_request_error",
-                        "param": tok,
-                        "code": "unknown_config_flag",
-                    }
-                },
-            )
-        argv.append(tok)
+    try:
+        return _parse_config_argv(tokens, source)
+    except ConfigArgError as e:
+        if error_mode == "exit":
+            print(f"【参数错误】{e}", file=sys.stderr)
+            sys.exit(2)
+        if error_mode == "http":
+            raise _config_error_response(str(e), source)
+        print(f"【提示词错误】{e}")
+        return {}
 
 def build_argv_openai(
     input_path: str,
-    prompt: str,
-    rf: str,  # 已经是小写的 json/text/srt/verbose_json/vtt 之一
+    config_argv: list[str],
+    rf: str,  # json/text/srt/verbose_json/vtt 之一，函数内统一转小写
     timestamp_granularities: Optional[list[str]],
 ) -> list[str]:
     """
@@ -237,8 +232,9 @@ def build_argv_openai(
       vtt          -> -segment2vtt
       verbose_json -> -text + (根据 timestamp_granularities 加 -segment/-subword)
     """
+    rf = rf.lower()
     argv: list[str] = [input_path]
-    _apply_prompt_to_argv(argv, prompt)
+    argv.extend(config_argv)
 
     cli_dests: set[str] = set()
 
@@ -289,45 +285,60 @@ def build_argv_openai(
                     }
                 },
             )
-        argv.append(FMT_DEST_TO_FLAG[dest])
+        argv.append(FMT_DEST_TO_FLAG[dest].lower())
 
     return argv
 
 def build_argv_legacy(
     input_path: str,
-    prompt: str,
+    config_argv: list[str],
     response_format: str,
 ) -> list[str]:
     """
-    旧的 ReazonSpeech 风格：直接把 response_format 当作 dest 名列表，
-    例如 "text,segment2srt" -> -text -segment2srt
+    旧的 ReazonSpeech 风格：直接把 response_format 当作空格分隔的输出参数，
+    例如 "-text -segment2srt"
     """
     argv: list[str] = [input_path]
-    _apply_prompt_to_argv(argv, prompt)
+    argv.extend(config_argv)
 
-    cli_dests: set[str] = {
-        t.strip().replace("-", "_")
-        for t in re.split(r"[,\s]+", response_format or "")
-        if t
+    output_flags = {
+        flag.lower()
+        for output in OUTPUT_INFO.values()
+        for flag in output["flags"]
     }
+    try:
+        cli_flags = shlex.split(response_format or "")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": f"response_format 解析失败：{e}",
+                    "type": "invalid_request_error",
+                    "param": "response_format",
+                    "code": "invalid_response_format",
+                }
+            },
+        )
 
-    for dest in cli_dests:
-        if dest not in OUTPUT_DESTS:
+    for flag in cli_flags:
+        flag = flag.lower()
+        if flag not in output_flags:
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": {
                         "message": (
-                            f"response_format 中包含未知输出类型 '{dest}'，允许的输出类型有："
-                            f"{', '.join(sorted(OUTPUT_DESTS))}"
+                            f"response_format 中包含未知输出参数 '{flag}'，允许的输出参数有："
+                            f"{' '.join(sorted(output_flags))}"
                         ),
                         "type": "invalid_request_error",
                         "param": "response_format",
-                        "code": "unknown_output_dest",
+                        "code": "unknown_output_flag",
                     }
                 },
             )
-        argv.append(FMT_DEST_TO_FLAG[dest])
+        argv.append(flag)
 
     return argv
 
@@ -393,16 +404,17 @@ def transcriptions(
         # 判定使用哪种 response_format 语义：OpenAI 风格 or 旧 dest 风格（禁止混用）
         # -------------------------
         tokens = [
-            t.lower() 
+            t
             for t in re.split(r"[,\s]+", (response_format or "").strip()) 
             if t
         ]
+        lower_tokens = [t.lower() for t in tokens]
 
         if not tokens:
             mode = "openai"
             rf = "text"
         else:
-            if all(t in OPENAI_RESPONSE_FORMATS for t in tokens):
+            if all(t in OPENAI_RESPONSE_FORMATS for t in lower_tokens):
                 if len(tokens) == 1:
                     mode = "openai"
                     rf = tokens[0]
@@ -420,7 +432,7 @@ def transcriptions(
                             }
                         },
                     )
-            elif any(t in OPENAI_RESPONSE_FORMATS for t in tokens):
+            elif any(t in OPENAI_RESPONSE_FORMATS for t in lower_tokens):
                 # 同时包含官方值和自定义 dest，显式禁止混用
                 raise HTTPException(
                     status_code=400,
@@ -456,66 +468,40 @@ def transcriptions(
 
         # 组装 argv 并调用 asr.main(argv=...)
         # argv 有值 => asr.main 会进入 API 模式，并返回内存中的结果 dict
-        prompt_warnings = []
-        # 必须同时满足
-        # _apply_prompt_to_argv 不抛 HTTPException
-        # 最终拼出来的 argv 能被 asr.arg_parser() 解析通过（否则说明 prompt 里有垃圾 token）
-        user_prompt_ok = False
-        if not prompt.strip():
-            prompt_warnings.append("未输入任何提示词")
-            prompt = ""
-        else:
+        fallback_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "reazonspeechprompt.txt"
+        )
+        file_config: dict[str, object] = {}
+        if os.path.isfile(fallback_path):
             try:
-                tmp_argv = [input_path]
-                _apply_prompt_to_argv(tmp_argv, prompt)
-                with contextlib.redirect_stderr(io.StringIO()):
-                    arg_parser().parse_args(tmp_argv)
-                user_prompt_ok = True
-            except (HTTPException, SystemExit):
-                # 无论用户乱填啥都不报错，直接忽略用户 prompt，尝试 fallback
-                prompt_warnings.append("提示词不符合格式要求")
-                prompt = ""
+                with open(fallback_path, "r", encoding="utf-8-sig") as f:
+                    file_prompt = f.read().strip()
+            except Exception as e:
+                raise _config_error_response(f"读取 reazonspeechprompt.txt 失败：{e}", "reazonspeechprompt.txt")
+            file_config = _parse_prompt_config(file_prompt, "reazonspeechprompt.txt", "http")
 
-        # prompt 为空或无效 -> 尝试读取 server.py 同级目录下的 reazonspeechprompt.txt
-        if not user_prompt_ok:
-            fallback_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "reazonspeechprompt.txt"
-            )
-
-            file_prompt = ""
-            if os.path.isfile(fallback_path):
-                try:
-                    with open(fallback_path, "r", encoding="utf-8-sig") as f:
-                        file_prompt = f.read().strip()
-                except Exception:
-                    file_prompt = ""
+        request_config = _parse_prompt_config(prompt, "prompt", "silent")
+        merged_config = {
+            **STARTUP_CONFIG,
+            **file_config,
+            **request_config,
+        }
+        config_argv: list[str] = []
+        for dest, value in merged_config.items():
+            if value is False or value is None:
+                continue
+            flag = CONFIG_INFO[dest]["flags"][0].lower()
+            if isinstance(value, bool):
+                if value:
+                    config_argv.append(flag)
             else:
-                prompt_warnings.append("找不到 reazonspeechprompt.txt")
-
-            if not file_prompt:
-                prompt_warnings.append("reazonspeechprompt.txt 中无内容")
-                prompt = ""
-            else:
-                try:
-                    tmp_argv = [input_path]
-                    _apply_prompt_to_argv(tmp_argv, file_prompt)
-                    with contextlib.redirect_stderr(io.StringIO()):
-                        arg_parser().parse_args(tmp_argv)
-                    prompt = file_prompt
-                    prompt_warnings.append("使用 reazonspeechprompt.txt 中的内容作为提示词")
-                except (HTTPException, SystemExit):
-                    prompt_warnings.append("reazonspeechprompt.txt 中的内容不符合格式要求")
-                    prompt = ""
-
-        # 只在服务端日志打印，不返回给客户端，不影响识别流程
-        if prompt_warnings:
-            print(f"【提示词错误】{prompt_warnings}")
+                config_argv.extend([flag, str(value)])
 
         if mode == "openai":
-            argv = build_argv_openai(input_path, prompt, rf, timestamp_granularities)
+            argv = build_argv_openai(input_path, config_argv, rf, timestamp_granularities)
         else:
-            argv = build_argv_legacy(input_path, prompt, response_format)
+            argv = build_argv_legacy(input_path, config_argv, response_format)
 
         result = asr_main(argv)
 
@@ -536,8 +522,8 @@ def transcriptions(
         if "error" in result:
             raise HTTPException(status_code=500 if result["error"]["type"] == "server_error" else 400, detail=result)
 
+        # 直接把 asr_main 的结果整包 JSON 返回
         if mode == "legacy":
-            # 旧模式：直接把 asr_main 的结果整包 JSON 返回
             return JSONResponse(result)
 
         # OpenAI 模式：
@@ -668,13 +654,49 @@ def transcriptions(
                 pass
 
 
-def main():
+def main(startup_argv: Optional[list[str]] = None):
     """给 asr.py 调用的入口：预加载模型+选择端口 + 启动 uvicorn"""
-    get_asr_model()
+    global STARTUP_CONFIG
+
+    print("API 服务启动中……")
 
     host = "0.0.0.0"
-    local_ip = get_local_ip()
-    port = find_free_port(host, 8888)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(_parse_config_argv, startup_argv or [], "API 启动参数"): "参数验证",
+            executor.submit(get_asr_model): "模型加载",
+            executor.submit(lambda: (get_local_ip(), find_free_port(host, 8888))): "服务地址准备",
+        }
+
+        done, _ = concurrent.futures.wait(
+            futures,
+            return_when=concurrent.futures.FIRST_EXCEPTION,
+        )
+        for future in done:
+            exc = future.exception()
+            if exc is None:
+                continue
+            task_name = futures[future]
+            if isinstance(exc, ConfigArgError):
+                print(f"【参数错误】{exc}", file=sys.stderr, flush=True)
+                os._exit(2)
+            print(f"【启动失败】{task_name}失败：{exc}", file=sys.stderr, flush=True)
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+            os._exit(1)
+
+        concurrent.futures.wait(futures)
+        for future, task_name in futures.items():
+            exc = future.exception()
+            if exc is None:
+                continue
+            print(f"【启动失败】{task_name}失败：{exc}", file=sys.stderr, flush=True)
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+            os._exit(1)
+
+        startup_config_future, _, service_addr_future = futures.keys()
+        STARTUP_CONFIG = startup_config_future.result()
+        local_ip, port = service_addr_future.result()
+
     if port != 8888:
         print(f"端口 {8888} 已被占用，自动切换到端口 {port}")
 

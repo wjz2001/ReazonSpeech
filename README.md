@@ -166,7 +166,7 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 
 ### 启动服务
 
-在终端直接运行命令（不带任何参数）：
+在终端直接运行命令：
 
 ```bash
 reazonspeech
@@ -175,6 +175,14 @@ reazonspeech
 启动成功后，服务默认监听端口 **8888**（如被占用会自动寻找空闲端口）
 - API 地址：`http://127.0.0.1:8888/v1/audio/transcriptions`
 
+启动服务时也可以附加配置参数，这些配置会作为全局默认值应用到每次请求：
+
+```bash
+reazonspeech --beam 5 --no-chunk
+```
+
+启动参数只允许使用 `--` 开头的配置参数，不允许使用 `-text`、`-segment2srt` 等输出参数。
+
 ### 接口参数
 
 | 参数名 | 必填 | 说明 |
@@ -182,52 +190,49 @@ reazonspeech
 | **file** | 是 | 上传音频文件或视频文件 |
 | **model** | 否 | 本 API 服务仅支持 ReazonSpeech 模型，所以此参数可写可不写 |
 | **language** | 否 | 本 API 服务仅支持日语，不支持其他语言，所以此参数可写可不写 |
-| **response_format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`<br>2. **ReazonSpeech 专用格式**：如 `kass`，`segment2tsv` 等（即上面的输出参数去除开头短横线，多个参数用逗号分隔） |
-| **prompt** | 否 | 在此处传入除输出参数和 debug 参数外所有的配置参数 |
+| **response_format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`，只能单选<br>2. **ReazonSpeech 原始输出参数**：如 `-text -segment2srt`，必须保留开头短横线，多个参数用空格分隔 |
+| **prompt** | 否 | 请求级配置参数，格式与命令行一致，只允许使用 `--` 开头的配置参数，不允许使用 `-text`、`-segment2srt` 等输出参数 |
 | **timestamp_granularities** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
 | 其余参数均无效 |
 
-- 如果你的应用不支持输入或自定义 prompt 提示词，那么可以在根目录下找到文件 `reazonspeechprompt.txt`，在其中填写 prompt 参数，格式与调用接口时相同，示例如下：
+配置参数优先级从低到高为：启动服务时传入的配置参数、`reazonspeechprompt.txt`、请求中的 `prompt`。
+
+如果你的应用不支持输入或自定义 prompt 提示词，那么可以在根目录下找到文件 `reazonspeechprompt.txt`，在其中填写配置参数，格式与调用接口时的 `prompt` 相同，示例如下：
 
 ```
 --beam 5 --no-chunk
 ```
 
-```
-{
-  "beam": 5,
-  "no_chunk": true
-}
-```
+布尔配置参数可以用 `--no_参数名` 显式设为关闭，例如 `--no_no-chunk` 表示关闭 `--no-chunk` 这个布尔配置。
 
 ### 调用示例
 
 #### cURL 示例
 
-- json风格参数必须包裹在大括号内，在 curl 中建议用单引号包裹，防止 shell 转义问题
+- OpenAI 标准返回格式
 
 ```bash
 curl -X POST "http://127.0.0.1:8888/v1/audio/transcriptions" \
   -F "file=@test.wav" \
-  -F 'prompt={"no-chunk": true, "beam-size": 5}' \
+  -F "prompt=--no-chunk --beam 5" \
   -F "response_format=verbose_json" \
-  -F "timestamp_granularities=["segment"]"
+  -F "timestamp_granularities[]=segment"
 ```
 
-- 命令行风格参数之间用空格分隔，不要加逗号
+- ReazonSpeech 原始输出参数，参数之间用空格分隔，不要加逗号
 
 ```bash
 curl -X POST "http://127.0.0.1:8888/v1/audio/transcriptions" \
   -F "file=@test.wav" \
-  -F "prompt=--audio-filter --beam-size 2" \
-  -F "response_format=text,segment2srt"
+  -F "prompt=--audio-filter --beam 2" \
+  -F "response_format=-text -segment2srt"
 ```
 
 #### Python 示例
 
 - 确保已安装：`pip install requests`
 
-- json风格参数必须包裹在大括号内
+- OpenAI 标准返回格式
 
 ```python
 import requests
@@ -236,17 +241,10 @@ import json
 url = "http://127.0.0.1:8888/v1/audio/transcriptions"
 file_path = "test.wav"
 
-# 构造 JSON 格式的 prompt 字符串
-prompt_config = {
-    "no-chunk": True,
-    "beam-size": 5
-}
-
 payload = {
-    # 将字典转为 JSON 字符串
-    "prompt": json.dumps(prompt_config),
+    "prompt": "--no-chunk --beam 5",
     "response_format": "verbose_json",
-    "timestamp_granularities": ["segment"]  # 可选: segment 或 word
+    "timestamp_granularities[]": ["segment"]  # 可选: segment 或 word
 }
 
 with open(file_path, "rb") as f:
@@ -258,7 +256,7 @@ print(response.status_code)
 print(json.dumps(response.json(), indent=2, ensure_ascii=False))
 ```
 
-- 命令行风格参数之间用空格分隔，不要加逗号
+- ReazonSpeech 原始输出参数，参数之间用空格分隔，不要加逗号
 
 ```python
 import requests
@@ -268,10 +266,10 @@ file_path = "test.wav"
 
 payload = {
     # 直接写命令行参数风格的字符串，空格分隔
-    "prompt": "--audio-filter --beam-size 2",
+    "prompt": "--audio-filter --beam 2",
     
-    # 自定义多选，逗号分隔，不要带前面的横线
-    "response_format": "text,segment2srt" 
+    # 原始输出参数，空格分隔，必须带前面的横线
+    "response_format": "-text -segment2srt"
 }
 
 with open(file_path, "rb") as f:

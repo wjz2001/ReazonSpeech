@@ -3,6 +3,7 @@ __pycache__
 *.m2ts
 *.wav
 !/test.wav
+!/reazonspeechprompt.txt
 *.srt
 *.txt
 *.ass
@@ -10,6 +11,7 @@ __pycache__
 *.egg-info
 *.zip
 /venv/
+/models/
 /ReazonSpeech.egg-info/
 /.ssh/
 /pkg/k2-asr/build/
