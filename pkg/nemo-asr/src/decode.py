@@ -44,11 +44,15 @@ def decode_hypothesis(model, hyp):
         TranscribeResult
     """
     # Drop a leading SentencePiece whitespace marker (▁) and its timestamp to keep token↔timestamp alignment.
+    # NeMo ALSD records hyp.timestamp[idx] = t + idx (k = t + u, with u = idx in the un-trimmed array).
+    # When the leading ▁ is trimmed the un-trimmed idx shifts by 1, so the offset is 1; otherwise it is 0.
     y_sequence = hyp.y_sequence.tolist()
     timestamps = hyp.timestamp.tolist() if hasattr(hyp.timestamp, "tolist") else list(hyp.timestamp)
+    trim_offset = 0
     if y_sequence and starts_with_sp_whitespace(model, y_sequence[0]):
         y_sequence = y_sequence[1:]
         timestamps = timestamps[1:]
+        trim_offset = 1
     text = model.tokenizer.ids_to_text(y_sequence)
 
     subwords = []
@@ -56,7 +60,7 @@ def decode_hypothesis(model, hyp):
         subwords.append(Subword(
             token_id=token_id,
             token=model.tokenizer.ids_to_text([token_id]),
-            seconds=max(SECONDS_PER_STEP * (step - idx - 1) - PAD_SECONDS, 0)
+            seconds=max(SECONDS_PER_STEP * (step - idx - trim_offset) - PAD_SECONDS, 0)
         ))
 
     # SentencePiece may emit whitespace as a separate token (▁). Trim empty/whitespace-only tokens.
@@ -93,16 +97,20 @@ def find_end_of_segment_by_step(subwords, start, phonemic_break_steps):
 
 def decode_hypothesis_to_subword_info(model, hyp):
     # See starts_with_sp_whitespace() for the rationale of this conditional trim.
+    # NeMo ALSD records hyp.timestamp[idx] = t + idx; trimming ▁ shifts the un-trimmed idx by 1,
+    # so the recovery formula is `step - idx - trim_offset` where trim_offset is 1 iff ▁ was dropped.
     y_sequence = hyp.y_sequence.tolist()
     timestamps = hyp.timestamp.tolist() if hasattr(hyp.timestamp, "tolist") else list(hyp.timestamp)
+    trim_offset = 0
     if y_sequence and starts_with_sp_whitespace(model, y_sequence[0]):
         y_sequence = y_sequence[1:]
         timestamps = timestamps[1:]
+        trim_offset = 1
 
     results = []
     for idx, (token_id, step) in enumerate(zip(y_sequence, timestamps)):
         token = model.tokenizer.ids_to_text([token_id])
-        step_index = int(step - idx - 1)
+        step_index = int(step - idx - trim_offset)
         results.append((token_id, token, step_index))
 
     return results

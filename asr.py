@@ -752,6 +752,7 @@ def enforce_monotonic_start_inplace(subs, total_audio_samples):
         subs[i].start_sample = cur
         prev = cur
 
+
 def format_duration(seconds):
     """将秒数格式化为 'X时Y分Z.ZZ秒' 的形式"""
     hours, remainder = divmod(seconds, 3600)
@@ -2411,12 +2412,15 @@ def main(argv=None):
             """
             只对“段首被 clamp 的 prefix token”（raw_local<0 的连续前缀）做去 clamp 化重定位：
               raw_local = step_index * STEP_SAMPLES - PAD_SAMPLES
-            将这段 prefix 的 start_sample 重定位到 keep_start_sample 附近，并做 1 sample 的递增展开避免同一时间戳堆叠。
+            将这段 prefix 的 start_sample 重定位到 base_offset_sample 附近（即 chunk 物理音频起点，
+            对应回看 padding 区段的真实声学位置），并做 1 sample 的递增展开避免同一时间戳堆叠。
+            （不再 anchor 到 keep_start_sample——那样会把段首 prefix 推到 chunk 中段，与回看 padding
+            区段后续 token 在 enforce_monotonic 下挤压成塌缩。）
             """
             # 以 step_index 为主排序，保证 prefix 的判断稳定
             subs.sort(key=lambda s: (s.step_index, s.start_sample))
 
-            anchor = max(0, min(int(meta["keep_start_sample"]), int(total_audio_samples)))
+            anchor = max(0, min(int(meta.get("base_offset_sample", meta["keep_start_sample"])), int(total_audio_samples)))
 
             # 找连续 prefix：raw_local < 0
             p = 0
@@ -2427,12 +2431,10 @@ def main(argv=None):
                 else:
                     break
 
-            if p <= 0:
-                continue
-
-            # 重定位 prefix 到 keep_start 附近，并展开
-            for j in range(p):
-                subs[j].start_sample = min(anchor + j, int(total_audio_samples))
+            if p > 0:
+                # 重定位 prefix 到 keep_start 附近，并展开
+                for j in range(p):
+                    subs[j].start_sample = min(anchor + j, int(total_audio_samples))
 
             enforce_monotonic_start_inplace(subs, int(total_audio_samples))
 
@@ -2465,6 +2467,40 @@ def main(argv=None):
                     break
 
             if k <= 0:
+                # === 字符级 fuzzy fallback ===
+                # 触发场景：长连读段下，chunk N 末尾被截断、识别带错（如"のに→ので"），
+                # 而 chunk N+1 利用 1.2s 回看上下文输出更完整版本（如完整的"としき...ません"）。
+                # 此时两份 token_id 不完全相同 → 精确匹配 k=0；但物理时间重叠 + 字符大量相似。
+                # 处理：识别该时间窗内的两份 token 文本，做 difflib 字符相似度。
+                # 若 ratio >= 0.4，认定为重叠重念，**删 merged 中重叠区段（chunk N 残缺版），保留 right（chunk N+1 完整版）**。
+                fuzzy_done = False
+                if right:
+                    right_head_start = min(int(s.start_sample) for s in right[:20]) if len(right) >= 1 else 0
+                    prev_keep_end = int(prev_meta["keep_end_sample"])
+                    overlap_margin = int(ms_to_samp_round(200))
+                    if right_head_start < prev_keep_end - overlap_margin:
+                        # merged 中 start_sample >= right_head_start - margin 的 token 是与 right 头部重叠的部分
+                        lo_bound = right_head_start - overlap_margin
+                        first_idx = next((i for i, s in enumerate(merged) if int(s.start_sample) >= lo_bound), len(merged))
+                        left_overlap_subs = merged[first_idx:]
+                        # 限制 right 端的样本到 prev_keep_end + margin（避免拿到太多 right 中段 token）
+                        right_overlap_subs = [s for s in right if int(s.start_sample) <= prev_keep_end + overlap_margin]
+                        left_text = "".join(s.token for s in left_overlap_subs)
+                        right_text = "".join(s.token for s in right_overlap_subs)
+                        if len(left_text) >= 4 and len(right_text) >= 4:
+                            import difflib as _difflib
+                            sim = _difflib.SequenceMatcher(None, left_text, right_text).ratio()
+                            if sim >= 0.4:
+                                logger.info(
+                                    f"【跨plan字符模糊去重】相似度={sim:.2f}，"
+                                    f"删除 merged[{first_idx}:] ({len(left_overlap_subs)} tokens) ，保留 right 全部（chunk N+1 重念版本）"
+                                )
+                                del merged[first_idx:]
+                                merged.extend(right)
+                                prev_meta = meta
+                                fuzzy_done = True
+                if fuzzy_done:
+                    continue
                 merged.extend(right)
                 prev_meta = meta
                 continue
