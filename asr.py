@@ -752,6 +752,105 @@ def enforce_monotonic_start_inplace(subs, total_audio_samples):
         subs[i].start_sample = cur
         prev = cur
 
+def collapse_dense_windows_inplace(
+    subs, total_audio_samples,
+    max_window_ms=200, min_tokens=8, loop_min_ratio=0.6
+    ):
+    """
+    检测短窗高密度 token 并分两种处理：
+      - 循环喷吐（窗口内有连续重复 n-gram，且重复占比 ≥ loop_min_ratio）：
+          压缩重复次数到 max(2, min(5, repeats // 4))，剩余 token 时间重对齐。
+      - 非循环高密度（多人重叠/短脉冲喷吐）：
+          不删字，仅在窗口左右真锚点之间均匀重对齐时间。
+    从后往前处理，避免索引偏移。
+    """
+    # 扫描 subs，找连续 ≥ min_tokens 个 token 的 start_sample 跨度 < max_window_ms 的窗口
+    n = len(subs)
+    if n < min_tokens:
+        return
+
+    max_window_samples = max_window_ms * SAMPLERATE // 1000
+    windows = []
+    i = 0
+    while i <= n - min_tokens:
+        if int(subs[i + min_tokens - 1].start_sample) - int(subs[i].start_sample) < max_window_samples:
+            j = i + min_tokens
+            while j < n and int(subs[j].start_sample) - int(subs[i].start_sample) < max_window_samples:
+                j += 1
+            windows.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    # 在窗口前后非异常 token 之间，线性时间插值 subs[start:end]
+    def _reflow_window_time_inplace(start, end):
+        nn = len(subs)
+        if start >= end:
+            return
+        left = int(subs[start - 1].start_sample) if start > 0 else int(subs[start].start_sample)
+        right = int(subs[end].start_sample) if end < nn else min(left + (end - start + 1) * STEP_SAMPLES, int(total_audio_samples))
+        count = end - start
+        if right <= left + count:
+            for kk in range(count):
+                subs[start + kk].start_sample = min(left + kk + 1, int(total_audio_samples))
+            return
+        span = right - left
+        for kk in range(count):
+            ratio = (kk + 1) / (count + 1)
+            new_t = left + int(span * ratio)
+            subs[start + kk].start_sample = max(0, min(new_t, int(total_audio_samples)))
+
+    # 对每个窗口：找连续重复 n-gram；有重复则压缩，没重复则仅均布时间
+    # 从后往前处理避免删除引起索引偏移
+    for w_start, w_end in reversed(windows):
+        win_n = w_end - w_start
+        tokens = [subs[w_start + k].token for k in range(win_n)]
+
+        best = None  # (rep_start_offset, ngram_len, repeats, ratio)
+        for ngram_len in range(1, win_n // 2 + 1):
+            for rep_start_offset in range(win_n - 2 * ngram_len + 1):
+                chunk = tokens[rep_start_offset:rep_start_offset + ngram_len]
+                if tokens[rep_start_offset + ngram_len:rep_start_offset + 2 * ngram_len] != chunk:
+                    continue
+
+                repeats = 2
+                k = rep_start_offset + 2 * ngram_len
+                while k + ngram_len <= win_n and tokens[k:k + ngram_len] == chunk:
+                    repeats += 1
+                    k += ngram_len
+
+                ratio = repeats * ngram_len / win_n
+                if ratio >= loop_min_ratio:
+                    # 保留覆盖比例最高的；若并列优先 ngram 较短的
+                    if best is None or ratio > best[3] or (ratio == best[3] and ngram_len < best[1]):
+                        best = (rep_start_offset, ngram_len, repeats, ratio)
+
+        if best is not None:
+            rep_off, ngram_len, repeats, _ratio = best
+            keep_repeats = max(2, min(5, repeats // 4))
+            if keep_repeats >= repeats:
+                _reflow_window_time_inplace(w_start, w_end)
+                continue
+
+            del_start = w_start + rep_off + ngram_len * keep_repeats
+            del_end = w_start + rep_off + ngram_len * repeats
+            removed_text = "".join(s.token for s in subs[del_start:del_end])[:30]
+
+            del subs[del_start:del_end]
+            new_end = w_end - (del_end - del_start)
+
+            logger.info(
+                f"【短窗循环压缩】@{int(subs[w_start].start_sample)/SAMPLERATE:.2f} 秒"
+                f"重复 n={ngram_len} ×{repeats} → ×{keep_repeats}，删除 '{removed_text}...'"
+            )
+            _reflow_window_time_inplace(w_start, new_end)
+        else:
+            preview = "".join(s.token for s in subs[w_start:w_end])[:30]
+            logger.info(
+                f"【短窗重对齐】@{int(subs[w_start].start_sample)/SAMPLERATE:.2f} 秒"
+                f"{w_end - w_start} tokens 跨度过窄，时间均布：'{preview}...'"
+            )
+            _reflow_window_time_inplace(w_start, w_end)
 
 def format_duration(seconds):
     """将秒数格式化为 'X时Y分Z.ZZ秒' 的形式"""
@@ -2488,17 +2587,22 @@ def main(argv=None):
                         left_text = "".join(s.token for s in left_overlap_subs)
                         right_text = "".join(s.token for s in right_overlap_subs)
                         if len(left_text) >= 4 and len(right_text) >= 4:
-                            import difflib as _difflib
-                            sim = _difflib.SequenceMatcher(None, left_text, right_text).ratio()
-                            if sim >= 0.4:
-                                logger.info(
-                                    f"【跨plan字符模糊去重】相似度={sim:.2f}，"
-                                    f"删除 merged[{first_idx}:] ({len(left_overlap_subs)} tokens) ，保留 right 全部（chunk N+1 重念版本）"
-                                )
-                                del merged[first_idx:]
-                                merged.extend(right)
-                                prev_meta = meta
-                                fuzzy_done = True
+                            # 字数差异 > 0.3 时不触发——避免 chunk N tail 携带额外句首信息被 chunk N+1 头部短残段误删。
+                            length_diff_ratio = abs(len(left_text) - len(right_text)) / max(len(left_text), len(right_text))
+                            if length_diff_ratio <= 0.3:
+                                import difflib as _difflib
+                                sim = _difflib.SequenceMatcher(None, left_text, right_text).ratio()
+                                # 只在两份内容高度相似（如「のに/ので」「ます/ません」 时触发
+                                # 内容显著差异场景。
+                                if sim >= 0.6:
+                                    logger.info(
+                                        f"【跨plan字符模糊去重】相似度={sim:.2f}，长度差={length_diff_ratio:.2f}，"
+                                        f"删除 merged[{first_idx}:] ({len(left_overlap_subs)} tokens) ，保留 right 全部（chunk N+1 重念版本）"
+                                    )
+                                    del merged[first_idx:]
+                                    merged.extend(right)
+                                    prev_meta = meta
+                                    fuzzy_done = True
                 if fuzzy_done:
                     continue
                 merged.extend(right)
@@ -2530,6 +2634,9 @@ def main(argv=None):
             prev_meta = meta
 
         raw_subwords = merged
+        # 短窗高密度处理：循环喷吐压缩 + 非循环高密度时间重对齐
+        # （触发条件保守：连续 ≥8 token 跨度 < 200ms。正常说话 200ms 内不会有 8+ token，故几乎不影响普通段）
+        collapse_dense_windows_inplace(raw_subwords, int(total_audio_samples))
         enforce_monotonic_start_inplace(raw_subwords, int(total_audio_samples))
         logger.debug(f"【VAD】所有语音块处理完毕")
 
