@@ -1678,16 +1678,35 @@ def refine_tail_timestamp(
     if start_idx >= len(speech_probs) or end_idx - start_idx <= 4:
         return min(rough_end_sample, max_end_sample)
 
-    # 平滑（只在 [last_token_start_sample, max_end_sample] 内统计阈值）
+    if len(kernel) == 0:
+        return min(rough_end_sample, max_end_sample)
+
+    # 提前计算主分析区间的 base_p / base_e 和平滑结果 p_smooth / e_smooth
+    base_p = speech_probs[start_idx:end_idx]
+    base_e = energy_array[start_idx:end_idx]
+    base_len = min(len(base_p), len(base_e))
+
+    if base_len <= 4:
+        return min(rough_end_sample, max_end_sample)
+
+    p_smooth = np.convolve(base_p[:base_len], kernel, mode="same")
+    e_smooth = np.convolve(base_e[:base_len], kernel, mode="same")
+
+    # 准备尾部额外搜索区间数据
     extra_p = speech_probs[end_idx:search_end_idx]
     extra_e = energy_array[end_idx:search_end_idx]
     extra_len = min(len(extra_p), len(extra_e))
 
-    if extra_len == 0:
-        return min(rough_end_sample, max_end_sample)
+    # extra_len == 0 时不直接返回，让平滑数组为空即可
+    if extra_len > 0:
+        extra_p_smooth = np.convolve(extra_p[:extra_len], kernel, mode="same")
+        extra_e_smooth = np.convolve(extra_e[:extra_len], kernel, mode="same")
+    else:
+        extra_p_smooth = np.array([], dtype=float)
+        extra_e_smooth = np.array([], dtype=float)
 
-    extra_p_smooth = np.convolve(extra_p[:extra_len], kernel, mode="same")
-    extra_e_smooth = np.convolve(extra_e[:extra_len], kernel, mode="same")
+    # 局部自适应阈值percentile + offset
+    # 限制阈值范围，防止极端情况导致逻辑失效
 
     # 局部自适应阈值percentile + offset
     # 限制阈值范围，防止极端情况导致逻辑失效
@@ -1866,21 +1885,6 @@ def refine_tail_timestamp(
 
     # 有可疑静音，可以利用已有阈值在多出的 1 秒内继续搜索
     # 只对额外 1s 做平滑，仍然使用之前在 [last_token_start_s, max_end_s] 内得到的 dyn_tau / dyn_e_tau。
-
-    # 取出两者的最短长度，如果是 0，说明切出来的数组是空的，直接返回
-    
-    if len(kernel) == 0:
-        return min(rough_end_sample, max_end_sample)
-  
-    base_p = speech_probs[start_idx:end_idx]
-    base_e = energy_array[start_idx:end_idx]
-    base_len = min(len(base_p), len(base_e))
-  
-    if base_len <= 4:
-        return min(rough_end_sample, max_end_sample)
-  
-    p_smooth = np.convolve(base_p[:base_len], kernel, mode="same")
-    e_smooth = np.convolve(base_e[:base_len], kernel, mode="same")
 
     for j in range(0, len(extra_p_smooth) - min_silence_frames + 1):
         if _is_stable_silence(j, extra_p_smooth, extra_e_smooth, end_idx):
