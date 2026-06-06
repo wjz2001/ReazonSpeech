@@ -2,8 +2,6 @@ __pycache__
 *.pyc
 *.m2ts
 *.wav
-!/test.wav
-!/reazonspeechprompt.txt
 *.srt
 *.txt
 *.ass
@@ -11,7 +9,7 @@ __pycache__
 *.egg-info
 *.zip
 /venv/
-/models/
+/models/*
 /ReazonSpeech.egg-info/
 /.ssh/
 /.loop/
@@ -20,3 +18,6 @@ __pycache__
 /gitpush.bat
 /CLAUDE.md
 /AGENTS.md
+!/test.wav
+!/reazonspeechprompt.txt
+!/models/ReazonSpeech-Placeholder
