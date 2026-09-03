@@ -2,6 +2,7 @@ __pycache__
 *.pyc
 *.m2ts
 *.wav
+*.mp4
 *.srt
 *.txt
 *.ass

@@ -374,10 +374,10 @@ async def openai_http_exception_handler(_: Request, exc: HTTPException):
 def transcriptions(
     file: UploadFile = File(...),
     prompt: str = Form(""), # CLI 字符串或 JSON
-    response_format: str = Form(""),
+    response_format: str = Form("", alias="response-format"),
     timestamp_granularities: Annotated[
         Optional[list[str]],
-        Form(alias="timestamp_granularities[]")
+        Form(alias="timestamp-granularities[]")
     ] = None,
 ):
     # 保存上传的文件到临时路径

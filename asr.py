@@ -308,7 +308,7 @@ def arg_parser():
     )
 
     parser.add_argument(
-        "--vad_threshold",
+        "--vad-threshold",
         type=float,
         default=0.4,
         metavar="(0.05-1]",
@@ -316,27 +316,27 @@ def arg_parser():
     )
     # VAD 结束阈值（双阈值滞回）
     parser.add_argument(
-        "--vad_end_threshold",
+        "--vad-end-threshold",
         type=float,
         default=None,
         metavar="[0.05-1]",
-        help="【VAD】判断为语音结束后静音的置信度阈值，默认值是vad_threshold的值减去0.15",
+        help="【VAD】判断为语音结束后静音的置信度阈值，默认值是vad-threshold的值减去0.15",
     )
     parser.add_argument(
-        "--min_speech_duration_ms",
+        "--min-speech-duration",
         type=int,
         default=100,
         help="【VAD】移除短于此时长（毫秒）的语音块",
     )
      # 静音最小时长，用于智能合并/分段
     parser.add_argument(
-        "--min_silence_duration_ms",
+        "--min-silence-duration",
         type=int,
         default=200,
         help="【VAD】短于此时长（毫秒）的语音块不被视为间隔",
     )
     parser.add_argument(
-        "--keep_silence",
+        "--keep-silence",
         type=int,
         default=300,
         help="【VAD】在语音块前后扩展时长（毫秒）",
@@ -349,15 +349,15 @@ def arg_parser():
         help="开启过零率检测，防止切断清辅音",
     )
     parser.add_argument(
-        "--zcr_threshold",
+        "--zcr-threshold",
         type=float,
         default=0.15,
         help="【ZCR】手动设置 ZCR 阈值",
     )
     parser.add_argument(
-        "--auto_zcr",
+        "--auto-zcr",
         action="store_true",
-        help="【ZCR】开启自适应 ZCR 阈值计算，zcr_threshold作为兜底",
+        help="【ZCR】开启自适应 ZCR 阈值计算，zcr-threshold作为兜底",
     )
 
     # --- 精修参数（必须先使用VAD） ---
@@ -368,51 +368,51 @@ def arg_parser():
     )
 
     parser.add_argument(
-        "--tail_percentile",
+        "--tail-percentile",
         type=float,
         default=20,
         metavar="[0-100]",
         help="【精修】自适应阈值，值越大，越容易将高概率语音区域判为静音",
     )
     parser.add_argument(
-        "--tail_offset",
+        "--tail-offset",
         type=float,
         default=0.05,
         help="【精修】在自适应阈值的基础上增加的固定偏移量，值越大越容易将高概率区域语音区域判为静音",
     )
     parser.add_argument(
-        "--tail_energy_percentile",
+        "--tail-energy-percentile",
         type=float,
         default=30,
         metavar="[0-100]",
         help="【精修】自适应能量阈值，通常取 20~40，低于此值则判定为静音",
     )
     parser.add_argument(
-        "--tail_energy_offset",
+        "--tail-energy-offset",
         type=float,
         default=0.0,
         help="【精修】在自适应能量阈值基础上增加的固定偏移量，一般保持为 0 即可，值越大判定标准越宽松",
     )
     parser.add_argument(
-        "--tail_lookahead_ms",
+        "--tail-lookahead",
         type=int,
         default=80,
         help="【精修】滞回检查向前看的时长（毫秒），用于确认静音的稳定性，不会马上又回到语音",
     )
     parser.add_argument(
-        "--tail_safety_margin_ms",
+        "--tail-safety-margin",
         type=int,
         default=30,
         help="【精修】在找到的切点后增加的安全边距（毫秒），避免切得太生硬",
     )
     parser.add_argument(
-        "--tail_min_keep_ms",
+        "--tail-min-keep",
         type=int,
         default=30,
         help="【精修】强制保留在段尾的最小时长（毫秒），保证听感自然",
     )
     parser.add_argument(
-        "--tail_zcr_high_ratio",
+        "--tail-zcr-high-ratio",
         type=float,
         default=0.3, 
         metavar="[0.1-0.5]",
@@ -1981,11 +1981,11 @@ def main(argv=None):
     # 只有当用户修改了默认值（即想要调整精修参数），但忘了加 --zcr 开关时才报错
     if not args.zcr:
         if getattr(args, "zcr_threshold") != parser.get_default("zcr_threshold"):
-            parser.error(f"【参数错误】未添加 --zcr，不能设置参数 --zcr_threshold")
+            parser.error(f"【参数错误】未添加 --zcr，不能设置参数 --zcr-threshold")
         if getattr(args, "tail_zcr_high_ratio") != parser.get_default("tail_zcr_high_ratio"):
-            parser.error(f"【参数错误】未添加 --zcr，不能设置参数 --tail_zcr_high_ratio")
+            parser.error(f"【参数错误】未添加 --zcr，不能设置参数 --tail-zcr-high-ratio")
         if args.auto_zcr:
-            parser.error(f"【参数错误】未添加 --zcr，不能设置参数 --auto_zcr")
+            parser.error(f"【参数错误】未添加 --zcr，不能设置参数 --auto-zcr")
 
     # 校验未使用 --refine-tail 却指定了相关参数的情况
     # 只有当用户修改了默认值（即想要调整精修参数），但忘了加 --refine-tail 开关时才报错
@@ -2027,21 +2027,21 @@ def main(argv=None):
         if args.vad_end_threshold is None:
             args.vad_end_threshold = max(0.05, args.vad_threshold - 0.15)
         if not (0.05 < args.vad_threshold <= 1):
-            parser.error(f"vad_threshold 必须在（0.05-1）范围内，当前值错误")
+            parser.error(f"vad-threshold 必须在（0.05-1）范围内，当前值错误")
         if not (0.05 <= args.vad_end_threshold <= 1):
-            parser.error(f"vad_end_threshold 必须在（0.05-1）范围内，当前值错误")
+            parser.error(f"vad-end-threshold 必须在（0.05-1）范围内，当前值错误")
         if args.vad_end_threshold > args.vad_threshold:
             parser.error(
-                f"vad_end_threshold 不能大于 vad_threshold"
+                f"vad-end-threshold 不能大于 vad-threshold"
             )
     
         if args.refine_tail:
             if not (0 <= args.tail_percentile <= 100):
-                parser.error(f"tail_percentile 必须在（0-100）范围内，当前值错误")
+                parser.error(f"tail-percentile 必须在（0-100）范围内，当前值错误")
             if not (0 <= args.tail_energy_percentile <= 100):
-                parser.error("tail_energy_percentile 必须在（0-100）范围内，当前值错误")
+                parser.error("tail-energy-percentile 必须在（0-100）范围内，当前值错误")
             if not (0.1 <= args.tail_zcr_high_ratio <= 0.5):
-                parser.error("tail_zcr_high_ratio 必须在（0.1-0.5）范围内，当前值错误")
+                parser.error("tail-zcr-high-ratio 必须在（0.1-0.5）范围内，当前值错误")
 
     # 启动内存 / 显存监控线程
     if args.debug and not api_mode:
@@ -2956,4 +2956,4 @@ def main(argv=None):
 
     if __name__ == "__main__":
         print("请勿直接运行本文件，请使用: reazonspeech 命令加参数使用本程序")
-        sys.exit(1)         
+        sys.exit(1)   

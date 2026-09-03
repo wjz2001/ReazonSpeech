@@ -131,20 +131,20 @@ echo.
 
 echo 请输入新数值，或直接按回车以使用默认值
 
-set /p "vadThresh=输入 vad_threshold（语音置信度，默认：0.4，范围：0.05~1）："
-if defined vadThresh set "chunkParams=!chunkParams! --vad_threshold !vadThresh!"
+set /p "vadThresh=输入 vad-threshold（语音置信度，默认：0.4，范围：0.05~1）："
+if defined vadThresh set "chunkParams=!chunkParams! --vad-threshold !vadThresh!"
 
-set /p "vadEndThresh=输入 vad_end_threshold（语音是否结束置信度，默认：智能，范围：0.05~1）："
-if defined vadEndThresh set "chunkParams=!chunkParams! --vad_end_threshold !vadEndThresh!"
+set /p "vadEndThresh=输入 vad-end-threshold（语音是否结束置信度，默认：智能，范围：0.05~1）："
+if defined vadEndThresh set "chunkParams=!chunkParams! --vad-end-threshold !vadEndThresh!"
 
-set /p "minSpeech=输入 min_speech_duration_ms（移除短于此时长（毫秒）的语音块，默认：100）："
-if defined minSpeech set "chunkParams=!chunkParams! --min_speech_duration_ms !minSpeech!"
+set /p "minSpeech=输入 min-speech-duration（移除短于此时长（毫秒）的语音块，默认：100）："
+if defined minSpeech set "chunkParams=!chunkParams! --min-speech-duration !minSpeech!"
 
-set /p "minSilence=输入 min_silence_duration_ms（最短静音间隔时长（毫秒），默认：200）："
-if defined minSilence set "chunkParams=!chunkParams! --min_silence_duration_ms !minSilence!"
+set /p "minSilence=输入 min-silence-duration（最短静音间隔时长（毫秒），默认：200）："
+if defined minSilence set "chunkParams=!chunkParams! --min-silence-duration !minSilence!"
 
-set /p "keep=输入 keep_silence（在语音块前后扩展的时长（毫秒），默认：300）："
-if defined keep set "chunkParams=!chunkParams! --keep_silence !keep!"
+set /p "keep=输入 keep-silence（在语音块前后扩展的时长（毫秒），默认：300）："
+if defined keep set "chunkParams=!chunkParams! --keep-silence !keep!"
 
 echo 已设置自定义 VAD 参数
 
@@ -176,29 +176,29 @@ echo.
 
 echo 请输入新数值，或直接按回车以使用默认值
 
-set /p "t_per=输入 tail_percentile（自适应阈值，默认：20，值越大越容易判为静音）："
-if defined t_per set "tailParams=!tailParams! --tail_percentile !t_per!"
+set /p "t_per=输入 tail-percentile（自适应阈值，默认：20，值越大越容易判为静音）："
+if defined t_per set "tailParams=!tailParams! --tail-percentile !t_per!"
 
-set /p "t_off=输入 tail_offset（阈值偏移量，默认：0.05，值越大越容易判为静音）："
-if defined t_off set "tailParams=!tailParams! --tail_offset !t_off!"
+set /p "t_off=输入 tail-offset（阈值偏移量，默认：0.05，值越大越容易判为静音）："
+if defined t_off set "tailParams=!tailParams! --tail-offset !t_off!"
 
-set /p "t_e_per=输入 tail_energy_percentile（自适应能量阈值，默认：30，范围：0~100，低于此值则判定为静音）："
-if defined t_e_per set "tailParams=!tailParams! --tail_energy_percentile !t_e_per!"
+set /p "t_e_per=输入 tail-energy-percentile（自适应能量阈值，默认：30，范围：0~100，低于此值则判定为静音）："
+if defined t_e_per set "tailParams=!tailParams! --tail-energy-percentile !t_e_per!"
 
-set /p "t_e_off=输入 tail_energy_offset（能量阈值偏移量，默认：0.0）："
-if defined t_e_off set "tailParams=!tailParams! --tail_energy_offset !t_e_off!"
+set /p "t_e_off=输入 tail-energy-offset（能量阈值偏移量，默认：0.0）："
+if defined t_e_off set "tailParams=!tailParams! --tail-energy-offset !t_e_off!"
 
-set /p "t_look=输入 tail_lookahead_ms（滞回检查时长（毫秒），默认：80）："
-if defined t_look set "tailParams=!tailParams! --tail_lookahead_ms !t_look!"
+set /p "t_look=输入 tail-lookahead（滞回检查时长（毫秒），默认：80）："
+if defined t_look set "tailParams=!tailParams! --tail-lookahead !t_look!"
 
-set /p "t_safe=输入 tail_safety_margin_ms（安全边距（毫秒），默认：30）："
-if defined t_safe set "tailParams=!tailParams! --tail_safety_margin_ms !t_safe!"
+set /p "t_safe=输入 tail-safety-margin（安全边距（毫秒），默认：30）："
+if defined t_safe set "tailParams=!tailParams! --tail-safety-margin !t_safe!"
 
-set /p "t_keep=输入 tail_min_keep_ms（强制保留时长（毫秒），默认：30）："
-if defined t_keep set "tailParams=!tailParams! --tail_min_keep_ms !t_keep!"
+set /p "t_keep=输入 tail-min-keep（强制保留时长（毫秒），默认：30）："
+if defined t_keep set "tailParams=!tailParams! --tail-min-keep !t_keep!"
 
-set /p "t_high=输入 tail_zcr_high_ratio（疑似静音窗口内高于 ZCR 阈值的帧超过此比例时才会判定为清音，必须开启 ZCR ，默认：0.3，范围：0.1~0.5）："
-if defined t_high set "tailParams=!tailParams! --tail_zcr_high_ratio !t_high!"
+set /p "t_high=输入 tail-zcr-high-ratio（疑似静音窗口内高于 ZCR 阈值的帧超过此比例时才会判定为清音，必须开启 ZCR ，默认：0.3，范围：0.1~0.5）："
+if defined t_high set "tailParams=!tailParams! --tail-zcr-high-ratio !t_high!"
 
 echo 已设置段尾精修参数
 
@@ -222,16 +222,16 @@ set "zcrParams= --zcr"
 
 echo.
 
-choice /c YN /m "是否启用自适应 ZCR 阈值？（Y=自动计算，zcr_threshold 兜底；N=仅使用zcr_threshold）"
-if %ERRORLEVEL% == 1 set "zcrParams=!zcrParams! --auto_zcr"
+choice /c YN /m "是否启用自适应 ZCR 阈值？（Y=自动计算，zcr-threshold 兜底；N=仅使用zcr-threshold）"
+if %ERRORLEVEL% == 1 set "zcrParams=!zcrParams! --auto-zcr"
 
 echo.
 
 echo 请输入 ZCR 手动阈值，或直接按回车以使用默认值（0.15）
 
-set /p "zcrTh=输入 zcr_threshold："
+set /p "zcrTh=输入 zcr-threshold："
 
-if defined zcrTh set "zcrParams=!zcrParams! --zcr_threshold !zcrTh!"
+if defined zcrTh set "zcrParams=!zcrParams! --zcr-threshold !zcrTh!"
 
 echo 已设置 ZCR 参数
 

@@ -69,7 +69,7 @@ python -m venv venv
 ## 用法
 
 ```bash
-reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
+reazonspeech 文件路径 --zcr --auto-zcr --refine-tail -segment2srt
 ```
 
 ### 其他参数
@@ -118,33 +118,33 @@ reazonspeech 文件路径 --zcr --auto_zcr --refine-tail -segment2srt
 | 参数 | 作用 | 默认值 |
 |-----------|:-------------:|:---------:|
 | `--no-chunk` | 禁止使用 VAD | `无` |
-| `--vad_threshold` | VAD 判断为语音的置信度阈值（0.05-1） | `0.4` |
-| `--vad_end_threshold` | VAD 判断为语音结束后静音的置信度阈值（0.05-1） | `vad_threshold的值减去0.15` |
-| `--min_speech_duration_ms` | 移除短于此时长（毫秒）的语音块 | `100` |
-| `--min_silence_duration_ms` | 短于此时长（毫秒）的语音块不被视为间隔 | `200` |
-| `--keep_silence` | 在语音块前后扩展的时长（毫秒） | `300` |
+| `--vad-threshold` | VAD 判断为语音的置信度阈值（0.05-1） | `0.4` |
+| `--vad-end-threshold` | VAD 判断为语音结束后静音的置信度阈值（0.05-1） | `vad-threshold的值减去0.15` |
+| `--min-speech-duration` | 移除短于此时长（毫秒）的语音块 | `100` |
+| `--min-silence-duration` | 短于此时长（毫秒）的语音块不被视为间隔 | `200` |
+| `--keep-silence` | 在语音块前后扩展的时长（毫秒） | `300` |
 
 ### 段尾精修参数（必须先开启 VAD）
 
 | 参数 | 作用 | 默认值 |
 |-----------|:-------------:|:---------:|
 | `--refine-tail` | 使用段尾精修 | `无` |
-| `--tail_percentile` | 自适应阈值（0-100），值越大越容易将高概率语音区域判为静音 | `20` |
-| `--tail_offset` | 在自适应阈值的基础上增加的固定偏移量，值越大越容易将高概率区域语音区域判为静音 | `0.05` |
-| `--tail_energy_percentile` | 自适应能量阈值（0-100），通常取 20~40，低于此值则判定为静音 | `30` |
-| `--tail_energy_offset` | 在自适应能量阈值基础上增加的固定偏移量，一般为 0，值越大判定标准越宽松 | `0` |
-| `--tail_lookahead_ms` | 滞回检查向前看的时长（毫秒），用于确认静音的稳定性，不会马上又回到语音 | `80` |
-| `--tail_safety_margin_ms` | 在找到的切点后增加的安全边距（毫秒） | `30` |
-| `--tail_min_keep_ms` | 强制保留在段尾的最小时长（毫秒） | `30` |
-| `--tail_zcr_high_ratio` | 疑似静音窗口内高于 ZCR 阈值的帧超过此比例时（0.1-0.5），才会判定为清音 | `0.3` |
+| `--tail-percentile` | 自适应阈值（0-100），值越大越容易将高概率语音区域判为静音 | `20` |
+| `--tail-offset` | 在自适应阈值的基础上增加的固定偏移量，值越大越容易将高概率区域语音区域判为静音 | `0.05` |
+| `--tail-energy-percentile` | 自适应能量阈值（0-100），通常取 20~40，低于此值则判定为静音 | `30` |
+| `--tail-energy-offset` | 在自适应能量阈值基础上增加的固定偏移量，一般为 0，值越大判定标准越宽松 | `0` |
+| `--tail-lookahead` | 滞回检查向前看的时长（毫秒），用于确认静音的稳定性，不会马上又回到语音 | `80` |
+| `--tail-safety-margin` | 在找到的切点后增加的安全边距（毫秒） | `30` |
+| `--tail-min-keep` | 强制保留在段尾的最小时长（毫秒） | `30` |
+| `--tail-zcr-high-ratio` | 疑似静音窗口内高于 ZCR 阈值的帧超过此比例时（0.1-0.5），才会判定为清音 | `0.3` |
 
 ### 过零率检测参数（必须先开启 VAD）
 
 | 参数 | 作用 | 默认值 |
 |-----------|:-------------:|:---------:|
 | `--zcr` | 开启过零率检测，防止切断清辅音 | `无` |
-| `--zcr_threshold` | 手动设置 ZCR 阈值 | `0.15` |
-| `--auto_zcr` | 开启自适应 ZCR 阈值计算，zcr_threshold作为兜底 | `无` |
+| `--zcr-threshold` | 手动设置 ZCR 阈值 | `0.15` |
+| `--auto-zcr` | 开启自适应 ZCR 阈值计算，zcr-threshold作为兜底 | `无` |
 
 ### 解码参数
 
@@ -216,9 +216,9 @@ reazonspeech --beam 5 --no-chunk
 | **file** | 是 | 上传音频文件或视频文件 |
 | **model** | 否 | 本 API 服务仅支持 ReazonSpeech 模型，所以此参数可写可不写 |
 | **language** | 否 | 本 API 服务仅支持日语，不支持其他语言，所以此参数可写可不写 |
-| **response_format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`，只能单选<br>2. **ReazonSpeech 原始输出参数**：如 `-text -segment2srt`，必须保留开头短横线，多个参数用空格分隔 |
+| **response-format** | 否 | **输出格式（必须二选一）：**<br>1. **OpenAI 标准格式**：`text`（默认），`json`，`srt`，`verbose_json`，`vtt`，只能单选<br>2. **ReazonSpeech 原始输出参数**：如 `-text -segment2srt`，必须保留开头短横线，多个参数用空格分隔 |
 | **prompt** | 否 | 请求级配置参数，格式与命令行一致，只允许使用 `--` 开头的配置参数，不允许使用 `-text`、`-segment2srt` 等输出参数 |
-| **timestamp_granularities** | 否 | 仅当 `response_format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
+| **timestamp-granularities** | 否 | 仅当 `response-format` 为 `verbose_json` 时有效：<br>可选值：`segment`（段级时间戳），`word`（单词级时间戳） |
 | 其余参数均无效 |
 
 - 接口的 `prompt` 配置参数优先级高，`reazonspeechprompt.txt` 里的配置参数优先级中，启动服务时传入的配置参数优先级低。
@@ -249,7 +249,7 @@ reazonspeech --beam 5 --no-chunk
 | `--no_no-chunk` | 允许使用 VAD |
 | `--no_refine-tail` | 禁用段尾精修 |
 | `--no_zcr` | 禁用过零率检测 |
-| `--no_auto_zcr` | 禁用自适应 ZCR 阈值计算 |
+| `--no_auto-zcr` | 禁用自适应 ZCR 阈值计算 |
 
 ### 调用示例
 
